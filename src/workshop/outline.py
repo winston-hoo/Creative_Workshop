@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,17 @@ from typing import Any, Callable
 from .annotate import load_annotation
 from .batch import ChapterTask, load_chapter_tasks
 from .errors import ErrorKind  # noqa: F401
-from .llm import ApiError, ChatResult, OpenAICompatProvider, build_thinking_extra, extract_json_object
+from .llm import (
+    DEFAULT_MAX_TOKENS,
+    MAX_TOKENS_CAP,
+    ApiError,
+    ChatResult,
+    OpenAICompatProvider,
+    build_thinking_extra,
+    extract_json_object,
+    looks_truncated,
+    repair_truncated_json,
+)
 from .secrets import redact
 
 OUTLINE_SCHEMA_VERSION = "outline-v1"
@@ -78,7 +89,16 @@ class OutlineOptions:
     block_size: int = DEFAULT_BLOCK_SIZE
     temperature: float = 0.3
     thinking: str = "disabled"
-    max_tokens: int = 1200
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    """单次输出的 token 预算起点。
+
+    原来写死 1200：书级归约要一口气写完 logline + premise + 全书结构与主线，
+    正文还没写完就被砍，报出来却是「返回内容不是 JSON」。
+    """
+
+    max_tokens_cap: int = MAX_TOKENS_CAP
+    """预算升级的上限。撞上截断时逐次翻倍，但不超过它。"""
+
     max_attempts: int = 3
     timeout_sec: float = 60.0
 
@@ -97,6 +117,7 @@ class OutlinePlan:
     est_cost_cny: float | None
     price_note: str
     block_size: int
+    missing_reasons: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,6 +128,7 @@ class OutlinePlan:
             "total_chapters": self.total_chapters,
             "summarized": self.summarized,
             "missing": self.missing,
+            "missing_reasons": self.missing_reasons,
             "blocks": len(self.blocks),
             "block_size": self.block_size,
             "est_input_tokens": self.est_input_tokens,
@@ -138,28 +160,100 @@ class OutlineResult:
 # ── 采集 ──────────────────────────────────────────────────
 
 
+MISSING_NO_ANNOTATION = "未跑标注"
+MISSING_FAILED = "标注失败"
+MISSING_SUMMARY_LOST = "梗概缺失"
+
+# 缺梗概有三种截然不同的成因，处理方式也不一样，不能混成一句「没跑过标注或标注失败」：
+#   · 未跑标注 → 去跑标注
+#   · 标注失败 → 先看失败原因，再决定重跑
+#   · 梗概缺失 → 标注其实跑成功了，只是 chapter_summary 这个字段没了
+#                （模型没写，或事后被别的工具覆盖），重跑这一章就能补回
+_MISSING_HINTS: dict[str, str] = {
+    MISSING_NO_ANNOTATION: "这一章还没有标注文件，跑标注就有",
+    MISSING_FAILED: "这一章的标注调用没能拿到可用结果，先看批跑面板的失败原因",
+    MISSING_SUMMARY_LOST: "标注跑成功了，但梗概字段是空的，重跑这一章可补回",
+}
+
+# 判断「这一章的标注到底成没成」时抽查的模型轨字段。
+_MODEL_PROBE_KEYS = (
+    "perspective",
+    "scene_switches",
+    "time_span",
+    "hook_strength",
+    "hook_type",
+    "emotion",
+    "conflict",
+    "info_release",
+    "mainline_progress",
+    "subplot_count",
+)
+# 抽查字段里填了这么多个，就认为模型当时确实给出了结果。
+_MODEL_PROBE_THRESHOLD = 3
+
+
+def _probe_filled(fields: dict) -> int:
+    return sum(1 for key in _MODEL_PROBE_KEYS if fields.get(key) not in (None, "", []))
+
+
 def collect_summaries(
     tasks: list[ChapterTask], annotations_dir: Path
-) -> tuple[list[tuple[ChapterTask, str]], list[ChapterTask]]:
+) -> tuple[list[tuple[ChapterTask, str]], list[tuple[ChapterTask, str]]]:
     """按章序取出逐章梗概。返回 (有梗概的, 缺梗概的)。
 
     缺梗概的章**不会**被静默跳过——调用方要明确报出缺了多少、
     以及这会让大纲的可信度打折扣。
+
+    缺梗概的每一项都带**原因**：同样是缺，成因不同、补救办法也不同，
+    只报一个总数等于让人猜。
     """
     have: list[tuple[ChapterTask, str]] = []
-    missing: list[ChapterTask] = []
+    missing: list[tuple[ChapterTask, str]] = []
     for task in tasks:
         record = load_annotation(Path(annotations_dir) / f"{task.chapter_id}.json")
-        summary = None
-        if record:
-            summary = (record.get("fields") or {}).get("chapter_summary")
-            if summary and record.get("errors"):
-                summary = None  # 这一章本身就是失败的，别拿它的梗概
-        if isinstance(summary, str) and summary.strip():
+        if not record:
+            missing.append((task, MISSING_NO_ANNOTATION))
+            continue
+
+        fields = record.get("fields") or {}
+        summary = fields.get("chapter_summary")
+        errors = record.get("errors") or []
+        usable = isinstance(summary, str) and bool(summary.strip())
+
+        if errors:
+            # 记了错误不等于这一章没跑成：别的模型字段都填上了，说明结果是好的，
+            # 只是梗概这一个字段后来没了（实测被演示模式整批覆盖过一次）。
+            # 只有模型字段也一起空着，才是真的没拿到结果。
+            if usable or _probe_filled(fields) < _MODEL_PROBE_THRESHOLD:
+                missing.append((task, MISSING_FAILED))
+            else:
+                missing.append((task, MISSING_SUMMARY_LOST))
+            continue
+
+        if usable:
             have.append((task, summary.strip()))
         else:
-            missing.append(task)
+            missing.append((task, MISSING_SUMMARY_LOST))
     return have, missing
+
+
+def summarize_missing(missing: list[tuple[ChapterTask, str]]) -> dict[str, int]:
+    """把缺梗概的章按原因归类计数。"""
+    out: dict[str, int] = {}
+    for _task, reason in missing:
+        out[reason] = out.get(reason, 0) + 1
+    return out
+
+
+def missing_detail(missing_reasons: dict[str, int]) -> list[dict[str, Any]]:
+    """缺梗概按原因摊开，带上「该怎么办」。
+
+    给界面用：只报「缺 500 章」，三种成因混在一起，看的人只能猜。
+    """
+    return [
+        {"reason": reason, "count": count, "hint": _MISSING_HINTS.get(reason, "")}
+        for reason, count in sorted(missing_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
 
 
 def build_outline_plan(
@@ -173,9 +267,13 @@ def build_outline_plan(
     price_input_per_mtok: float | None = None,
     price_output_per_mtok: float | None = None,
     bucket: str | None = None,
-    max_output_tokens: int = 1000,
+    max_output_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> OutlinePlan:
-    """算出这次要跑几块、大概花多少。**不发起任何调用。**"""
+    """算出这次要跑几块、大概花多少。**不发起任何调用。**
+
+    `max_output_tokens` 只用来估费，默认值要和实际用的输出预算一致，
+    不然「预估费用」会按一个早就被证明不够用的数字报给你。
+    """
     have, missing = collect_summaries(tasks, annotations_dir)
     warnings: list[str] = []
 
@@ -185,9 +283,13 @@ def build_outline_plan(
             "所以要先跑标注。"
         )
     elif missing:
+        reasons = summarize_missing(missing)
+        detail = "、".join(
+            f"{reason} {count} 章" for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1])
+        )
         warnings.append(
-            f"有 {len(missing)} 章缺梗概，大纲会缺这一段的内容。"
-            "缺的章不会被猜补——跑完标注再来会更完整。"
+            f"有 {len(missing)} 章缺梗概（{detail}），大纲会缺这一段的内容。"
+            "缺的章不会被猜补——按下面的原因分别处理后会更完整。"
         )
 
     size = max(1, block_size)
@@ -222,6 +324,7 @@ def build_outline_plan(
         total_chapters=len(tasks),
         summarized=len(have),
         missing=len(missing),
+        missing_reasons=summarize_missing(missing),
         blocks=blocks,
         est_input_tokens=est_in,
         est_output_tokens=est_out,
@@ -263,21 +366,56 @@ def _block_label(task_range: list[ChapterTask]) -> str:
     return f"{first.chapter_id} → {last.chapter_id}"
 
 
+@dataclass
+class OutlineCall:
+    """一次（可能重试多次的）调用结果。
+
+    `salvaged` 必须单独带出来：抢救出来的大纲比什么都没有强，但它**不是完整的**，
+    调用方要据此显式标注「有字段可能缺失」，不能当成一次正常成功。
+    """
+
+    payload: dict[str, Any] | None = None
+    error: str = ""
+    usage: dict[str, int] = field(default_factory=dict)
+    salvaged: bool = False
+    truncated: bool = False
+    max_tokens: int = 0
+
+    @property
+    def notice(self) -> str:
+        if not self.salvaged:
+            return ""
+        return (
+            f"输出撞上 max_tokens={self.max_tokens} 被截断，"
+            "只抢救出截断前的字段，后面的内容可能缺失。"
+        )
+
+
 def _call(
     client: OpenAICompatProvider,
     model_id: str,
     system: str,
     user: str,
     opts: OutlineOptions,
-) -> tuple[dict[str, Any] | None, str, dict[str, int]]:
-    """一次调用 + 重试。返回 (解析出的 JSON, 错误说明, usage)。"""
+) -> OutlineCall:
+    """一次调用 + 重试。撞上截断就加大输出预算重试，实在不行从截断处抢救。
+
+    旧版把「被截断」和「返回的不是 JSON」混成一个错误：写死 1200 token 的输出，
+    被砍断后原样重试三次（每次都在同一处被砍），最后报出来的是「返回内容不是 JSON」——
+    与真实病根毫无关系，还会让人以为是模型不守格式。
+    """
     extra = build_thinking_extra(opts.thinking, None)
+    budget = max(1, opts.max_tokens)
+    cap = max(budget, opts.max_tokens_cap)
+    attempts = max(1, opts.max_attempts)
     last_error = ""
     usage_total: dict[str, int] = {}
+    truncated = False
+    salvaged_payload: dict[str, Any] | None = None
     # 部分中转站不认 response_format=json_object，撞上 BAD_REQUEST 就降级为
     # 提示词约束 + 解析（extract_json_object 仍能抠出 JSON）。
     json_mode = True
-    for _attempt in range(1, max(1, opts.max_attempts) + 1):
+    for attempt in range(1, attempts + 1):
         try:
             result: ChatResult = client.chat(
                 model_id,
@@ -285,7 +423,7 @@ def _call(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=opts.max_tokens,
+                max_tokens=budget,
                 temperature=opts.temperature,
                 response_format={"type": "json_object"} if json_mode else None,
                 extra=extra,
@@ -295,17 +433,45 @@ def _call(
             if json_mode and exc.kind in (ErrorKind.BAD_REQUEST, ErrorKind.RESPONSE_UNPARSABLE):
                 json_mode = False
                 continue
+            if exc.kind == ErrorKind.RATE_LIMITED:
+                time.sleep(min(2.0 * attempt, 15.0))
+                continue
             continue
         if result.usage:
             for key, value in result.usage.to_dict().items():
                 if isinstance(value, int):
                     usage_total[key] = usage_total.get(key, 0) + value
         payload = extract_json_object(result.text)
-        if payload is None:
-            last_error = f"返回内容不是 JSON：{result.text[:120]}"
-            continue
-        return payload, "", usage_total
-    return None, last_error, usage_total
+        if payload is not None:
+            return OutlineCall(payload=payload, usage=usage_total, max_tokens=budget)
+
+        if result.truncated or looks_truncated(result.text):
+            truncated = True
+            repaired = repair_truncated_json(result.text)
+            if repaired is not None:
+                salvaged_payload = repaired
+            if budget < cap:
+                # 加大预算重试：整本书的结构本来就写不下，原样重试只会在同一处再被砍
+                budget = min(cap, budget * 2)
+                last_error = f"输出被 max_tokens 截断，已把上限提高到 {budget} 重试"
+                continue
+            # 预算已经加不动了。同一个预算再试一次只会在同一个位置再被砍一次，
+            # 旧版就是这样把几次调用全烧在同一个截断点上的，到这里就该停手。
+            last_error = f"输出撞上 max_tokens={budget} 被截断，且截断处没有可用的完整字段"
+            break
+        last_error = f"返回内容不是 JSON：{result.text[:120]}"
+
+    if salvaged_payload is not None:
+        return OutlineCall(
+            payload=salvaged_payload,
+            usage=usage_total,
+            salvaged=True,
+            truncated=True,
+            max_tokens=budget,
+        )
+    return OutlineCall(
+        error=last_error, usage=usage_total, truncated=truncated, max_tokens=budget
+    )
 
 
 def generate_outline(
@@ -347,16 +513,17 @@ def generate_outline(
             result.blocks.append(done_blocks[label])
             continue
 
-        payload, error, usage = _call(
+        call = _call(
             client,
             plan.model_id,
             _BLOCK_PROMPT,
             f"这一批是 {label}：\n\n{_block_text(block, summaries)}",
             opts,
         )
-        for key, value in usage.items():
+        for key, value in call.usage.items():
             result.usage[key] = result.usage.get(key, 0) + value
 
+        payload, error = call.payload, call.error
         if payload is None or not str(payload.get("summary") or "").strip():
             # 失败不落盘，重跑时会重试；也不伪造一个空块把缺口藏起来。
             result.errors.append(f"{label}：{error or '返回里没有 summary 字段'}")
@@ -368,6 +535,11 @@ def generate_outline(
                 "summary": str(payload["summary"]).strip(),
                 "chapters": [_chapter_ref(t) for t in block],
             }
+            if call.salvaged:
+                # 抢救出来的段梗概比什么都没有强，但它比别的段短一截。
+                # 标出来是为了别把它当成「这一段本来就这么简略」。
+                item["salvaged"] = True
+                result.errors.append(f"{label}：{call.notice}")
         result.blocks.append(item)
         _save_state(state_path, result, secrets)
 
@@ -378,28 +550,35 @@ def generate_outline(
         return result
 
     body = "\n\n".join(f"【{b['range']}】\n{b['summary']}" for b in usable)
-    payload, error, usage = _call(
+    call = _call(
         client,
         plan.model_id,
         _BOOK_PROMPT,
         f"《{plan.work}》共 {plan.total_chapters} 章，分为 {len(usable)} 段。各段梗概如下：\n\n{body}",
         opts,
     )
-    for key, value in usage.items():
+    for key, value in call.usage.items():
         result.usage[key] = result.usage.get(key, 0) + value
 
-    if payload is None:
-        result.errors.append(f"全书归约失败：{error}")
+    if call.payload is None:
+        result.errors.append(f"全书归约失败：{call.error}")
     else:
+        payload = call.payload
         payload["_meta"] = {
             "chapters": plan.total_chapters,
             "summarized": plan.summarized,
             "missing": plan.missing,
+            "missing_reasons": plan.missing_reasons,
+            "missing_detail": missing_detail(plan.missing_reasons),
             "blocks_used": len(usable),
             "blocks_failed": len(result.blocks) - len(usable),
+            "salvaged": call.salvaged,
             "model": plan.model_id,
             "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         }
+        if call.salvaged:
+            # 有总比没有强，但不能让这份残缺的大纲冒充完整的。
+            result.errors.append(f"全书归约：{call.notice}")
         result.outline = payload
 
     _save_state(state_path, result, secrets)
@@ -435,6 +614,8 @@ def render_markdown(work: str, result: OutlineResult, plan: OutlinePlan | None =
                      f"（缺 {meta.get('missing', '?')} 章）。")
         if meta.get("blocks_failed"):
             lines.append(f"**有 {meta['blocks_failed']} 段归约失败，这些段的内容不在下面的大纲里。**")
+        if meta.get("salvaged"):
+            lines.append("**这份大纲是从被截断的输出里抢救出来的，越靠后的字段越可能缺失。**")
         lines.append("")
 
         if outline.get("logline"):
@@ -498,6 +679,9 @@ def render_markdown(work: str, result: OutlineResult, plan: OutlinePlan | None =
         lines.append(f"### {block.get('range')}")
         if block.get("summary"):
             lines.append(str(block["summary"]))
+            if block.get("salvaged"):
+                lines.append("")
+                lines.append("（这一段是被截断的输出里抢救出来的，可能不完整）")
         else:
             lines.append(f"（这一段归约失败：{block.get('error') or '未完成'}）")
         lines.append("")

@@ -29,15 +29,23 @@ sys.path.insert(0, str(ROOT / "src"))
 from workshop.annotate import AnnotateOptions, save_annotation  # noqa: E402
 from workshop.batch import load_chapter_tasks  # noqa: E402
 from workshop.ingest import ingest, save_ingest  # noqa: E402
-from workshop.llm import OpenAICompatProvider  # noqa: E402
+from workshop.llm import ChatResult, OpenAICompatProvider  # noqa: E402
 from workshop.outline import (  # noqa: E402
+    MISSING_FAILED,
+    MISSING_NO_ANNOTATION,
+    MISSING_SUMMARY_LOST,
     OutlineOptions,
+    OutlineCall,
+    _BOOK_PROMPT,
     _block_label,
+    _call,
     build_outline_plan,
     collect_summaries,
     generate_outline,
+    missing_detail,
     render_markdown,
     save_outline,
+    summarize_missing,
 )
 from workshop.primitives import load_primitives  # noqa: E402
 from workshop.samples import build_synthetic_novel  # noqa: E402
@@ -134,6 +142,66 @@ def run(plan, *, responder=block_responder, max_attempts=1):
         )
 
 
+# ── 输出被截断 ──────────────────────────────────────────────
+#
+# 一部 545 章连载的真实运行：11 块段梗概全部成功，最后一步「全书归约」
+# 却报「返回内容不是 JSON」。真实原因是输出预算写死 1200，大纲正文还没写完
+# 就被砍断——截断的 JSON 必然不是合法 JSON，于是报错文案把病根盖住了。
+
+# 真实截断长得就是这样：写到 structure 的第二条，值还没写完就没了。
+BOOK_TRUNCATED = (
+    "{\n"
+    '  "logline": "怪力少年王铁柱觉醒变身魅魔异能，从校园打到火星。",\n'
+    '  "premise": "十八岁生日，王铁柱觉醒变身女性的怪力异能，被异能办事处定级。",\n'
+    '  "structure": [\n'
+    '    {"part": "第一段 第1-163章", "gist": "校园里的觉醒与成长。", "turn": "觉醒异能"},\n'
+    '    {"part": "第二段 第164-326章", "gist": "跨出国门的对抗'
+)
+
+BOOK_COMPLETE = json.dumps(
+    {
+        "logline": "怪力少年觉醒变身魅魔异能。",
+        "premise": "十八岁生日觉醒异能。",
+        "structure": [
+            {"part": "第一段", "gist": "校园觉醒。", "turn": "觉醒异能"},
+            {"part": "第二段", "gist": "跨出国门。", "turn": "公开异能"},
+        ],
+        "main_threads": [{"thread": "主线", "gist": "从校园打到火星"}],
+        "key_turns": ["觉醒", "公开"],
+        "ending": "在火星决战。",
+        "confidence": "中",
+        "uncertain_fields": [],
+    },
+    ensure_ascii=False,
+)
+
+
+class StubClient:
+    """假客户端：按提示词分派应答，并记下每次请求的 max_tokens。
+
+    finish_reason 由应答方显式给出：「模型把话说完了但没给 JSON」和
+    「被 max_tokens 砍断」是两回事，靠文本猜会把截断判断的逻辑测歪。
+    """
+
+    def __init__(self, responder) -> None:
+        self.responder = responder
+        self.seen_max_tokens: list[int] = []
+        self.secrets: list[str] = []
+
+    def chat(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int = 8,
+        temperature: float = 0.0,
+        response_format: dict | None = None,
+        extra: dict | None = None,
+    ) -> ChatResult:
+        self.seen_max_tokens.append(max_tokens)
+        text, finish = self.responder(messages, max_tokens)
+        return ChatResult(text=text, finish_reason=finish)
+
+
 # ── 用例 ──────────────────────────────────────────────────
 
 
@@ -160,6 +228,84 @@ def test_missing_partial_is_reported() -> None:
     check(plan.summarized == 3, "有梗概 3 章")
     check(plan.missing == 5, f"缺梗概 5 章（实际 {plan.missing}）")
     check(any("缺梗概" in w for w in plan.warnings), "警告里点出了缺口")
+
+
+def _write_annotation(cid: str, *, summary=None, errors=None, rich: bool = True) -> None:
+    """手造一份标注文件。rich=True 表示模型轨字段都填上了（这一章跑成功了）。"""
+    fields: dict = {"char_count": 100, "chapter_summary": summary}
+    if rich:
+        fields.update(
+            {
+                "perspective": "第三限知",
+                "scene_switches": 1,
+                "time_span": "即时",
+                "hook_strength": 3,
+                "hook_type": "期待",
+                "emotion": 3,
+            }
+        )
+    record = {
+        "chapter_id": cid,
+        "chapter_no": 1,
+        "status": "needs_review",
+        "fields": fields,
+        "source": {"sha256": f"fake-{cid}"},
+    }
+    if errors:
+        record["errors"] = errors
+    ANNOTATIONS.mkdir(parents=True, exist_ok=True)
+    (ANNOTATIONS / f"{cid}.json").write_text(
+        json.dumps(record, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def test_missing_reasons_are_distinguished() -> None:
+    """回归：三种缺梗概曾混成一句「没跑过标注或标注失败」。
+
+    一部 545 章的连载真实踩到：500 章的梗概是被演示模式误覆盖清空的，
+    既不是没跑标注、也不是标注失败，按那句提示根本不知道该怎么办。
+    """
+    print("缺梗概要按原因分开：未跑标注 / 标注失败 / 梗概缺失")
+
+    prepare(with_summaries=0)
+    tasks = load_chapter_tasks(INGEST)
+    c = [t.chapter_id for t in tasks]
+
+    _write_annotation(c[0], summary="正常梗概")                                   # 有梗概
+    _write_annotation(c[1])                                                        # 梗概缺失
+    _write_annotation(c[2], errors=["chapter_summary 被演示模式误覆盖，已置空"])   # 梗概缺失
+    _write_annotation(c[3], rich=False, errors=["模型返回不是 JSON"])              # 标注失败
+
+    _have, missing = collect_summaries(tasks, ANNOTATIONS)
+    reasons = summarize_missing(missing)
+
+    check(reasons.get(MISSING_SUMMARY_LOST) == 2, f"梗概缺失 2 章（实际 {reasons.get(MISSING_SUMMARY_LOST)}）")
+    check(reasons.get(MISSING_FAILED) == 1, f"标注失败 1 章（实际 {reasons.get(MISSING_FAILED)}）")
+    check(
+        reasons.get(MISSING_NO_ANNOTATION) == len(tasks) - 4,
+        f"未跑标注 {len(tasks) - 4} 章（实际 {reasons.get(MISSING_NO_ANNOTATION)}）",
+    )
+
+    # 关键：带 errors 不等于标注失败——别的模型字段都填上了就是梗概被清空
+    by_reason: dict = {}
+    for task, reason in missing:
+        by_reason.setdefault(reason, []).append(task.chapter_id)
+    check(
+        by_reason.get(MISSING_SUMMARY_LOST) == [c[1], c[2]],
+        f"被误覆盖的那章归到「梗概缺失」而不是「标注失败」（实际 {by_reason.get(MISSING_SUMMARY_LOST)}）",
+    )
+    check(by_reason.get(MISSING_FAILED) == [c[3]], "模型字段全空的才判为标注失败")
+
+    plan = plan_for(tasks=tasks)
+    check(plan.missing_reasons == reasons, "计划里带上了原因分布")
+    warn = " ".join(plan.warnings)
+    for reason in (MISSING_NO_ANNOTATION, MISSING_FAILED, MISSING_SUMMARY_LOST):
+        check(reason in warn, f"警告里点出了「{reason}」")
+
+    detail = missing_detail(reasons)
+    check(len(detail) == 3, f"按原因摊成 3 行（实际 {len(detail)}）")
+    check(all(d.get("hint") for d in detail), "每一行都给了「该怎么办」")
+    check(detail[0]["count"] >= detail[-1]["count"], "按章数从多到少排")
 
 
 def test_blocking_and_estimate() -> None:
@@ -335,6 +481,82 @@ def test_primitive_p22() -> None:
     )
 
 
+def test_book_reduction_escalates_budget() -> None:
+    """回归：书级归约被截断却报「返回内容不是 JSON」。
+
+    现在撞上截断就加大输出预算重试，不再原地重试三次后报一个与病根无关的错。
+    """
+    print("全书归约被截断时加大输出预算重试")
+
+    opts = OutlineOptions(max_tokens=1200, max_tokens_cap=32000, max_attempts=3)
+    client = StubClient(
+        lambda messages, budget: (BOOK_TRUNCATED, "length") if budget <= 1200 else (BOOK_COMPLETE, "stop")
+    )
+    call = _call(client, "mock-flash", _BOOK_PROMPT, "各段梗概如下", opts)
+
+    check(isinstance(call, OutlineCall), "返回结构化的结果，而不是裸三元组")
+    check(client.seen_max_tokens == [1200, 2400], f"第二次把预算翻倍（实际 {client.seen_max_tokens}）")
+    check(call.payload is not None and call.payload.get("ending") == "在火星决战。", "最终拿到完整大纲")
+    check(not call.salvaged, "拿到完整结果就不标记为「只抢救出部分」")
+    check(call.error == "", "没有错误，更不会报成「返回内容不是 JSON」")
+
+
+def test_salvage_when_budget_exhausted() -> None:
+    """预算加到顶还是截断时，保住截断前的字段，而不是整份大纲作废。"""
+    print("预算用尽时从截断处抢救")
+
+    opts = OutlineOptions(max_tokens=1200, max_tokens_cap=4800, max_attempts=5)
+    client = StubClient(lambda messages, budget: (BOOK_TRUNCATED, "length"))
+    call = _call(client, "mock-flash", _BOOK_PROMPT, "各段梗概如下", opts)
+
+    check(client.seen_max_tokens == [1200, 2400, 4800], f"预算递增到上限（实际 {client.seen_max_tokens}）")
+    check(call.salvaged, "标记为「只抢救出部分」，不假装完整")
+    check((call.payload or {}).get("logline"), "截断前的 logline 保住了")
+    check("截断" in call.notice, "说明里讲清了是截断，而不是含糊的「不是 JSON」")
+
+
+def test_non_json_is_not_called_truncation() -> None:
+    """反向的误判也要防：普通文字不能被打上「截断」的标签，预算也不能无谓翻倍。"""
+    print("不是 JSON 就不说是截断")
+
+    opts = OutlineOptions(max_tokens=8000, max_tokens_cap=32000, max_attempts=2)
+    client = StubClient(lambda messages, budget: ("这是一段普通文字，没有 JSON，也没被截断。", "stop"))
+    call = _call(client, "mock-flash", _BOOK_PROMPT, "各段梗概如下", opts)
+
+    check(call.payload is None, "解析不出大纲")
+    check(not call.truncated and not call.salvaged, "没有被误判成截断")
+    check("不是 JSON" in call.error, f"原因说的是「不是 JSON」（实际 {call.error[:30]}）")
+    check(set(client.seen_max_tokens) == {8000}, f"预算没有无谓地翻倍（实际 {client.seen_max_tokens}）")
+
+
+def test_salvaged_outline_is_marked() -> None:
+    """抢救出来的大纲必须显式标注可能缺字段，不能冒充完整产物。"""
+    print("抢救出来的大纲在产物和渲染里都标出来")
+    prepare()
+    plan = plan_for(block_size=3)
+
+    def responder(messages, budget):
+        system = str(messages[0].get("content") or "")
+        if "structure" in system:  # 书级归约的提示词里有 structure
+            return BOOK_TRUNCATED, "length"
+        return json.dumps({"summary": "（模拟）段落梗概"}, ensure_ascii=False), "stop"
+
+    client = StubClient(responder)
+    result = generate_outline(
+        plan=plan,
+        client=client,
+        annotations_dir=ANNOTATIONS,
+        opts=OutlineOptions(block_size=3, max_tokens=8000, max_attempts=1),
+    )
+
+    check(result.outline is not None, "仍然产出了大纲（有总比没有强）")
+    meta = (result.outline or {}).get("_meta") or {}
+    check(meta.get("salvaged") is True, "元信息里记了「是抢救出来的」")
+    check(any("截断" in e for e in result.errors), "错误列表里说清了真实病根")
+    md = render_markdown(WORK, result, plan)
+    check("抢救" in md, "渲染出的 Markdown 里也标了")
+
+
 def main() -> int:
     print("=" * 58)
     print("大纲链路自检")
@@ -344,11 +566,16 @@ def main() -> int:
         test_primitive_p22,
         test_no_summaries_is_explicit,
         test_missing_partial_is_reported,
+        test_missing_reasons_are_distinguished,
         test_blocking_and_estimate,
         test_generate_outline,
         test_failed_block_is_not_faked,
         test_block_label_with_restart,
         test_resume_from_state,
+        test_book_reduction_escalates_budget,
+        test_salvage_when_budget_exhausted,
+        test_non_json_is_not_called_truncation,
+        test_salvaged_outline_is_marked,
         test_markdown_and_save,
     ):
         try:

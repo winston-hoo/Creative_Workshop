@@ -8,6 +8,8 @@
   · 对已回收的伏笔再做动作要拦下来
   · 未回收清单必须进**变量部分**，不能污染固定前缀（否则缓存全失效）
   · 长期未推进的伏笔要能被识别为疑似断点
+  · **重跑同一章必须幂等**（一部 545 章的连载真实踩到：
+    重跑 20 章就让台账从 794 条涨到 825 条，全量重跑会让它翻倍）
 """
 
 from __future__ import annotations
@@ -232,6 +234,199 @@ def test_stale_detection() -> None:
     check(len(led.stale_items(current_chapter_no=50, threshold=30)) == 0, "推进后不再是断点")
 
 
+# ── 重跑幂等 ────────────────────────────────────────────────
+
+
+def _plants_in(led: Ledger, fid: str, chapter_id: str) -> list:
+    """某条目里由指定章产生的「埋设」事件。
+
+    不能直接数 events 总数：别的章的推进/回收事件也会留在同一条目上，
+    那是应该保留的（重跑只撤销本章痕迹）。
+    """
+    item = led.find(fid)
+    if item is None:
+        return []
+    return [e for e in item.events if e.chapter_id == chapter_id and e.action == "埋设"]
+
+
+def _book_ledger() -> Ledger:
+    """造一本小书的台账：c1 埋两条，c2 推进一条，c3 回收一条。"""
+    led = Ledger(work="演示作品")
+    led.apply(
+        chapter_id="c1",
+        chapter_no=1,
+        foreshadows=[
+            {"动作": "埋设", "编号": "", "描述": "主角身世有隐情"},
+            {"动作": "埋设", "编号": "", "描述": "反派的真面目未揭晓"},
+        ],
+    )
+    led.apply(
+        chapter_id="c2", chapter_no=2, foreshadows=[{"动作": "推进", "编号": "F-001", "描述": "身世线索浮现"}]
+    )
+    led.apply(
+        chapter_id="c3", chapter_no=3, foreshadows=[{"动作": "回收", "编号": "F-002", "描述": "真面目揭晓"}]
+    )
+    return led
+
+
+def test_rerun_same_chapter_is_idempotent() -> None:
+    """回归：重跑一章会把「推进」追加成两条 events。
+
+    同一章跑两次，台账必须和跑一次完全一样——条目数、events 数、
+    编号、状态全都一样。这是全量重跑 540 章能不能做的前提。
+    """
+    print("重跑同一章：结果不变")
+
+    once = _book_ledger()
+    twice = _book_ledger()
+    twice.apply(
+        chapter_id="c2", chapter_no=2, foreshadows=[{"动作": "推进", "编号": "F-001", "描述": "身世线索浮现"}]
+    )
+
+    check(len(twice.items) == len(once.items), f"条目数不变（{len(once.items)} → {len(twice.items)}）")
+    check(
+        sum(len(i.events) for i in twice.items) == sum(len(i.events) for i in once.items),
+        f"events 总数不变（{sum(len(i.events) for i in once.items)} → "
+        f"{sum(len(i.events) for i in twice.items)}）",
+    )
+    check([i.id for i in twice.items] == [i.id for i in once.items], "编号集合不变")
+    check(
+        [i.status for i in twice.items] == [i.status for i in once.items],
+        "回收状态不变（c3 的回收没有被误撤销）",
+    )
+
+    # 反复跑同一个动作也不能涨
+    for _ in range(3):
+        twice.apply(
+            chapter_id="c2",
+            chapter_no=2,
+            foreshadows=[{"动作": "推进", "编号": "F-001", "描述": "身世线索浮现"}],
+        )
+    check(
+        len(twice.find("F-001").events) == len(once.find("F-001").events),
+        f"反复重跑同一章 events 不累积（{len(once.find('F-001').events)} → "
+        f"{len(twice.find('F-001').events)}）",
+    )
+
+
+def test_rerun_reuses_planted_id() -> None:
+    """回归：重跑一章，上次埋的伏笔被当成新伏笔又发一个编号。
+
+    描述措辞漂一点也要认出来是同一条，复用原编号。
+    """
+    print("重跑埋设：复用旧编号而不是发新号")
+
+    led = _book_ledger()
+    before = set(i.id for i in led.items)
+    seq_before = led.next_seq
+
+    report = led.apply(
+        chapter_id="c1",
+        chapter_no=1,
+        foreshadows=[
+            {"动作": "埋设", "编号": "", "描述": "主角身世藏着隐情"},  # 措辞变了
+            {"动作": "埋设", "编号": "", "描述": "反派真面目还没揭晓"},  # 措辞变了
+        ],
+    )
+
+    check(set(i.id for i in led.items) == before, f"编号集合没变（{sorted(before)}）")
+    check(led.next_seq == seq_before, f"没有消耗新编号（next_seq {seq_before} → {led.next_seq}）")
+    check(report.added == ["F-001", "F-002"], f"复用的正是原来的编号（实际 {report.added}）")
+    check(
+        all(len(_plants_in(led, fid, "c1")) == 1 for fid in ("F-001", "F-002")),
+        "每条各自只有一个 c1 的埋设事件（不重复堆积）",
+    )
+
+
+def test_rerun_distinguishes_different_foreshadow() -> None:
+    """反向：真的是新伏笔时不能硬并到旧条目上。"""
+    print("重跑埋设：真·新伏笔要发新号")
+
+    led = _book_ledger()
+    report = led.apply(
+        chapter_id="c1",
+        chapter_no=1,
+        foreshadows=[{"动作": "埋设", "编号": "", "描述": "主角身世有隐情"}, {"动作": "埋设", "编号": "", "描述": "外星舰队已在路上"}],
+    )
+
+    check("F-003" in report.added, f"全新的伏笔拿到新编号（实际 {report.added}）")
+    check(len(_plants_in(led, "F-001", "c1")) == 1, "旧条目被复用而不是被并掉")
+    # 这一轮没有重新埋 F-002，它就不该有新的埋设事件；
+    # 但条目本身要留着（宁可多留一条也不丢信息），别的章的回收记录也还在。
+    check(len(_plants_in(led, "F-002", "c1")) == 0, "没重新埋的不会凭空长出埋设事件")
+    check(led.find("F-002") is not None, "没重新埋的旧条目仍然保留，没有被删掉")
+    check(not led.find("F-002").is_open, "它身上别的章做的回收记录还在")
+    check(led.find("F-003").desc == "外星舰队已在路上", "新条目描述正确")
+
+
+def test_rerun_undoes_this_chapters_recovery() -> None:
+    """回收动作若正是这一章做的，重跑时应先撤销——否则状态会卡在「已回收」。
+
+    反过来，别的章做的回收不能被这一章的重跑误撤销。
+    """
+    print("重跑撤销本章的回收，但不动别章的")
+
+    led = _book_ledger()
+    check(not led.find("F-002").is_open, "前置：F-002 已被 c3 回收")
+
+    # c3 重跑，但这次只推进不回收
+    led.apply(
+        chapter_id="c3", chapter_no=3, foreshadows=[{"动作": "推进", "编号": "F-002", "描述": "真面目仍未揭晓"}]
+    )
+    check(led.find("F-002").is_open, "c3 不再回收它，状态退回未回收")
+    check(len(led.find("F-002").events) == 2, f"只留下埋设+推进两条（实际 {len(led.find('F-002').events)}）")
+
+    # c1 重跑，不能影响 c3 做的回收判定
+    led2 = _book_ledger()
+    led2.apply(
+        chapter_id="c1", chapter_no=1, foreshadows=[{"动作": "埋设", "编号": "", "描述": "主角身世有隐情"}]
+    )
+    check(not led2.find("F-002").is_open, "别的章重跑不会误撤销 c3 的回收")
+
+
+def test_rerun_prunes_unconfirmed_plants() -> None:
+    """回归：只撤销不清理，台账会只增不减。
+
+    上一轮埋的、这一轮没再确认的条目是孤儿，必须清掉，
+    否则每重跑一轮就攒一批，全量重跑后台账会明显膨胀。
+    """
+    print("重跑清理：本章埋过但这一轮没再埋的要清掉")
+
+    led = Ledger()
+    led.apply(
+        chapter_id="c1",
+        chapter_no=1,
+        foreshadows=[
+            {"动作": "埋设", "编号": "", "描述": "甲的旧伏笔"},
+            {"动作": "埋设", "编号": "", "描述": "乙的旧伏笔"},
+        ],
+    )
+    # 乙后来被第 2 章推进过，它身上带着别的章的痕迹
+    led.apply(
+        chapter_id="c2", chapter_no=2, foreshadows=[{"动作": "推进", "编号": "F-002", "描述": "乙的线索又出现"}]
+    )
+    check(len(led.items) == 2, "前置：两条都在")
+
+    led.apply(
+        chapter_id="c1", chapter_no=1, foreshadows=[{"动作": "埋设", "编号": "", "描述": "甲的旧伏笔"}]
+    )
+
+    check(led.find("F-001") is not None, "这一轮仍确认的甲保留")
+    check(led.find("F-002") is not None, "被别的章推进过的乙不会被误删")
+    check(len(led.items) == 2, f"没有凭空多出条目（实际 {len(led.items)}）")
+    check(len(_plants_in(led, "F-002", "c1")) == 0, "乙身上 c1 的埋设痕迹已撤销")
+    check(
+        len([e for e in led.find("F-002").events if e.chapter_id == "c2"]) == 1,
+        "但 c2 的推进痕迹还在（别的章的记录不受这一章重跑影响）",
+    )
+
+    # 这一章一个伏笔都不报了：它自己埋的、且没人碰过的条目要清干净
+    led2 = Ledger()
+    led2.apply(chapter_id="c1", chapter_no=1, foreshadows=[{"动作": "埋设", "编号": "", "描述": "丙"}])
+    led2.apply(chapter_id="c1", chapter_no=1, foreshadows=[])
+    check(len(led2.items) == 0, f"本章不再确认的条目被清掉（实际 {len(led2.items)}）")
+
+
 # ── 持久化 ──────────────────────────────────────────────────
 
 
@@ -342,6 +537,11 @@ def main() -> int:
         test_partial_bad_items_do_not_kill_whole_list,
         test_context_excludes_recovered_and_shows_gap,
         test_stale_detection,
+        test_rerun_same_chapter_is_idempotent,
+        test_rerun_reuses_planted_id,
+        test_rerun_distinguishes_different_foreshadow,
+        test_rerun_undoes_this_chapters_recovery,
+        test_rerun_prunes_unconfirmed_plants,
         test_roundtrip,
         test_missing_file_is_empty_ledger,
         test_ledger_context_goes_to_variable_tail,

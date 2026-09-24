@@ -1089,6 +1089,12 @@ function renderTaskArea() {
       <div class="row" id="entity-actions">
         <a class="btn ghost" id="entity-link" href="#/work/${encodeURIComponent(taskState.name)}/entities"
            style="text-decoration:none;color:inherit;display:none">查看实体</a>
+        <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:14px;margin:0">
+          本次只跑
+          <input id="entity-limit" type="number" min="1" max="500" step="1"
+                 placeholder="全部" style="width:76px;padding:6px 8px">
+          块
+        </label>
         <button id="entity-run">生成实体统计</button>
       </div>
     </div>
@@ -1115,6 +1121,12 @@ function renderTaskArea() {
   if (outlineBtn) outlineBtn.onclick = () => startOutline(outlineBtn);
   const entityBtn = document.getElementById('entity-run');
   if (entityBtn) entityBtn.onclick = () => startEntitiesGen(entityBtn);
+  const entityLimit = document.getElementById('entity-limit');
+  if (entityLimit) {
+    entityLimit.onkeydown = (e) => {
+      if (e.key === 'Enter') startEntitiesGen(entityBtn);
+    };
+  }
   loadOutlineInfo();
   loadEntitiesInfo();
 
@@ -1155,6 +1167,39 @@ function modelSelector(plan, id) {
   </select>`;
 }
 
+/* 实体统计的分次进度。已完成的块下次直接复用、不再花钱，所以
+   「还剩几块」直接决定下一次要花多少——必须摆在按钮旁边，不能让人自己数。 */
+function entityProgressHtml(prog) {
+  const p = prog || {};
+  const total = p.total || 0;
+  if (!total) return '';
+  const left = (p.failed || 0) + (p.pending || 0);
+
+  const chips = [
+    `<span class="chip ok">已完成 ${num(p.done)}/${num(total)} 块</span>`,
+    p.failed ? `<span class="chip bad">失败 ${num(p.failed)} 块</span>` : '',
+    p.pending ? `<span class="chip">还没跑 ${num(p.pending)} 块</span>` : '',
+    p.salvaged ? `<span class="chip warn">被截断 ${num(p.salvaged)} 块</span>` : '',
+  ]
+    .filter(Boolean)
+    .join('');
+
+  let note;
+  if (left) {
+    note =
+      `还剩 <strong>${num(left)}</strong> 块要跑。点下面的按钮只跑这些，` +
+      `已完成的 ${num(p.done)} 块不会重复花钱。`;
+  } else if (p.salvaged) {
+    note = `全部 ${num(total)} 块都跑过了，但有 ${num(p.salvaged)} 块输出被截断，<strong>只抢救出截断前的部分实体，可能不完整</strong>。`;
+  } else {
+    note = `全部 ${num(total)} 块都跑完了。`;
+  }
+  return (
+    `<div class="row wrap" style="margin-top:10px;gap:6px">${chips}</div>` +
+    `<p class="muted" style="margin:6px 0 0;font-size:13px">${note}</p>`
+  );
+}
+
 async function loadEntitiesInfo(modelOverride) {
   const box = document.getElementById('entity-info');
   if (!box) return;
@@ -1174,6 +1219,9 @@ async function loadEntitiesInfo(modelOverride) {
   const link = document.getElementById('entity-link');
   if (link && plan.has_result) link.style.display = '';
 
+  const prog = plan.progress || {};
+  const left = (prog.failed || 0) + (prog.pending || 0);
+
   const rows = [
     ['模型', modelSelector(plan, 'entity-model')],
     ['分块', `${num(plan.blocks)} 块（每块 ${num(plan.block_size)} 章）`],
@@ -1187,31 +1235,69 @@ async function loadEntitiesInfo(modelOverride) {
     <p style="margin:8px 0 0;font-size:14px">${
       plan.est_cost_cny == null ? esc(plan.price_note) : `预估费用：<strong>≈ ¥${plan.est_cost_cny}</strong>`
     }</p>
+    ${entityProgressHtml(prog)}
   `;
   const entityModel = document.getElementById('entity-model');
   if (entityModel) {
     entityModel.onchange = () => loadEntitiesInfo(entityModel.value);
   }
+  // 按钮文案要说清这次到底要跑多少：跑了一半再点，跑的是没跑的那些，不是全部重来
+  const runBtn = document.getElementById('entity-run');
+  if (runBtn) {
+    runBtn.textContent =
+      left > 0 && prog.done > 0 ? `继续生成（还有 ${num(left)} 块）` : '生成实体统计';
+  }
+  // 刷新页面时任务可能还在跑：把进度与「停止」按钮接回来
+  if (plan.running) pollEntities();
 }
 
 async function startEntitiesGen(button) {
   const plan = taskState.entitiesPlan;
   if (!plan) return;
 
+  const prog = plan.progress || {};
+  const left = (prog.failed || 0) + (prog.pending || 0);
+  // 跑了一半再点，跑的是没跑的那些。确认框里必须写清这一点，
+  // 否则用户没法判断这次会不会又把钱花在已经跑好的块上。
+  const resuming = left > 0 && prog.done > 0;
+  const runCount = entitiesRunCount(plan);
+  if (!runCount) {
+    // 全部块都已跑完，缓存直接命中，一次调用都不会发。
+    // 与其弹个框说「本次要跑 11 块」，不如说清这里已经没有可跑的了。
+    await tellUser(
+      '没有需要跑的块',
+      `<p style="margin:0">${num(plan.blocks)} 块全部已完成，这一轮不会重新调用模型，也不会产生费用。</p>` +
+        `<p class="muted" style="margin:8px 0 0">想从头重跑，需要先删掉 <code>50-entities/_state.json</code>。</p>`
+    );
+    return;
+  }
+  const perBlock =
+    plan.est_cost_cny != null && plan.blocks ? plan.est_cost_cny / plan.blocks : null;
+
+  const costLine =
+    plan.est_cost_cny == null
+      ? '费用：<strong>未填写单价，算不出来</strong>'
+      : runCount < plan.blocks
+        ? `预估费用：<strong>≈ ¥${(perBlock * runCount).toFixed(2)}</strong>` +
+          `（本次 ${num(runCount)} 块；全量 ${num(plan.blocks)} 块约 ¥${plan.est_cost_cny}）`
+        : `预估费用：<strong>≈ ¥${plan.est_cost_cny}</strong>`;
+
   const ok = await askConfirm({
-    title: '生成世界观与人物',
+    title: resuming ? '继续生成实体统计' : '生成世界观与人物',
     html:
       `<dl class="kv">` +
       `<dt>服务商</dt><dd>${esc(plan.provider_name || plan.provider)} / ${esc(plan.model)}</dd>` +
       `<dt>范围</dt><dd>${num(plan.total_chapters)} 章，分 ${num(plan.blocks)} 块</dd>` +
+      `<dt>本次要跑</dt><dd>${num(runCount)} 块` +
+      (resuming ? `（已完成的 ${num(prog.done)} 块直接复用，不重复花钱）` : '') +
+      `</dd>` +
+      (runCount < left
+        ? `<dt>跑完之后</dt><dd>还剩 ${num(left - runCount)} 块，下次接着跑，不用重来</dd>`
+        : '') +
       `</dl>` +
-      `<p style="margin:14px 0 0;font-size:14px">` +
-      (plan.est_cost_cny == null
-        ? '费用：<strong>未填写单价，算不出来</strong>'
-        : `预估费用：<strong>≈ ¥${plan.est_cost_cny}</strong>`) +
-      `</p>` +
-      notice('warn', '会发起模型调用、产生费用。'),
-    confirmLabel: '开始生成',
+      `<p style="margin:14px 0 0;font-size:14px">${costLine}</p>` +
+      notice('warn', '会发起模型调用、产生费用。中途可以停下，没跑的块下次接着跑。'),
+    confirmLabel: resuming ? `继续跑 ${num(runCount)} 块` : `开始跑 ${num(runCount)} 块`,
   });
   if (!ok) return;
 
@@ -1219,11 +1305,10 @@ async function startEntitiesGen(button) {
     try {
       await postJSON(
         `/api/works/${encodeURIComponent(taskState.name)}/entities/start?block_size=${plan.block_size}` +
-          `&model=${encodeURIComponent(plan.model)}`,
+          `&model=${encodeURIComponent(plan.model)}` +
+          (entitiesLimit() ? `&limit=${entitiesLimit()}` : ''),
         {}
       );
-      const box = document.getElementById('entity-info');
-      if (box) box.innerHTML = notice('info', '正在抽取实体，完成后这里的提示会变。');
       pollEntities();
     } catch (e) {
       await tellUser('启动失败', `<p style="margin:0">${esc(e.message)}</p>`);
@@ -1231,8 +1316,30 @@ async function startEntitiesGen(button) {
   });
 }
 
+/* 「本次只跑 N 块」输入框的值。留空 = 把剩下的全跑完。 */
+function entitiesLimit() {
+  const input = document.getElementById('entity-limit');
+  if (!input) return null;
+  const value = Math.floor(Number(input.value));
+  if (!Number.isFinite(value) || value < 1) return null;
+  return Math.min(value, 500);
+}
+
+/* 这次到底会发起几次调用。填的 N 比剩下的块数还大时，实际就是全跑完。 */
+function entitiesRunCount(plan) {
+  const prog = plan.progress || {};
+  const left = (prog.failed || 0) + (prog.pending || 0);
+  // 没有剩余 = 这一轮一次调用都不会发（已完成的块直接复用缓存）。
+  // 这时候不能报「本次要跑 11 块」，那是句假话。
+  if (!left) return 0;
+  const limit = entitiesLimit();
+  return limit ? Math.min(limit, left) : left;
+}
+
 let entityTimer = null;
 
+/* 运行中要能看到「跑到第几块了」，还要能停下来。
+   停下来不是放弃：已完成的块留在 _state.json 里，下次接着跑不重复花钱。 */
 function pollEntities() {
   if (entityTimer) return;
   entityTimer = setInterval(async () => {
@@ -1243,18 +1350,68 @@ function pollEntities() {
       return;
     }
     const box = document.getElementById('entity-info');
-    if (box) {
-      box.innerHTML = st.running
-        ? notice('info', '<span class="spinner"></span>正在抽取实体…')
-        : st.has_result
-          ? notice('ok', '实体统计已生成，点上面的「查看实体」')
-          : notice('warn', '任务结束了但没有产出，检查运行记录');
+    if (box && st.running) {
+      const p = st.progress || {};
+      box.innerHTML =
+        notice(
+          'info',
+          `<span class="spinner"></span>正在抽取实体… 第 <strong>${num(p.done)}/${num(p.total)}</strong> 块` +
+            (p.label ? `（${esc(p.label)}）` : '')
+        ) +
+        `<div class="row" style="margin-top:8px;align-items:center;gap:10px">
+           <button id="entity-stop" class="ghost">停止</button>
+           <span class="muted" style="font-size:13px">当前块跑完即停，已完成的块会保留，下次接着跑</span>
+         </div>`;
+      const stopBtn = document.getElementById('entity-stop');
+      if (stopBtn) stopBtn.onclick = () => stopEntitiesGen(stopBtn);
     }
     if (!st.running) {
       clearInterval(entityTimer);
       entityTimer = null;
+      if (box) {
+        const pending = st.pending || 0;
+        box.innerHTML = st.error
+          ? notice(
+              'warn',
+              `任务结束，但最后有报错：<br><span class="muted">${esc(st.error)}</span>` +
+                (st.has_result ? '<br>已完成的块仍然保留，点下面的按钮接着跑。' : '')
+            )
+          : st.has_result
+            ? notice(
+                'ok',
+                pending
+                  ? `这一轮跑完了，还有 ${num(pending)} 块没跑（被停下来了）。点下面的按钮接着跑。`
+                  : '实体统计已生成，点上面的「查看实体」'
+              )
+            : notice('warn', '任务结束了但没有产出，检查运行记录');
+      }
+      // 跑完之后刷新进度与按钮文案，否则按钮还停在「生成实体统计」
+      const sel = document.getElementById('entity-model');
+      loadEntitiesInfo(sel ? sel.value : undefined);
     }
   }, 2000);
+}
+
+async function stopEntitiesGen(button) {
+  const ok = await askConfirm({
+    title: '停止生成实体',
+    html:
+      '<p style="margin:0">当前这一块跑完就会停下。</p>' +
+      '<p class="muted" style="margin:8px 0 0">已经跑完的块会保留，下次点「继续生成」只跑剩下的，不会重复花钱。</p>',
+    confirmLabel: '停止',
+  });
+  if (!ok) return;
+  await withBusy(button, '停止中…', async () => {
+    try {
+      const res = await postJSON(
+        `/api/works/${encodeURIComponent(taskState.name)}/entities/stop`,
+        {}
+      );
+      if (!res.ok) await tellUser('停不下来', `<p style="margin:0">${esc(res.message || '没有正在运行的任务')}</p>`);
+    } catch (e) {
+      await tellUser('停止失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    }
+  });
 }
 
 /* ── 大纲 ──────────────────────────────────────────────────
@@ -1293,6 +1450,7 @@ async function loadOutlineInfo() {
         : `预估费用：<strong>≈ ¥${plan.est_cost_cny}</strong>`
     }</p>
     ${(plan.warnings || []).map((w) => notice('warn', esc(w))).join('')}
+    ${missingNotice(plan)}
   `;
   const outlineModel = document.getElementById('outline-model');
   if (outlineModel) {
@@ -1663,11 +1821,11 @@ async function loadChapters() {
                     ${selected.has(ch.id) ? 'checked' : ''}></td>
               <td>${esc(ch.id)}</td>
               <td>${ch.unnumbered ? '<span class="chip">无编号</span>' : ch.chapter_no}</td>
-              <td>${
-                ch.title
-                  ? chapterLink(detailState.name, ch.id, esc(ch.title))
-                  : '<span class="muted">（无标题）</span>'
-              }</td>
+              <td>${chapterLink(
+                detailState.name,
+                ch.id,
+                ch.title ? esc(ch.title) : `<span class="muted">${esc(chapterLabel(ch))}</span>`
+              )}</td>
               <td class="num">${num(ch.chars)}</td>
               <td>${annotChip(ch)}</td>
               <td>${ch.status === 'repaired' ? '<span class="chip info">已修复</span>' : '<span class="muted">正常</span>'}</td>
@@ -2746,6 +2904,12 @@ function chapterLink(name, id, label) {
   return `<a href="#/work/${encodeURIComponent(name)}/chapter/${encodeURIComponent(id)}">${label}</a>`;
 }
 
+/* 原文标题为空时（如「第一章」独占一行）给个能点的标签。
+   这一格以前直接渲染成「（无标题）」纯文本，整格没有链接，用户点不进去看正文。 */
+function chapterLabel(ch) {
+  return ch.unnumbered ? '（无编号章）' : `第${ch.chapter_no ?? '·'}章`;
+}
+
 async function renderChapter(name, chapterId) {
   setTab('');
   chapterState.name = name;
@@ -2937,6 +3101,33 @@ document.addEventListener('keydown', (e) => {
 
 /* ── 大纲页 ────────────────────────────────────────────── */
 
+/* 缺梗概要按原因摊开：同样是「缺」，未跑标注、标注失败、梗概缺失
+   三件事的处理办法完全不同，只报一个总数等于让人猜。 */
+function missingNotice(src) {
+  const total = src.missing || 0;
+  if (!total) return '';
+  const detail = src.missing_detail || [];
+  if (!detail.length) {
+    return notice('warn', `有 ${num(total)} 章缺梗概，大纲里没有这部分内容。`);
+  }
+  const rows = detail
+    .map(
+      (d) => `<tr>
+        <td>${esc(d.reason)}</td>
+        <td class="num">${num(d.count)} 章</td>
+        <td class="muted">${esc(d.hint || '')}</td>
+      </tr>`
+    )
+    .join('');
+  return (
+    notice('warn', `有 ${num(total)} 章缺梗概，大纲里没有这部分内容。按原因分开看：`) +
+    `<div class="table-wrap" style="margin-top:8px;margin-bottom:8px"><table>
+      <thead><tr><th>原因</th><th class="num">章数</th><th>该怎么办</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`
+  );
+}
+
 async function renderOutline(name) {
   setTab('');
   view.innerHTML = '<p class="muted">读取大纲…</p>';
@@ -2977,11 +3168,7 @@ async function renderOutline(name) {
       }
     </p>
 
-    ${
-      meta.missing
-        ? notice('warn', `有 ${num(meta.missing)} 章缺梗概（没跑过标注或标注失败），大纲里没有这部分内容。`)
-        : ''
-    }
+    ${missingNotice(meta)}
     ${
       meta.blocks_failed
         ? notice('bad', `有 ${num(meta.blocks_failed)} 段归约失败，这些段的内容不在下面的大纲里。`)
@@ -3223,7 +3410,13 @@ async function renderEntities(name) {
 
   const m = latest.merged || {};
   const counts = m.counts || {};
-  const failed = (latest.blocks || []).filter((b) => b.error);
+  const blocks = latest.blocks || [];
+  // 三种「表里没有」要分开说：失败、还没跑、被截断只抢救出部分。
+  // 混成一个「失败」会把「压根没跑」说成「跑了但错了」，也会把「不完整」说成「没有」。
+  const failed = blocks.filter((b) => b.error);
+  const pending = blocks.filter((b) => b.pending);
+  const salvaged = blocks.filter((b) => b.salvaged);
+  const left = failed.length + pending.length;
   const table = (headers, rows) =>
     rows.length
       ? `<div class="table-wrap"><table><thead><tr>${headers
@@ -3231,19 +3424,32 @@ async function renderEntities(name) {
           .join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`
       : '<p class="muted">无数据</p>';
 
-  const failedDetail = failed.length
-    ? `<details style="margin:10px 0 0">
-        <summary>失败详情（${failed.length} 块）</summary>
-        <ul class="list">${failed
+  const detail = (title, items, text) =>
+    items.length
+      ? `<details style="margin:10px 0 0">
+        <summary>${esc(title)}（${items.length} 块）</summary>
+        <ul class="list">${items
           .map(
             (b) =>
               `<li><strong>${esc(b.range)}</strong><div class="muted" style="white-space:pre-wrap">${esc(
-                b.error || '未知错误'
+                text(b)
               )}</div></li>`
           )
           .join('')}</ul>
       </details>`
-    : '';
+      : '';
+
+  const failedDetail = detail('失败详情', failed, (b) => b.error || '未知错误');
+  const pendingDetail = detail(
+    '还没跑的块',
+    pending,
+    () => '分次执行或中途停下时没轮到这一块。下次点「继续生成」会补上，已完成的块不会重复花钱。'
+  );
+  const salvagedDetail = detail(
+    '被截断、只抢救出部分的块',
+    salvaged,
+    (b) => b.notice || '输出撞上 max_tokens 被截断，只抢救出截断前的部分实体。'
+  );
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
@@ -3259,10 +3465,53 @@ async function renderEntities(name) {
       <span class="chip">地点 ${num(counts.locations)}</span>
       <span class="chip">关系 ${num(counts.relations)}</span>
       ${failed.length ? `<span class="chip bad">失败 ${num(failed.length)} 块</span>` : ''}
-      ${failed.length ? `<button id="retry-entities" class="ghost">重试失败的块</button>` : ''}
+      ${pending.length ? `<span class="chip">还没跑 ${num(pending.length)} 块</span>` : ''}
+      ${salvaged.length ? `<span class="chip warn">被截断 ${num(salvaged.length)} 块</span>` : ''}
+      ${left ? `<button id="retry-entities" class="ghost">继续生成（还有 ${num(left)} 块）</button>` : ''}
+      ${
+        left
+          ? `<label class="muted" style="display:flex;align-items:center;gap:6px;font-size:14px;margin:0">
+               本次只跑
+               <input id="entity-limit" type="number" min="1" max="500" step="1"
+                      placeholder="全部" style="width:76px;padding:6px 8px">
+               块
+             </label>`
+          : ''
+      }
     </div>
 
-    ${failed.length ? notice('bad', `有 ${failed.length} 块抽取失败，这些段里的实体不在下面的表里：${esc(failed.map((b) => b.range).join('、'))}`) + failedDetail : ''}
+    ${
+      failed.length
+        ? notice(
+            'bad',
+            `有 ${failed.length} 块抽取失败，这些段里的实体不在下面的表里：${esc(
+              failed.map((b) => b.range).join('、')
+            )}`
+          )
+        : ''
+    }
+    ${
+      pending.length
+        ? notice(
+            'warn',
+            `有 ${pending.length} 块还没跑（分次执行或中途停下），这些段里的实体同样不在下面的表里：${esc(
+              pending.map((b) => b.range).join('、')
+            )}`
+          )
+        : ''
+    }
+    ${
+      salvaged.length
+        ? notice(
+            'warn',
+            `有 ${salvaged.length} 块输出被截断，<strong>只抢救出截断前的部分实体，可能不完整</strong>：${esc(
+              salvaged.map((b) => b.range).join('、')
+            )}`
+          )
+        : ''
+    }
+    ${failedDetail}${pendingDetail}${salvagedDetail}
+    <div id="entity-run-progress" style="margin:0 0 14px"></div>
 
     <div class="card">
       <h2>人物（${num(counts.characters)}）</h2>
@@ -3327,9 +3576,9 @@ async function renderEntities(name) {
   if (retryBtn) retryBtn.onclick = () => retryFailedEntities(name, latest);
 }
 
-/* 重试失败的实体块。失败块的错误原因已在页面上方展示；
-   重试流程直接复用「生成实体统计」，_state.json 会让成功的块跳过，
-   只把失败的块重新抽一遍。 */
+/* 接着跑没跑完的实体块（失败的和被停下时没轮到的）。
+   失败的块不会落进「已完成」，所以复用同一个入口就够；
+   _state.json 让成功的块跳过，只把剩下的重新抽一遍。 */
 async function retryFailedEntities(name, latest) {
   if (!latest) return;
   let plan;
@@ -3339,18 +3588,27 @@ async function retryFailedEntities(name, latest) {
     await tellUser('读不到实体统计计划', `<p style="margin:0">${esc(e.message)}</p>`);
     return;
   }
+  const prog = plan.progress || {};
+  const left = (prog.failed || 0) + (prog.pending || 0);
+  if (!left) return;
+  const runCount = entitiesRunCount(plan);
   const ok = await askConfirm({
-    title: '重试失败的块',
+    title: '继续生成实体统计',
     html:
-      `<p style="margin:0">只重新抽取失败的块，已成功的不动。</p>` +
-      `<p class="muted" style="margin:8px 0 0">会发起模型调用、产生费用。预估与首次生成相同。</p>`,
-    confirmLabel: '开始重试',
+      `<p style="margin:0">本次跑剩下的 <strong>${num(runCount)}</strong> 块：` +
+      `共剩 ${num(prog.failed || 0)} 块失败 + ${num(prog.pending || 0)} 块还没跑。</p>` +
+      (runCount < left
+        ? `<p class="muted" style="margin:8px 0 0">跑完之后还剩 ${num(left - runCount)} 块，下次接着跑。</p>`
+        : '') +
+      `<p class="muted" style="margin:8px 0 0">已完成的 ${num(prog.done || 0)} 块直接复用，不会重复花钱。</p>`,
+    confirmLabel: `继续跑 ${num(runCount)} 块`,
   });
   if (!ok) return;
   try {
     await postJSON(
       `/api/works/${encodeURIComponent(name)}/entities/start?block_size=${plan.block_size}` +
-        `&model=${encodeURIComponent(plan.model)}`,
+        `&model=${encodeURIComponent(plan.model)}` +
+        (entitiesLimit() ? `&limit=${entitiesLimit()}` : ''),
       {}
     );
     await pollEntitiesDone(name);
@@ -3359,7 +3617,10 @@ async function retryFailedEntities(name, latest) {
   }
 }
 
+/* 实体页上等任务跑完。顺带把进度画出来——这一段动辄几十块，
+   只转个圈不说跑到哪了，用户没法判断还要不要等下去。 */
 async function pollEntitiesDone(name) {
+  const box = document.getElementById('entity-run-progress');
   for (let i = 0; i < 600; i++) {
     await new Promise((r) => setTimeout(r, 2000));
     let st;
@@ -3367,6 +3628,14 @@ async function pollEntitiesDone(name) {
       st = await getJSON(`/api/works/${encodeURIComponent(name)}/entities/status`);
     } catch {
       continue;
+    }
+    if (box && st.running) {
+      const p = st.progress || {};
+      box.innerHTML = notice(
+        'info',
+        `<span class="spinner"></span>正在抽取实体… 第 <strong>${num(p.done)}/${num(p.total)}</strong> 块` +
+          (p.label ? `（${esc(p.label)}）` : '')
+      );
     }
     if (!st.running) {
       renderEntities(name);

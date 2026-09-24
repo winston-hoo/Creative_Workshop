@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,38 @@ LEDGER_SCHEMA_VERSION = "foreshadow-ledger-v1"
 ACTION_PLANT = "埋设"
 ACTION_ADVANCE = "推进"
 ACTION_RECOVER = "回收"
+
+# 重跑同一章时，「这次埋的」和「上次埋的」描述未必一字不差（模型措辞会漂）。
+# 相似度达到这个阈值就认定是同一条伏笔，复用旧编号；低于它才发新号。
+# 定 0.6：实测同一条伏笔换个说法，序列相似度普遍在 0.75 以上
+# （如「主角身世有隐情」与「主角身世藏着隐情」是 0.8）；
+# 而真正不同的两条伏笔通常落在 0.4 以下。
+PLANT_MATCH_THRESHOLD = 0.6
+
+_PUNCT_RE = re.compile(r"[\s\W_]+", re.UNICODE)
+
+
+def _normalize_desc(text: str) -> str:
+    """去掉空白与标点，只留字本身——比较的是「说了什么」不是「怎么断句」。"""
+    return _PUNCT_RE.sub("", str(text or ""))
+
+
+def _similarity(left: str, right: str) -> float:
+    """两段描述的相似度，0~1。
+
+    用 difflib 的序列比而不是字二元组重合度：后者对「中间插了几个字」很敏感，
+    「身世有隐情」和「身世藏着隐情」只差两个字，二元组重合度却掉到 0.44，
+    会误判成两条伏笔。序列比看得是**最长公共子序列**，插字掉分很少。
+    """
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    matcher = SequenceMatcher(None, left, right)
+    # 先用便宜的字符多重集比做一次快速否决，省掉大部分完整比对。
+    if matcher.quick_ratio() < PLANT_MATCH_THRESHOLD:
+        return matcher.quick_ratio()
+    return matcher.ratio()
 
 
 @dataclass
@@ -221,19 +255,121 @@ class Ledger:
         self.next_seq += 1
         return fid
 
+    def revert_chapter(self, chapter_id: str) -> int:
+        """抹掉某一章在台账里留下的全部痕迹，返回清掉的 event 条数。
+
+        重跑一章之前**必须**先调它。不然同一章的动作会被追加一遍：
+        「推进」变成两条 events，上次埋的伏笔被当成新伏笔再发一个编号。
+        实测 20 章重跑就让台账从 794 条涨到 825 条——照这个比例全量重跑
+        一本 545 章的书，台账会直接翻倍，未回收数与疑似断点统计随之失真。
+
+        条目本身**不删**：只清这一章产生的 events。条目留着才能在下一次
+        「埋设」时按描述匹配回来、复用原编号，也符合这里一贯的取舍——
+        宁可多留一条，也不丢信息。
+        """
+        cleared = 0
+        for item in self.items:
+            before = len(item.events)
+            if before == 0:
+                continue
+            item.events = [e for e in item.events if e.chapter_id != chapter_id]
+            if len(item.events) == before:
+                continue
+            cleared += before - len(item.events)
+
+            # 这一章动过它，派生的两个字段要跟着回退，不能留在旧值上。
+            touched = [e.chapter_no for e in item.events if e.chapter_no is not None]
+            item.last_touched_chapter_no = max(touched) if touched else item.planted_chapter_no
+            # 回收动作若正是这一章做的，撤掉后状态要退回未回收。
+            if not any(e.action == ACTION_RECOVER for e in item.events):
+                item.status = "open"
+        return cleared
+
+    def _plant(
+        self,
+        chapter_id: str,
+        chapter_no: int | None,
+        desc: str,
+        *,
+        claimed: set[str] | None = None,
+    ) -> ForeshadowItem:
+        """登记一条「埋设」。这一章以前埋过同样的就复用旧编号，否则发新号。
+
+        复用是重跑幂等的关键：不复用，每重跑一章就多出一批 F-0xx，
+        台账里同一个伏笔会有好几个编号。
+        """
+        existing = self._match_planted(chapter_id, desc, claimed=claimed)
+        if existing is not None:
+            # 描述以这次的为准（措辞可能更准确），编号与埋设章保持不变。
+            existing.desc = desc
+            existing.planted_chapter_no = chapter_no
+            existing.last_touched_chapter_no = chapter_no
+            existing.events.append(ForeshadowEvent(chapter_id, chapter_no, ACTION_PLANT, desc))
+            return existing
+
+        fid = self.allocate_id()
+        item = ForeshadowItem(
+            id=fid,
+            desc=desc,
+            planted_chapter_id=chapter_id,
+            planted_chapter_no=chapter_no,
+            last_touched_chapter_no=chapter_no,
+        )
+        item.events.append(ForeshadowEvent(chapter_id, chapter_no, ACTION_PLANT, desc))
+        self.items.append(item)
+        return item
+
+    def _match_planted(
+        self,
+        chapter_id: str,
+        desc: str,
+        *,
+        claimed: set[str] | None = None,
+        threshold: float = PLANT_MATCH_THRESHOLD,
+    ) -> ForeshadowItem | None:
+        """在这一章自己埋过的条目里，找描述最像的那条，供重跑复用编号。
+
+        只在「同一章埋的」里找：不同章埋了相似的伏笔是常有的事，
+        跨章匹配会把两条独立的线并成一条。
+        """
+        target = _normalize_desc(desc)
+        if not target:
+            return None
+        best: ForeshadowItem | None = None
+        best_score = 0.0
+        for item in self.items:
+            if item.planted_chapter_id != chapter_id:
+                continue
+            if claimed and item.id in claimed:
+                continue  # 这一轮已经被别的伏笔认领走了
+            if any(e.chapter_id == chapter_id and e.action == ACTION_PLANT for e in item.events):
+                continue  # 这一章已经埋过它了，别再埋一次
+            score = _similarity(target, _normalize_desc(item.desc))
+            if score > best_score:
+                best, best_score = item, score
+        return best if best_score >= threshold else None
+
     def apply(
         self,
         *,
         chapter_id: str,
         chapter_no: int | None,
         foreshadows: list[dict[str, Any]] | None,
+        replace_chapter: bool = True,
     ) -> ApplyReport:
         """把某一章的伏笔动作并入台账，并把分配好的编号写回原条目。
 
         写回很重要：标注文件里必须留下**台账分配的规范编号**，
         否则标注文件自身不自洽，之后按编号回溯就对不上。
+
+        `replace_chapter` 默认为 True：**先撤销这一章的旧痕迹再写入**，
+        所以同一章跑几次结果都一样（幂等）。关掉它就退回「追加」语义——
+        只在明确知道这一章从未跑过时才该关。
         """
         report = ApplyReport()
+        if replace_chapter:
+            self.revert_chapter(chapter_id)
+        claimed: set[str] = set()
         for entry in foreshadows or []:
             if not isinstance(entry, dict):
                 continue
@@ -242,20 +378,10 @@ class Ledger:
             ref = str(entry.get("编号") or "").strip()
 
             if action == ACTION_PLANT:
-                fid = self.allocate_id()
-                item = ForeshadowItem(
-                    id=fid,
-                    desc=desc,
-                    planted_chapter_id=chapter_id,
-                    planted_chapter_no=chapter_no,
-                    last_touched_chapter_no=chapter_no,
-                )
-                item.events.append(
-                    ForeshadowEvent(chapter_id, chapter_no, ACTION_PLANT, desc)
-                )
-                self.items.append(item)
-                entry["编号"] = fid
-                report.added.append(fid)
+                item = self._plant(chapter_id, chapter_no, desc, claimed=claimed)
+                claimed.add(item.id)
+                entry["编号"] = item.id
+                report.added.append(item.id)
                 continue
 
             if action in (ACTION_ADVANCE, ACTION_RECOVER):
@@ -267,21 +393,11 @@ class Ledger:
                     report.anomalies.append(
                         f"{chapter_id} 的伏笔动作「{action}」{reason}，已按「埋设」重新登记"
                     )
-                    fid = self.allocate_id()
-                    item = ForeshadowItem(
-                        id=fid,
-                        desc=desc,
-                        planted_chapter_id=chapter_id,
-                        planted_chapter_no=chapter_no,
-                        last_touched_chapter_no=chapter_no,
-                    )
-                    item.events.append(
-                        ForeshadowEvent(chapter_id, chapter_no, ACTION_PLANT, desc)
-                    )
-                    self.items.append(item)
+                    item = self._plant(chapter_id, chapter_no, desc, claimed=claimed)
+                    claimed.add(item.id)
                     entry["动作"] = ACTION_PLANT
-                    entry["编号"] = fid
-                    report.added.append(fid)
+                    entry["编号"] = item.id
+                    report.added.append(item.id)
                     continue
 
                 if not item.is_open:
@@ -303,7 +419,30 @@ class Ledger:
 
             report.anomalies.append(f"{chapter_id} 的伏笔动作「{action or '(空)'}」无法识别，已忽略")
 
+        if replace_chapter:
+            self._prune_unconfirmed(chapter_id)
+
         return report
+
+    def _prune_unconfirmed(self, chapter_id: str) -> int:
+        """删掉「由这一章埋下、但这一轮没再确认」的条目，返回删掉的数量。
+
+        撤销之后仍一个事件都不剩，说明这一章刚才埋过它、这一轮却没有再埋——
+        即这一轮不认为它是伏笔。留着就会变成孤儿：每重跑一轮攒一批，
+        台账只增不减。删掉才能让重跑真正收敛。
+
+        只删**这一章埋的**、且**一个事件都没有**的条目：
+        被别的章推进或回收过的条目一定带着那些事件，不会被误删。
+        """
+        kept: list[ForeshadowItem] = []
+        dropped = 0
+        for item in self.items:
+            if item.planted_chapter_id == chapter_id and not item.events:
+                dropped += 1
+                continue
+            kept.append(item)
+        self.items = kept
+        return dropped
 
     # ── 视图 ────────────────────────────────────────────
 

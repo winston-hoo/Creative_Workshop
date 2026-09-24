@@ -161,13 +161,22 @@ class _Handler(BaseHTTPRequestHandler):
             completion_tokens = self._count_tokens(content)
             reasoning_tokens = 0
 
+        # 结束原因要如实反映，不能一律报 length：
+        #   · 思考模式吃满输出预算 → 正文是空的，上游确实会说 length
+        #   · 其余情况（responder / 预设标注 JSON / 预设文本）都是把话说完了 → stop
+        # 一律报 length 会把「模型正常答完了」伪装成「被截断」，
+        # 于是调用方的截断判断（加大输出预算重试、抢救解析）在自检里全部走偏。
+        finish_reason = "length" if thinking_on else "stop"
+
         if payload.get("stream"):
             self._stream_response(
-                model, content, reasoning_text, prompt_tokens, completion_tokens, reasoning_tokens
+                model, content, reasoning_text, prompt_tokens, completion_tokens,
+                reasoning_tokens, finish_reason,
             )
         else:
             self._plain_response(
-                model, content, reasoning_text, prompt_tokens, completion_tokens, reasoning_tokens
+                model, content, reasoning_text, prompt_tokens, completion_tokens,
+                reasoning_tokens, finish_reason,
             )
 
     # ── 响应构造 ────────────────────────────────────────
@@ -192,6 +201,7 @@ class _Handler(BaseHTTPRequestHandler):
         prompt_tokens: int,
         completion_tokens: int,
         reasoning_tokens: int,
+        finish_reason: str = "stop",
     ) -> None:
         message: dict = {"role": "assistant", "content": content}
         if reasoning_text:
@@ -200,7 +210,7 @@ class _Handler(BaseHTTPRequestHandler):
             "id": "chatcmpl-mock",
             "object": "chat.completion",
             "model": model,
-            "choices": [{"index": 0, "message": message, "finish_reason": "length"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         }
         usage = self._usage(prompt_tokens, completion_tokens, reasoning_tokens)
         if usage:
@@ -215,6 +225,7 @@ class _Handler(BaseHTTPRequestHandler):
         prompt_tokens: int,
         completion_tokens: int,
         reasoning_tokens: int,
+        finish_reason: str = "stop",
     ) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -250,7 +261,7 @@ class _Handler(BaseHTTPRequestHandler):
             emit(content, "content", self.state.ttft_ms)
 
         usage = self._usage(prompt_tokens, completion_tokens, reasoning_tokens)
-        write_chunk({}, finish="length", usage=usage)
+        write_chunk({}, finish=finish_reason, usage=usage)
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 

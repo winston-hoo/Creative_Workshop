@@ -30,6 +30,7 @@ from workshop.ingest import (  # noqa: E402
     detect_encoding,
     find_candidates,
     find_unmatched_title_like,
+    find_volumes,
     format_preview,
     ingest,
     save_ingest,
@@ -81,6 +82,7 @@ def test_cn_numbers() -> None:
     cases = {
         "一": 1, "十": 10, "十五": 15, "二十三": 23, "一百": 100,
         "一百零八": 108, "三百二十": 320, "一千零一": 1001, "7": 7, "42": 42,
+        "两": 2, "两百九十六": 296, "两万三千": 23000,
     }
     for text, expected in cases.items():
         actual = cn_to_int(text)
@@ -320,6 +322,144 @@ def test_body_text_not_mistaken_for_chapter() -> None:
     )
 
 
+def test_volume_prefixed_chapter_headings() -> None:
+    """回归：标题写成「卷名 + 第X章 + 标题」时，整本书一章都切不出来。
+
+    实测某部 330 章的作品全部是这种写法，两种卷名格式：
+      · 带名字的卷名：「启程卷 第一章 初入江湖」
+      · 带编号的卷名：「卷十五 第两百九十六章 夜袭」
+    主模板要求行首就是「第」，于是 0 命中，整本书被当成一个章前区段——
+    最坏的一次失效：门禁居然是「通过」的，因为重建校验只要求拼回去一致。
+
+    同时钉住两处会静默吞章的细节：
+      · 标题里合法地夹着引号（「帝都的“喜讯”」「“一见钟情”」）不能被引号过滤器丢掉；
+      · 章号里的「两」（第两百九十六章）必须算得出数。
+    """
+    print("卷名 + 第X章 的标题（回归）")
+
+    headings = [
+        "启程卷 第一章 初入江湖",
+        "启程卷 第二章 拦路的山贼",
+        "风云之荣耀卷 第一百三十四章 城里的“喜讯”",
+        "卷十五 第两百九十六章 夜袭",
+    ]
+    text = "\n".join(
+        [
+            headings[0], "主角一向是一个很本分的人。",
+            headings[1], "看着手里拿着的那把生锈的破刀。",
+            headings[2], "「第一章 夜行」这句是正文里的引用，不是标题。",
+            headings[3], "就在此时，门外传来宣告，“国王到！”",
+        ]
+    )
+
+    candidates = find_candidates(text)
+    check(len(candidates) == 4, f"4 行标题全部命中（实际 {len(candidates)}）")
+    check(
+        [c.chapter_no for c in candidates] == [1, 2, 134, 296],
+        f"章号解析为 1/2/134/296（实际 {[c.chapter_no for c in candidates]}）",
+    )
+    check(
+        [c.title for c in candidates] == ["初入江湖", "拦路的山贼", "城里的“喜讯”", "夜袭"],
+        f"标题不含卷名（实际 {[c.title for c in candidates]}）",
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="ingest-volume-test-"))
+    source = tmp / "示例作品.txt"
+    source.write_text(text + "\n", encoding="utf-8")
+    result = ingest(source, work_name="示例作品")
+    mapping = by_id(result)
+
+    check(len(chapters_of(result)) == 4, f"切出 4 章（实际 {len(chapters_of(result))}）")
+    check("v001-c0134" in mapping, "带引号的标题没有被丢掉")
+    if "v001-c0134" in mapping:
+        check(
+            "这句是正文里的引用" in mapping["v001-c0134"].cleaned_text,
+            "该章正文完整，没有被并进上一章",
+        )
+    check(
+        "生锈的破刀" in mapping["v001-c0002"].cleaned_text,
+        "上一章正文里不含下一章的内容",
+    )
+    check(result["integrity"]["passed"], "门禁通过")
+    unmatched_texts = [item["text"] for item in (result.get("unmatched_title_like") or [])]
+    check(
+        not any("门外传来" in t for t in unmatched_texts),
+        "正文里的「门外传来」没有被当成章节标记（外传需在行首）",
+    )
+
+    # 「卷名 + 第X章」必须要求卷名与章号之间有空白，否则正文句子会被吞
+    body = find_candidates("他把这本卷第一章撕了\n")
+    check(not body, "正文「这本卷第一章撕了」不被当成标题")
+
+
+def test_volume_heading_starts_new_section() -> None:
+    """回归：选集里每一篇都从「第一章」重新编号，但整本书被切成了一段。
+
+    实测一部 80 篇的选集：每篇都短（几章），每篇的卷标题行下面还隔着「前言」或
+    一段简介才到「第一章」。分段只能靠 RESTART_MIN_PREV（上一个章号超过 20），
+    而每篇都不到 20 章，于是全书只有一个分段——273 条重号、40 条乱序，
+    80 个「第一章」挤在 v001-c0001 上靠字母后缀区分。
+
+    同时钉住「章节标题行优先于卷标题行」：章节行「卷九 第一百六十九章 名将的崛起」
+    会被卷模板命中，否则一本 12 卷的书会报出 142 个假卷。
+    """
+    print("选集：卷标题行开启新分段（回归）")
+
+    text = "\n".join(
+        [
+            "第二十二卷 丝袜辣妈张静（1-6）",
+            "本卷简介一句话。",
+            "第一章",
+            "第一篇开头。",
+            "第二章",
+            "第一篇结尾。",
+            "（完）",
+            "第二十三卷 艳母淫臀(1-5)",
+            "前言",
+            "前言正文，排在第一章之前。",
+            "第一章",
+            "第二篇开头。",
+            "第二章",
+            "第二篇结尾。",
+        ]
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="ingest-volume-section-test-"))
+    source = tmp / "选集.txt"
+    source.write_text(text + "\n", encoding="utf-8")
+    result = ingest(source, work_name="选集")
+    mapping = by_id(result)
+    kinds = [a["kind"] for a in result["anomalies"]]
+
+    check(len(chapters_of(result)) == 4, f"切出 4 章（实际 {len(chapters_of(result))}）")
+    check(
+        "v002-c0001" in mapping and "v002-c0002" in mapping,
+        "第二篇自成一段，章号从 1 重新开始（而不是靠字母后缀）",
+    )
+    check(
+        list(mapping) == ["v001-c0001", "v001-c0002", "v002-c0001", "v002-c0002"],
+        f"四章编号分别为两段的 1/2（实际 {list(mapping)}）",
+    )
+    check("duplicate_chapter" not in kinds, f"不再产出重号（实际异常 {kinds}）")
+    check(kinds.count("section_restart") == 1, f"只报一次分段（实际 {kinds}）")
+    check(len(result["volumes"]) == 2, f"分成 2 段（实际 {len(result['volumes'])}）")
+    # 切分只按标题切、绝不搬运文字：排在「第一章」之前的卷首语归属上一章，
+    # 但必须一字不少地留在原文里（要挪到本章前面就等于手工改写原文了）
+    check(
+        "前言正文，排在第一章之前。" in mapping["v001-c0002"].cleaned_text,
+        "章前的前言一字不少地留在原文里",
+    )
+
+    # 章节标题行不能同时被算成卷标题行
+    chapter_lines = "卷九 第一百六十九章 名将的崛起\n正文。\n卷十 第一百七十章 帝国之痛\n正文。\n"
+    check(not find_volumes(chapter_lines), "章节标题行不会被算成卷（否则卷号全错）")
+    real = find_volumes("第一卷 关山\n正文。\n")
+    check(
+        len(real) == 1 and real[0].vol_no == 1 and real[0].title == "关山",
+        f"真正的卷标题行照常识别（实际 {[(v.vol_no, v.title) for v in real]}）",
+    )
+
+
 # ── 清洗 ────────────────────────────────────────────────────
 
 
@@ -481,6 +621,8 @@ def main() -> int:
         test_extra_patterns_from_work_config,
         test_candidates_exclude_quoted_lines,
         test_body_text_not_mistaken_for_chapter,
+        test_volume_prefixed_chapter_headings,
+        test_volume_heading_starts_new_section,
         test_cleaning_is_conservative,
         test_repeated_lines_reported_not_deleted,
         test_integrity,

@@ -23,7 +23,8 @@
   GET    /api/works/{name}/outline/plan      大纲计划（不调模型）
   POST   /api/works/{name}/outline/start     生成大纲（逐层归约，会花钱）
   GET    /api/works/{name}/entities/plan     实体统计计划（不调模型）
-  POST   /api/works/{name}/entities/start    生成实体统计（会花钱）
+  POST   /api/works/{name}/entities/start    生成实体统计（会花钱，?limit=N 可分批）
+  POST   /api/works/{name}/entities/stop     请求停止（已完成的块保留）
   GET    /api/works/{name}/entities          最近一次实体统计
   GET    /api/works/{name}/outline           最近一次大纲
   GET    /api/works/{name}/report            生成并落盘体检报告
@@ -697,13 +698,26 @@ def api_entities_start(
     block_size: int = Query(DEFAULT_BLOCK_SIZE, ge=5, le=200),
     provider: str | None = Query(None),
     model: str | None = Query(None),
+    limit: int | None = Query(None, ge=1, le=500),
 ) -> dict:
+    """开始/接着跑实体统计。
+
+    `limit` 限制本次最多跑几块（已完成的块直接复用，不计入），
+    长任务因此可以分次做完，不必一口气跑到底。
+    """
     try:
         return services.start_entities(
-            PATHS, safe_name(name), block_size=block_size, provider_id=provider, model_id=model
+            PATHS, safe_name(name), block_size=block_size, provider_id=provider,
+            model_id=model, limit=limit,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/entities/stop")
+def api_entities_stop(name: str) -> dict:
+    """请求停止。当前块跑完即停，已完成的块保留，下次接着跑不重复花钱。"""
+    return services.stop_entities(safe_name(name))
 
 
 @app.get("/api/works/{name}/entities/status")

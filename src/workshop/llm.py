@@ -24,6 +24,28 @@ logger = logging.getLogger(__name__)
 
 JSON_PROBE_KEYS = ("ok",)
 
+DEFAULT_MAX_TOKENS = 8000
+"""单次输出预算起点。模型没声明 max_output 时用它。"""
+
+MAX_TOKENS_CAP = 32000
+"""预算升级的上限。撞上截断时逐次翻倍，但不超过它。"""
+
+
+def default_max_tokens(model_cfg: dict[str, Any] | None) -> int:
+    """按模型自己声明的 max_output 定输出预算，封顶 MAX_TOKENS_CAP。
+
+    这里绝不能再用一个小常数。实测两处都栽在同一件事上：
+      · 实体统计写死 4000，545 章每块 50 章时 11 块里 9 块被截断，整块数据丢掉
+      · 大纲的书级归约写死 1200，正文还没写完就被砍，报出来却是「返回内容不是 JSON」
+    """
+    try:
+        declared = int((model_cfg or {}).get("max_output") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared <= 0:
+        return DEFAULT_MAX_TOKENS
+    return max(2000, min(declared, MAX_TOKENS_CAP))
+
 
 @dataclass
 class Usage:
@@ -153,6 +175,17 @@ class ChatResult:
     reasoning_text: str = ""
     usage: Usage | None = None
     total_ms: float = 0.0
+    finish_reason: str = ""
+    """上游给的结束原因。`length` 表示撞上 max_tokens 被截断。
+
+    必须单独带出来：结构化任务里被截断的输出必然不是合法 JSON，
+    只看文本会把「输出预算不够」误报成「返回的不是 JSON」，
+    真正的病根就此被藏起来，重试也会一次次照原样失败。
+    """
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == "length"
 
     @property
     def thinking_used(self) -> bool:
@@ -311,15 +344,18 @@ class OpenAICompatProvider:
         choices = data.get("choices") or []
         text = ""
         reasoning = ""
+        finish_reason = ""
         if choices and isinstance(choices[0], dict):
             message = choices[0].get("message") or {}
             text = str(message.get("content") or "")
             reasoning = str(message.get("reasoning_content") or "")
+            finish_reason = str(choices[0].get("finish_reason") or "")
         return ChatResult(
             text=text,
             reasoning_text=reasoning,
             usage=Usage.from_api(data.get("usage")),
             total_ms=elapsed_ms,
+            finish_reason=finish_reason,
         )
 
     def chat_stream(
@@ -407,14 +443,19 @@ class OpenAICompatProvider:
         return result
 
 
-def extract_json_object(text: str) -> dict[str, Any] | None:
-    """从模型输出里抠出第一个 JSON 对象，容忍前后有额外文字或代码围栏。"""
-    if not text:
-        return None
+def _strip_code_fences(text: str) -> str:
     candidate = text.strip()
     if candidate.startswith("```"):
         lines = [ln for ln in candidate.splitlines() if not ln.strip().startswith("```")]
         candidate = "\n".join(lines).strip()
+    return candidate
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    """从模型输出里抠出第一个 JSON 对象，容忍前后有额外文字或代码围栏。"""
+    if not text:
+        return None
+    candidate = _strip_code_fences(text)
     try:
         parsed = json.loads(candidate)
         return parsed if isinstance(parsed, dict) else None
@@ -429,3 +470,72 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
         return parsed if isinstance(parsed, dict) else None
     except ValueError:
         return None
+
+
+def looks_truncated(text: str) -> bool:
+    """上游没给 finish_reason 时的兜底判断：开了 JSON 的头却没闭合。
+
+    只看「结尾不是 }」会把「模型压根没输出 JSON、只是说了一段话」也算成截断，
+    于是输出预算被无谓地翻倍，错误原因还从「不是 JSON」变成「被截断」——
+    真正的病根又一次被盖住。所以先要求文本里确实出现了 `{`。
+    """
+    stripped = (text or "").strip()
+    if "{" not in stripped:
+        return False
+    return not stripped.endswith("}")
+
+
+def repair_truncated_json(text: str) -> dict[str, Any] | None:
+    """抢救被 max_tokens 截断的 JSON：丢掉没写完的尾巴，把完整的部分闭合回来。
+
+    截断点必然落在某个值内部，而截断之前的部分（往往是几十个人物）本身是合法的。
+    所以从后往前找「某个元素刚好闭合」的位置，在那里切断并按扫描出的未闭合括号
+    补上收尾，通常能保住绝大多数字段。宁可少最后一条，也不能因为最后一条没写完
+    就把整块实体全丢掉——实测一次真实运行里 11 块有 9 块是这样整块丢的。
+
+    文本本身完整（顶层括号已闭合）却解析失败时返回 None：那不是截断，抢救没有意义。
+    """
+    if not text:
+        return None
+    candidate = _strip_code_fences(text)
+    start = candidate.find("{")
+    if start == -1:
+        return None
+    candidate = candidate[start:]
+
+    stack: list[str] = []
+    checkpoints: list[tuple[int, tuple[str, ...]]] = []
+    in_string = False
+    escaped = False
+    for index, ch in enumerate(candidate):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                return None
+            stack.pop()
+            if not stack:
+                # 顶层已经闭合，说明输出本身是完整的，只是别处不合法
+                return None
+            checkpoints.append((index + 1, tuple(stack)))
+
+    closers = {"{": "}", "[": "]"}
+    for end, open_stack in reversed(checkpoints[-50:]):
+        head = candidate[:end].rstrip().rstrip(",")
+        repaired = head + "".join(closers[ch] for ch in reversed(open_stack))
+        try:
+            parsed = json.loads(repaired)
+        except ValueError:
+            continue
+        return parsed if isinstance(parsed, dict) else None
+    return None

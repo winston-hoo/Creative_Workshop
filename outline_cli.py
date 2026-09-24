@@ -30,7 +30,7 @@ from workshop.batch import (  # noqa: E402
     resolve_token_coefficient,
 )
 from workshop.config import load_config  # noqa: E402
-from workshop.llm import OpenAICompatProvider  # noqa: E402
+from workshop.llm import OpenAICompatProvider, default_max_tokens  # noqa: E402
 from workshop.outline import (  # noqa: E402
     DEFAULT_BLOCK_SIZE,
     OutlineOptions,
@@ -60,7 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None)
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     p.add_argument("--timeout", type=float, default=60.0)
-    p.add_argument("--max-tokens", type=int, default=1200)
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="单次输出的 token 上限。不填则按模型声明的 max_output 定（撞上截断会自动翻倍重试）",
+    )
     p.add_argument("--run", action="store_true")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--status", action="store_true", help="看最近一次结果")
@@ -109,13 +114,44 @@ def _resolve_provider(cfg, args):
 
 
 def _demo_summaries(dirs: dict[str, Path]) -> None:
-    """给演示作品补上逐章梗概，好让大纲链路能跑通。"""
-    index = 0
-    for path in sorted(dirs["annotations"].glob("*.json")):
+    """给演示作品补上逐章梗概，好让大纲链路能跑通。
+
+    **只补缺、不覆盖，并且拒绝写真实数据。** 这里曾经不看 --run、也不看目录里
+    装的是什么，只要给了 --annotations-dir 就照写：实测把一本 545 章真实作品
+    的逐章梗概全换成了「演示梗概第 N 条」，而逐章梗概正是大纲的唯一原料。
+    所以现在先看一遍目录——有真实标注就停下，已有的梗概一律不动。
+    """
+    annotations = Path(dirs["annotations"])
+    if not annotations.exists():
+        return
+
+    real: list[Path] = []
+    pending: list[tuple[Path, dict]] = []
+    for path in sorted(annotations.glob("*.json")):
         if path.name.startswith("_"):
             continue
-        index += 1
-        record = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (ValueError, OSError):
+            continue
+        provider = str((record.get("provenance") or {}).get("provider") or "")
+        if provider and provider != "mock":
+            real.append(path)
+            continue
+        summary = (record.get("fields") or {}).get("chapter_summary")
+        if isinstance(summary, str) and summary.strip():
+            continue  # 已有梗概就不动它，包括上一次演示补进去的那一批
+        pending.append((path, record))
+
+    if real:
+        print(
+            f"{annotations} 里有 {len(real)} 份真实标注（例如 {real[0].name}）。"
+            "演示模式只写模拟服务产出的数据，已停止，没有改动任何文件。",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    for index, (path, record) in enumerate(pending, start=1):
         record.setdefault("fields", {})["chapter_summary"] = f"演示梗概第 {index} 条"
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -158,6 +194,10 @@ def main(argv: list[str] | None = None) -> int:
     bucket = price_bucket(provider)
     from workshop.batch import _pick_price
 
+    # 输出预算的起点由模型自己声明的上限决定。以前这里写死 1200，
+    # 书级归约根本写不完整本结构与主线，被截断后报的却是「返回内容不是 JSON」。
+    max_tokens = args.max_tokens or default_max_tokens(model_cfg)
+
     plan = build_outline_plan(
         work_name=args.work or "批量演示",
         provider_id=provider.id,
@@ -168,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
         price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
         bucket=bucket,
-        max_output_tokens=args.max_tokens,
+        max_output_tokens=max_tokens,
     )
     _print_plan(plan, provider.name)
 
@@ -217,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     opts = OutlineOptions(
         block_size=args.block_size,
-        max_tokens=args.max_tokens,
+        max_tokens=max_tokens,
         timeout_sec=args.timeout,
     )
 

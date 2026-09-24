@@ -611,6 +611,40 @@ def test_report_without_annotations() -> None:
     cleanup()
 
 
+def test_entities_plan_shows_progress_and_running() -> None:
+    """实体统计界面靠这两个字段决定「还剩几块」和「要不要接回停止按钮」。
+
+    分次跑是这一轮的改动：跑了一半、刷新页面之后，界面必须还能看出
+    哪些块已完成、哪些没跑，否则用户只能靠再点一次「生成」去猜。
+    """
+    print("实体统计计划带进度与运行态")
+    import_test_work()
+    r = client.get(f"/api/works/{TEST_WORK}/entities/plan")
+    check(r.status_code == 200, f"返回 200（实际 {r.status_code}）")
+    d = r.json()
+    prog = d.get("progress") or {}
+    check(
+        prog.get("total") == d.get("blocks") and bool(d.get("blocks")),
+        f"进度里的总块数与计划一致（{prog.get('total')} / {d.get('blocks')}）",
+    )
+    check(prog.get("done") == 0, "还没跑过时已完成 0 块")
+    check(prog.get("pending") == prog.get("total"), "还没跑过时全部记为「还没跑」")
+    check(d.get("running") is False, "没在跑时 running 为 false")
+    cleanup()
+
+
+def test_entities_stop_without_job() -> None:
+    """没有任务在跑时按停止：要如实说「没有任务」，不能假装停成功了。"""
+    print("没任务时的停止请求")
+    import_test_work()
+    r = client.post(f"/api/works/{TEST_WORK}/entities/stop")
+    check(r.status_code == 200, f"返回 200（实际 {r.status_code}）")
+    d = r.json()
+    check(d.get("ok") is False, "ok 为 false")
+    check(bool(d.get("message")), "说清了为什么没停下来")
+    cleanup()
+
+
 def main() -> int:
     print("=" * 58)
     print("工作台接口自检")
@@ -645,6 +679,8 @@ def main() -> int:
         test_chapter_unknown_id_404,
         test_chapter_list_shows_annotation_state,
         test_annotate_selected_chapters,
+        test_entities_plan_shows_progress_and_running,
+        test_entities_stop_without_job,
     ):
         fn()
         print()

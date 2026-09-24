@@ -34,7 +34,7 @@ PATTERN_SET = "cn-standard-v1"
 # ── 章节标题模板 ──────────────────────────────────────────
 # 按优先级依次尝试。命中即记录，但**不立即切分**。
 
-_CN_NUM = "零〇一二三四五六七八九十百千两壹贰叁肆伍陆柒捌玖拾佰仟0-9"
+_CN_NUM = "零〇一二三四五六七八九十百千万两壹贰叁肆伍陆柒捌玖拾佰仟0-9"
 
 STRICT_CHAPTER_PATTERNS: list[re.Pattern[str]] = [
     # 0  第X章 / 第X回 / 第X节 〔主模板〕
@@ -44,6 +44,14 @@ STRICT_CHAPTER_PATTERNS: list[re.Pattern[str]] = [
     # 2  【第X章】/【X】/（N）—— 必须带章回节标记，或括号内就是一个纯数字
     re.compile(
         rf"^\s*[【\[（(]\s*(?:第\s*)?([{_CN_NUM}]{{1,10}})\s*[章回节]?\s*[】\]）)]\s*$"
+    ),
+    # 3  卷名 + 第X章 〔真实作品常见：`变脸之初卷 第一章 武士和处男`、`卷十五 第两百九十六章 狙击`〕
+    #    两种卷名写法：带名字的「…卷」和带编号的「卷十五」。
+    #    卷名用非捕获组，因为 find_candidates 约定「组1=章号、组2=标题」。
+    #    卷名与章号之间必须是空白，避免正文里「这本卷第一章撕了」这类句子被吞进来。
+    re.compile(
+        rf"^\s*(?:\S{{1,12}}卷|卷[{_CN_NUM}]{{1,6}})[\s　]+"
+        rf"第\s*([{_CN_NUM}]{{1,12}})\s*[章回节][\s　:：·]*(.{{0,40}}?)\s*$"
     ),
 ]
 
@@ -65,9 +73,25 @@ LOOSE_CHAPTER_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 VOLUME_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(rf"^\s*第\s*([{_CN_NUM}]{{1,10}})\s*[卷部篇][\s　:：·]*(.{{0,40}}?)\s*$"),
-    re.compile(rf"^\s*[卷部]\s*([{_CN_NUM}]{{1,3}})[\s　:：·]*(.{{0,40}}?)\s*$"),
+    # 卷标记与标题之间**必须有分隔符**（空格 / 冒号 / 间隔号），或者整行只有卷标记。
+    # 允许「零分隔符」的话，正文句子「第一篇开头。」「卷一开头就这样」都会被当成卷标题行：
+    # 实测选集里每篇只有几章、章号频繁回落到 1，这些假卷行会让每个分段再凭空多开一段。
+    re.compile(rf"^\s*第\s*([{_CN_NUM}]{{1,10}})\s*[卷部篇](?:[\s　:：·]+(.{{0,40}}?))?\s*$"),
+    re.compile(rf"^\s*[卷部]\s*([{_CN_NUM}]{{1,3}})(?:[\s　:：·]+(.{{0,40}}?))?\s*$"),
 ]
+
+
+def _looks_like_volume_line(stripped: str) -> bool:
+    """这行是不是「卷标题行」。
+
+    **章节标题行优先**：一行同时被两套模板命中时必须算章节行，否则卷号会被算错。
+    实测某部作品的章节行「卷九 第一百六十九章 突围」会被卷模板
+    `^[卷部]\\s*(数字)` 命中，整本书因此报出 142 个假卷（真正只有 12 卷）。
+    """
+    if any(pattern.match(stripped) for pattern in STRICT_CHAPTER_PATTERNS):
+        return False
+    return any(pattern.match(stripped) for pattern in VOLUME_PATTERNS)
+
 
 # 标题行里出现这些字符，多半是正文里的引用或对话，不是标题
 _QUOTE_CHARS = "「」『』“”\"'‘’"
@@ -161,7 +185,7 @@ _CN_DIGITS = {
     "四": 4, "肆": 4, "五": 5, "伍": 5, "六": 6, "陆": 6, "七": 7, "柒": 7, "八": 8,
     "捌": 8, "九": 9, "玖": 9,
 }
-_CN_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}
+_CN_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000, "万": 10000}
 
 
 def cn_to_int(text: str) -> int | None:
@@ -216,8 +240,9 @@ _SECTION_MARKER_MAX_LEN = 40
 GAP_MAX = 50
 
 _TITLE_HINT_RE = re.compile(
-    r"(第\s*[0-9零〇一二三四五六七八九十百千两]{1,10}\s*[章回节])"
-    r"|番外|序章|楔子|尾声|外传|前传|章$"
+    r"(第\s*[0-9零〇一二三四五六七八九十百千万两]{1,12}\s*[章回节])"
+    r"|^(?:番外|序章|楔子|尾声|外传|前传)"
+    r"|章$"
 )
 
 
@@ -270,8 +295,15 @@ class Anomaly:
 
 
 def _looks_like_body_reference(raw_line: str) -> bool:
-    """标题行里带引号，多半是正文引用或对话，排除掉。"""
-    return any(ch in raw_line for ch in _QUOTE_CHARS)
+    """以引号开头的行，多半是正文对话或对章节标题的引用，排除掉。
+
+    只看**行首**，不看「行内出现过引号」：中文对话的引号一律出现在行首，
+    而行内夹引号是合法标题的常见写法（实测「风云之荣耀卷 第一百三十四章 城里的“喜讯”」
+    「卷十一 第两百三十二章 “一见钟情”」）。按「行内出现引号」判会让这几章整章丢失、
+    正文被并进上一章，只在切分结果里留下一条缺章告警，很难定位到是引号过滤器干的。
+    """
+    stripped = raw_line.strip()
+    return bool(stripped) and stripped[0] in _QUOTE_CHARS
 
 
 def find_candidates(
@@ -388,6 +420,8 @@ def find_volumes(text: str) -> list[Volume]:
         stripped = line.strip()
         if not stripped or len(stripped) > _TITLE_MAX_LEN:
             continue
+        if not _looks_like_volume_line(stripped):
+            continue
         for pattern in VOLUME_PATTERNS:
             match = pattern.match(stripped)
             if match:
@@ -400,16 +434,26 @@ def find_volumes(text: str) -> list[Volume]:
 # ── 序列校验与断点修复 ────────────────────────────────────
 
 
-def _section_marker(cand: Candidate, text: str | None) -> str | None:
+def _section_marker(cand: Candidate, text: str | None, after_offset: int = 0) -> str | None:
     """判断这个候选是不是新分段的开头。
 
-    先看标题行自己（「第一章 红旗蛮眼熟(番外)」这种），
-    再看紧邻的上一非空行（「未曾设想的道路(番外篇)」这种）。
+    依次看三个地方：
+      ① 标题行自己（「第一章 红旗蛮眼熟(番外)」这种）
+      ② 紧邻的上一非空行（「未曾设想的道路(番外篇)」这种）
+      ③ 上一个候选之后到本行之间的卷标题行——卷标题行不保证紧邻章标题，
+         选集里还常隔着「前言」「摘要」块（实测「第三十五卷 赤裸熟母」下面
+         先是一段 33 字简介，才是「第一章 网上的邻居」）。
 
     用语义标记而不是纯章号阈值，是因为阈值要靠章号积累，一本短书或早期就重启的书
     会判不出来；而标记行是作者自己写的，最贴近本意。
+
+    卷标题行也算标记：选集/合集的每一篇都从「第一章」重新开始编号，
+    而每篇只有几章，靠 RESTART_MIN_PREV 的「上一个章号超过 20」永远判不出来——
+    实测一部 80 篇的选集因此产出 273 条重号、40 条乱序，全书的章号完全糊在一起。
     """
     if _SECTION_MARKER_RE.search(cand.raw_line):
+        return cand.raw_line.strip()
+    if _looks_like_volume_line(cand.raw_line.strip()):
         return cand.raw_line.strip()
     if text is None:
         return None
@@ -418,6 +462,12 @@ def _section_marker(cand: Candidate, text: str | None) -> str | None:
         last = prev_lines[-1]
         if len(last) <= _SECTION_MARKER_MAX_LEN and _SECTION_MARKER_RE.search(last):
             return last
+    # ③ 只在卷标题行里找，不把「番外 / 第二部」这类子串判断也铺开——
+    #    正文里「第二部什么时候拍？」这种短句会被误判，而卷标题行的判据是全行锚定的，不会。
+    for line in reversed(text[after_offset : cand.offset].split("\n")):
+        stripped = line.strip()
+        if stripped and _looks_like_volume_line(stripped):
+            return stripped
     return None
 
 
@@ -440,9 +490,11 @@ def validate_sequence(
     section = 1
     counts: dict[int, int] = {}
     unnumbered_counter = 0
+    prev_line_end = 0  # 上一个候选行的结尾，用来界定「两章之间的过渡区」
 
     for cand in candidates:
         no = cand.chapter_no
+        line_end = cand.offset + len(cand.raw_line)
 
         # 原文里没有编号的章节（如「番外XXX」）：不占用章号，只给段内序号。
         # 这样既不会与真正的第 N 章撞号，也不会把真实的缺口填掉。
@@ -452,13 +504,20 @@ def validate_sequence(
             cand.section = section
             cand.occurrence = 1
             out.append(cand)
+            prev_line_end = line_end
             continue
 
-        # 编号重启：判定为新分段（番外篇、第二部之类），而不是重号
-        if no <= RESTART_MAX_NO and (
-            _section_marker(cand, text) is not None or last_no > RESTART_MIN_PREV
+        # 编号重启：判定为新分段（番外篇、第二部、选集里下一篇之类），而不是重号。
+        # last_no > 0：当前分段还没有任何编号章节时谈不上「重启」——
+        # 否则全书开篇的卷标题行会凭空开出一个空的第 1 段，后面所有分段号整体错位。
+        marker = (
+            _section_marker(cand, text, prev_line_end)
+            if no <= RESTART_MAX_NO and last_no > 0
+            else None
+        )
+        if no <= RESTART_MAX_NO and last_no > 0 and (
+            marker is not None or last_no > RESTART_MIN_PREV
         ):
-            marker = _section_marker(cand, text)
             reason = f"依据标记「{marker}」" if marker else f"依据章号从 {last_no} 回落"
             anomalies.append(
                 Anomaly(
@@ -506,6 +565,7 @@ def validate_sequence(
         # 初版用最大值，结果一个错字（第9229章实为第922章）会把此后每一章
         # 都判成乱序，凭空造出 150 条告警。改用一个错字只影响它自己也只影响一次。
         last_no = no
+        prev_line_end = line_end
         out.append(cand)
 
     return out, anomalies
@@ -533,7 +593,7 @@ def find_unmatched_title_like(
         stripped = line.strip()
         if not stripped or len(stripped) > max_len:
             continue
-        if any(ch in stripped for ch in _QUOTE_CHARS):
+        if _looks_like_body_reference(stripped):
             continue
         if not _TITLE_HINT_RE.search(stripped):
             continue

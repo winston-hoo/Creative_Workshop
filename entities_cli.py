@@ -3,6 +3,7 @@
 
   python entities_cli.py --work 示例作品            # 只看计划，不调模型
   python entities_cli.py --work 示例作品 --run --yes  # 真跑
+  python entities_cli.py --work 示例作品 --run --yes --limit 3   # 先跑 3 块，再跑一次接着跑
   python entities_cli.py --demo --run                     # 本地模拟
   python entities_cli.py --work 示例作品 --status
 """
@@ -27,7 +28,7 @@ from workshop.entities import (  # noqa: E402
     generate_entities,
     save_entities,
 )
-from workshop.llm import OpenAICompatProvider  # noqa: E402
+from workshop.llm import MAX_TOKENS_CAP, OpenAICompatProvider, default_max_tokens  # noqa: E402
 from workshop.secrets import SecretStore, setup_logging  # noqa: E402
 
 
@@ -46,7 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None)
     p.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     p.add_argument("--timeout", type=float, default=120.0)
-    p.add_argument("--max-tokens", type=int, default=4000)
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="单块输出 token 预算起点；不填则取模型声明的 max_output（封顶 32000）")
+    p.add_argument("--limit", type=int, default=None,
+                   help="本次最多跑几块。没轮到的块标成「还没跑」，再跑一次接着跑，已完成的块不重复花钱")
     p.add_argument("--run", action="store_true")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--status", action="store_true")
@@ -139,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     model_cfg = provider.model(model_id) or {}
+    budget = args.max_tokens or default_max_tokens(model_cfg)
     bucket = price_bucket(provider)
     plan: EntitiesPlan = build_entities_plan(
         work=args.work or "批量演示",
@@ -157,6 +162,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"正文       {plan.body_chars:,} 字（含空白与缩进）")
     print(f"输入 token ≈ {plan.est_input_tokens:,}   输出 ≈ {plan.est_output_tokens:,}")
     print(f"费用       {'≈ ¥' + str(plan.est_cost_cny) if plan.est_cost_cny is not None else plan.price_note}")
+    print(
+        f"输出预算   每块 {budget:,} token"
+        f"（被 max_tokens 截断时自动翻倍，封顶 {MAX_TOKENS_CAP:,}）"
+    )
+    if args.limit:
+        print(f"本次上限   只跑 {args.limit} 块，剩下的标成「还没跑」，再跑一次接着跑")
     print()
     if not args.run:
         print("这只是计划，没有发起任何调用。加 --run 才会真的跑。")
@@ -199,10 +210,11 @@ def main(argv: list[str] | None = None) -> int:
             plan=plan,
             tasks=tasks,
             client=client,
-            opts=EntitiesOptions(block_size=args.block_size, max_tokens=args.max_tokens, timeout_sec=args.timeout),
+            opts=EntitiesOptions(block_size=args.block_size, max_tokens=budget, timeout_sec=args.timeout),
             secrets=store.known_values,
             on_progress=lambda i, t, l: print(f"  [{i}/{t}] 抽取 {l}", flush=True),
             state_path=dirs["out"] / "_state.json",
+            limit=args.limit,
         )
     finally:
         if server is not None:
@@ -216,6 +228,16 @@ def main(argv: list[str] | None = None) -> int:
           f"关系 {merged['counts']['relations']}")
     if result.get("errors"):
         print(f"未完成 {len(result['errors'])} 块")
+    salvaged = [b for b in result.get("blocks") or [] if b.get("salvaged")]
+    if salvaged:
+        print(
+            f"有 {len(salvaged)} 块输出被截断，只抢救出截断前的部分实体（可能不完整）："
+            f"{'、'.join(str(b.get('range')) for b in salvaged)}"
+        )
+    leftover = result.get("pending") or []
+    if leftover:
+        shown = "、".join(leftover[:5]) + ("…" if len(leftover) > 5 else "")
+        print(f"还有 {len(leftover)} 块没跑（{shown}）。再跑一次会接着跑，已完成的块不会重复花钱。")
     print(f"实测 usage：{result.get('usage')}")
     print(f"已落盘：{paths['markdown']}")
     return 0

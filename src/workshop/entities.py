@@ -29,7 +29,17 @@ from typing import Any, Callable
 
 from .batch import ChapterTask
 from .errors import ErrorKind  # noqa: F401
-from .llm import ApiError, ChatResult, OpenAICompatProvider, build_thinking_extra, extract_json_object
+from .llm import (
+    DEFAULT_MAX_TOKENS,
+    MAX_TOKENS_CAP,
+    ApiError,
+    ChatResult,
+    OpenAICompatProvider,
+    build_thinking_extra,
+    extract_json_object,
+    looks_truncated,
+    repair_truncated_json,
+)
 from .secrets import redact
 
 ENTITIES_SCHEMA_VERSION = "entities-v1"
@@ -55,6 +65,7 @@ ENTITY_PROMPT = """你是长篇小说的设定整理员。下面是连续若干�
 - 原文没给名字的人物（如「老爹」「屈老二」这类称呼）就用原文里的称呼，不要给正式名字
 - relations 只记**双向都成立的关系**（甲是乙的父亲、甲与乙是同学），单方面的认知不算
 - 同一个人物在多章出现，只记一条，first_chapter 取最早
+- 同一段里人物很多时按重要程度排序，主角与重要配角写在最前面
 - 本章没有的内容就给空数组，不要为了填满而编造"""
 
 
@@ -63,9 +74,44 @@ class EntitiesOptions:
     block_size: int = DEFAULT_BLOCK_SIZE
     temperature: float = 0.2
     thinking: str = "disabled"
-    max_tokens: int = 4000
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    """单块输出的 token 预算起点。"""
+
+    max_tokens_cap: int = MAX_TOKENS_CAP
+    """预算升级的上限。撞上截断时逐次翻倍，但不超过它。
+
+    写死一个小上限必然在人物密集的段落上把 JSON 截断——实测一部 545 章的连载、
+    每块 50 章，前两块恰好装得下，后面 9 块全部超 4000 被截断，
+    整块实体全丢。调用方应把模型声明的 max_output 也考虑进来。
+    """
+
     max_attempts: int = 3
     timeout_sec: float = 120.0
+
+
+@dataclass
+class CallOutcome:
+    """一次块抽取的结果。把「失败了」和「为什么失败」分开说清楚。"""
+
+    payload: dict[str, Any] | None = None
+    error: str = ""
+    usage: dict[str, int] = field(default_factory=dict)
+    salvaged: bool = False
+    """输出被截断，只抢救出截断前的部分实体。数据可用但不完整，必须让人看见。"""
+
+    truncated: bool = False
+    max_tokens: int = 0
+
+    @property
+    def notice(self) -> str:
+        if self.salvaged:
+            return (
+                f"输出撞上 max_tokens={self.max_tokens} 被截断，只抢救出截断前的部分实体，"
+                "这一段可能不完整。"
+            )
+        if self.truncated:
+            return f"输出撞上 max_tokens={self.max_tokens} 被截断。"
+        return ""
 
 
 @dataclass
@@ -169,20 +215,38 @@ def _block_text(task_range: list[ChapterTask]) -> str:
     return "\n\n".join(parts)
 
 
+def _has_any_entity(payload: dict[str, Any]) -> bool:
+    return any(
+        isinstance(payload.get(key), list) and payload[key]
+        for key in ("characters", "factions", "abilities", "locations")
+    )
+
+
 def _call(
     client: OpenAICompatProvider,
     model_id: str,
     user: str,
     opts: EntitiesOptions,
-) -> tuple[dict[str, Any] | None, str, dict[str, int]]:
+) -> CallOutcome:
+    """跑一块。撞上截断就加大输出预算重试，实在不行再从截断处抢救。
+
+    旧版的顺序是反的：它写死 max_tokens=4000，被截断后原样重试三次——
+    三次都会在同一个位置截断，除了把 token 烧掉没有任何作用，最后整块数据被丢掉，
+    报出来的原因还是「返回内容不是 JSON」，与真实病根无关。
+    """
     extra = build_thinking_extra(opts.thinking, None)
-    last_error = ""
+    budget = max(1, opts.max_tokens)
+    cap = max(budget, opts.max_tokens_cap)
+    attempts = max(1, opts.max_attempts)
     usage_total: dict[str, int] = {}
+    last_error = ""
+    truncated = False
+    salvaged_payload: dict[str, Any] | None = None
     # 中转站等部分服务商虽然自称 OpenAI 兼容，却不认 response_format=json_object，
     # 首调用它会在 BAD_REQUEST 上直接失败。第一次撞上就记住，本块后续重试
     # 改用「提示词约束 + 解析」的降级路径再试（extract_json_object 仍能抠 JSON）。
     json_mode = True
-    for attempt in range(1, max(1, opts.max_attempts) + 1):
+    for attempt in range(1, attempts + 1):
         try:
             fmt = {"type": "json_object"} if json_mode else None
             result: ChatResult = client.chat(
@@ -191,7 +255,7 @@ def _call(
                     {"role": "system", "content": "你是长篇小说的设定整理员。只输出 JSON。"},
                     {"role": "user", "content": user},
                 ],
-                max_tokens=opts.max_tokens,
+                max_tokens=budget,
                 temperature=opts.temperature,
                 response_format=fmt,
                 extra=extra,
@@ -213,16 +277,43 @@ def _call(
             for key, value in result.usage.to_dict().items():
                 if isinstance(value, int):
                     usage_total[key] = usage_total.get(key, 0) + value
+
         payload = extract_json_object(result.text)
-        if payload is None:
-            last_error = f"返回内容不是 JSON：{result.text[:120]}"
+        if payload is not None:
+            return CallOutcome(payload=payload, usage=usage_total, max_tokens=budget)
+
+        if result.truncated or looks_truncated(result.text):
+            truncated = True
+            repaired = repair_truncated_json(result.text)
+            if repaired is not None and _has_any_entity(repaired):
+                salvaged_payload = repaired
+            if budget < cap:
+                # 加大预算重试：人物密集的段落本来就写不下，原样重试没有意义
+                budget = min(cap, budget * 2)
+                last_error = f"输出被 max_tokens 截断，已把上限提高到 {budget} 重试"
+                continue
+            last_error = (
+                f"输出撞上 max_tokens={budget} 被截断，"
+                "且截断处没有可用的完整片段（这一段的人物太多，建议缩小每块章数）"
+            )
             continue
-        return payload, "", usage_total
-    return None, last_error, usage_total
+        last_error = f"返回内容不是 JSON：{result.text[:120]}"
+
+    if salvaged_payload is not None:
+        return CallOutcome(
+            payload=salvaged_payload,
+            usage=usage_total,
+            salvaged=True,
+            truncated=True,
+            max_tokens=budget,
+        )
+    return CallOutcome(error=last_error, usage=usage_total, truncated=truncated, max_tokens=budget)
 
 
-def _empty_block(label: str, error: str, chapters: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+def _empty_block(
+    label: str, error: str, chapters: list[dict[str, Any]], *, truncated: bool = False
+) -> dict[str, Any]:
+    block = {
         "range": label,
         "chapters": chapters,
         "error": error,
@@ -231,6 +322,41 @@ def _empty_block(label: str, error: str, chapters: list[dict[str, Any]]) -> dict
         "abilities": [],
         "locations": [],
     }
+    if truncated:
+        block["truncated"] = True
+    return block
+
+
+def _carry_block(
+    previous: dict[str, Any] | None, label: str, chapters: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """本次没跑的块：沿用上次的结果，没跑过就显式标成「未处理」。
+
+    必须标出来。空数组 + 无错误会被读成「这一段真的没有实体」——
+    把没做的事说成做完了，比报错更糟。
+    """
+    if previous and not previous.get("pending"):
+        return dict(previous)
+    return {
+        "range": label,
+        "chapters": chapters,
+        "pending": True,
+        "error": "",
+        "characters": [],
+        "factions": [],
+        "abilities": [],
+        "locations": [],
+    }
+
+
+def _load_state(state_path: Path | None) -> dict[str, Any]:
+    if not state_path or not Path(state_path).exists():
+        return {}
+    try:
+        data = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def generate_entities(
@@ -242,11 +368,32 @@ def generate_entities(
     secrets: list[str] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     state_path: Path | None = None,
+    limit: int | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """逐块抽取实体，最后归并。失败的块显式留痕，不伪装成「没有」。"""
+    """逐块抽取实体，最后归并。失败的块显式留痕，不伪装成「没有」。
+
+    这张表**可以分次做完**，不必一口气跑到底：
+      · `limit` 限制本次真正发起的调用数（已完成的块直接复用缓存，不计入）
+      · `should_stop` 让上一层的「停止」按钮在中途生效
+    两种情况都会把还没跑的块标成 `pending`，下次接着跑，已完成的块不重复花钱。
+    """
     opts = opts or EntitiesOptions(block_size=plan.block_size)
     size = max(1, plan.block_size)
     blocks = [tasks[i : i + size] for i in range(0, len(tasks), size)]
+
+    previous = _load_state(state_path)
+    done_blocks: dict[str, dict[str, Any]] = {}
+    prev_by_range: dict[str, dict[str, Any]] = {}
+    for item in previous.get("blocks") or []:
+        if not isinstance(item, dict) or not item.get("range"):
+            continue
+        label = str(item["range"])
+        if item.get("pending"):
+            continue
+        prev_by_range[label] = item
+        if not item.get("error"):
+            done_blocks[label] = item
 
     result: dict[str, Any] = {
         "schema_version": ENTITIES_SCHEMA_VERSION,
@@ -259,21 +406,11 @@ def generate_entities(
         "merged": {},
     }
 
-    done_blocks: dict[str, dict[str, Any]] = {}
-    if state_path and Path(state_path).exists():
-        try:
-            cached = json.loads(Path(state_path).read_text(encoding="utf-8-sig"))
-            for item in cached.get("blocks") or []:
-                if isinstance(item, dict) and item.get("range") and not item.get("error"):
-                    done_blocks[str(item["range"])] = item
-        except (ValueError, OSError):
-            done_blocks = {}
-
     total = len(blocks)
+    processed = 0
+    stopped = False
     for index, block in enumerate(blocks, start=1):
         label = _block_label(block)
-        if on_progress:
-            on_progress(index, total, label)
 
         chapter_refs = [
             {"id": t.chapter_id, "chapter_no": t.chapter_no, "title": t.title} for t in block
@@ -283,38 +420,62 @@ def generate_entities(
             result["blocks"].append(done_blocks[label])
             continue
 
+        if should_stop is not None and should_stop():
+            stopped = True
+        if stopped or (limit is not None and processed >= limit):
+            # 没轮到的块要说清是「没跑」，不能留个空结果假装这一段没有实体
+            result["blocks"].append(_carry_block(prev_by_range.get(label), label, chapter_refs))
+            continue
+
         text = _block_text(block)
         if not text.strip():
             result["blocks"].append(_empty_block(label, "这一块没有可读的正文", chapter_refs))
             continue
 
-        payload, error, usage = _call(
+        # 只在**真的要发起调用**时上报进度。跳过的块也报一遍，
+        # 命令行会打印出「抽取第 2 章」却没扣费，看起来像跑过了一样。
+        if on_progress:
+            on_progress(index, total, label)
+
+        outcome = _call(
             client,
             plan.model_id,
             f"{ENTITY_PROMPT}\n\n以下是第 {index}/{total} 块（{label}）：\n\n{text}",
             opts,
         )
-        for key, value in usage.items():
+        for key, value in outcome.usage.items():
             result["usage"][key] = result["usage"].get(key, 0) + value
 
-        if payload is None:
-            result["errors"].append(f"{label}：{error or '返回为空'}")
-            result["blocks"].append(_empty_block(label, error or "返回为空", chapter_refs))
-        else:
+        if outcome.payload is None:
+            result["errors"].append(f"{label}：{outcome.error or '返回为空'}")
             result["blocks"].append(
-                {
-                    "range": label,
-                    "chapters": chapter_refs,
-                    "error": "",
-                    "characters": payload.get("characters") or [],
-                    "factions": payload.get("factions") or [],
-                    "abilities": payload.get("abilities") or [],
-                    "locations": payload.get("locations") or [],
-                }
+                _empty_block(
+                    label,
+                    outcome.error or "返回为空",
+                    chapter_refs,
+                    truncated=outcome.truncated,
+                )
             )
+        else:
+            block_result: dict[str, Any] = {
+                "range": label,
+                "chapters": chapter_refs,
+                "error": "",
+                "characters": outcome.payload.get("characters") or [],
+                "factions": outcome.payload.get("factions") or [],
+                "abilities": outcome.payload.get("abilities") or [],
+                "locations": outcome.payload.get("locations") or [],
+            }
+            if outcome.salvaged:
+                block_result["salvaged"] = True
+                block_result["notice"] = outcome.notice
+            result["blocks"].append(block_result)
 
+        processed += 1
         _save_state(state_path, result, secrets)
 
+    result["pending"] = [str(b["range"]) for b in result["blocks"] if b.get("pending")]
+    result["stopped"] = stopped
     result["merged"] = _merge(result["blocks"])
     _save_state(state_path, result, secrets)
     return result
@@ -384,7 +545,7 @@ def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                 entry[f] = new
 
     for block in blocks:
-        if block.get("error"):
+        if block.get("error") or block.get("pending"):
             continue
         for ch in block.get("characters") or []:
             if not isinstance(ch, dict):
@@ -469,7 +630,10 @@ def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
 def render_markdown(result: dict[str, Any]) -> str:
     merged = result.get("merged") or {}
     counts = merged.get("counts") or {}
-    failed = [b for b in result.get("blocks") or [] if b.get("error")]
+    blocks = result.get("blocks") or []
+    failed = [b for b in blocks if b.get("error")]
+    pending = [b for b in blocks if b.get("pending")]
+    salvaged = [b for b in blocks if b.get("salvaged")]
 
     lines = [
         f"# 设定实体 · {result.get('work')}",
@@ -482,6 +646,17 @@ def render_markdown(result: dict[str, Any]) -> str:
     ]
     if failed:
         lines.append(f"> ⚠️ 有 {len(failed)} 块抽取失败，这些段里的实体**不在下面的表里**。")
+        lines.append("")
+    if pending:
+        lines.append(
+            f"> ⏸️ 有 {len(pending)} 块**还没跑**（分次执行或中途停下），"
+            "这些段里的实体同样不在下面的表里。接着跑一次会补齐。"
+        )
+        lines.append("")
+    if salvaged:
+        lines.append(
+            f"> ⚠️ 有 {len(salvaged)} 块输出被截断，只抢救出截断前的部分实体，**可能不完整**。"
+        )
         lines.append("")
 
     lines.append("## 人物")
@@ -529,6 +704,18 @@ def render_markdown(result: dict[str, Any]) -> str:
         lines.append("## 未完成的块")
         for b in failed:
             lines.append(f"- {b['range']}：{b['error']}")
+        lines.append("")
+
+    if salvaged:
+        lines.append("## 被截断、只抢救出部分的块")
+        for b in salvaged:
+            lines.append(f"- {b['range']}：{b.get('notice') or '输出被截断'}")
+        lines.append("")
+
+    if pending:
+        lines.append("## 还没跑的块")
+        for b in pending:
+            lines.append(f"- {b['range']}")
         lines.append("")
 
     lines.append("> 实体由模型从正文抽取，名字与关系可能有遗漏或归并错误，重要设定请以原文为准。")

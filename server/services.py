@@ -642,6 +642,12 @@ class BatchJob:
 _JOBS: dict[str, BatchJob] = {}
 _JOBS_LOCK = threading.Lock()
 
+# 实体统计的实时状态与「停止」信号。标注那边状态挂在 runner 上，
+# 实体这条路没有 runner，所以单独存一份：界面要能看到「跑到第几块」和
+# 「上一次为什么结束」，否则失败了只剩一句「没有产出，检查运行记录」。
+_ENTITY_LIVE: dict[str, dict[str, Any]] = {}
+_ENTITY_STOPS: dict[str, threading.Event] = {}
+
 
 def ensure_work_config(paths: Paths, name: str) -> Path:
     """作品配置缺失时补一份最小版本。
@@ -2112,6 +2118,12 @@ def entities_plan(
         for m in provider.models
     ]
     payload["has_result"] = entities_latest(paths, name) is not None
+    # 分次跑的进度：已完成的块不重复花钱，所以「还剩几块」直接决定下一次还要花多少
+    payload["progress"] = _entities_progress(paths, name, tasks, block_size)
+    # 界面刷新后要能认出「还有一个任务在跑」，否则会丢掉进度与停止按钮
+    with _JOBS_LOCK:
+        job = _JOBS.get(f"entities:{name}")
+    payload["running"] = job is not None and job.thread.is_alive()
     return payload
 
 
@@ -2125,9 +2137,63 @@ def entities_latest(paths: Paths, name: str) -> dict[str, Any] | None:
         return None
 
 
+def _entities_progress(paths: Paths, name: str, tasks: list, block_size: int) -> dict[str, Any]:
+    """已跑 / 失败 / 还没跑的块数。
+
+    实体抽取允许分次跑（停一下、下次接着跑），所以「还剩多少」必须是界面上
+    看得见的东西，而不是让人自己数块。
+    """
+    from workshop.entities import _block_label
+
+    size = max(1, block_size)
+    labels = [_block_label(tasks[i : i + size]) for i in range(0, len(tasks), size)]
+    state_path = paths.work_dir(name) / "50-entities" / "_state.json"
+    known: dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            cached = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            known = {
+                str(b.get("range")): b
+                for b in (cached.get("blocks") or [])
+                if isinstance(b, dict) and b.get("range")
+            }
+        except (ValueError, OSError):
+            known = {}
+
+    done = failed = pending = 0
+    for label in labels:
+        item = known.get(label)
+        if item is None or item.get("pending"):
+            pending += 1
+        elif item.get("error"):
+            failed += 1
+        else:
+            done += 1
+    salvaged = sum(1 for item in known.values() if item.get("salvaged"))
+    return {
+        "total": len(labels),
+        "done": done,
+        "failed": failed,
+        "pending": pending,
+        "salvaged": salvaged,
+    }
+
+
+def _model_max_tokens(model_cfg: dict[str, Any]) -> int:
+    """单次输出的 token 预算。策略在 llm 层（命令行入口也用它），这里只做转发。
+
+    实体统计和大纲都从这里取——两处都栽过同一个坑：写死一个小预算，
+    输出被截断，报出来却是「返回内容不是 JSON」。
+    """
+    from workshop.llm import default_max_tokens
+
+    return default_max_tokens(model_cfg)
+
+
 def start_entities(
     paths: Paths, name: str, *, block_size: int = DEFAULT_BLOCK_SIZE,
     provider_id: str | None = None, model_id: str | None = None,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     from workshop.batch import _pick_price, load_chapter_tasks, price_bucket
     from workshop.config import load_config
@@ -2174,6 +2240,8 @@ def start_entities(
     )
     out_dir = paths.work_dir(name) / "50-entities"
     state: dict[str, Any] = {"running": True, "done": 0, "total": plan.blocks, "label": "", "error": ""}
+    stop_event = threading.Event()
+    opts = EntitiesOptions(block_size=block_size, max_tokens=_model_max_tokens(model_cfg))
 
     def _worker() -> None:
         try:
@@ -2181,32 +2249,71 @@ def start_entities(
                 plan=plan,
                 tasks=tasks,
                 client=client,
-                opts=EntitiesOptions(block_size=block_size),
+                opts=opts,
                 secrets=store.known_values,
                 on_progress=lambda i, t, l: state.update({"done": i, "total": t, "label": l}),
                 state_path=out_dir / "_state.json",
+                limit=limit,
+                should_stop=stop_event.is_set,
             )
             save_entities(paths.work_dir(name), result)
             state["error"] = "；".join(result.get("errors") or [])[:400]
+            state["pending"] = len(result.get("pending") or [])
+            state["stopped"] = bool(result.get("stopped"))
         except Exception as exc:  # noqa: BLE001
             state["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             state["running"] = False
             with _JOBS_LOCK:
                 _JOBS.pop(key, None)
+                _ENTITY_STOPS.pop(name, None)
 
     thread = threading.Thread(target=_worker, name=f"entities-{name}", daemon=True)
     with _JOBS_LOCK:
         _JOBS[key] = BatchJob(thread=thread, runner=None, work=name)
+        _ENTITY_LIVE[name] = state
+        _ENTITY_STOPS[name] = stop_event
     thread.start()
-    return {"ok": True, "work": name, "blocks": plan.blocks, "state": state}
+    return {
+        "ok": True,
+        "work": name,
+        "blocks": plan.blocks,
+        "limit": limit,
+        "max_tokens": opts.max_tokens,
+        "state": state,
+    }
+
+
+def stop_entities(name: str) -> dict[str, Any]:
+    """请求停止实体抽取。当前块跑完即停，已完成的块与费用都留着，下次接着跑。"""
+    with _JOBS_LOCK:
+        job = _JOBS.get(f"entities:{name}")
+        event = _ENTITY_STOPS.get(name)
+    if job is None or event is None:
+        return {"ok": False, "message": "没有正在运行的实体统计任务"}
+    event.set()
+    return {"ok": True, "message": "已请求停止，当前块跑完即停；已完成的块会保留"}
 
 
 def entities_status(paths: Paths, name: str) -> dict[str, Any]:
     with _JOBS_LOCK:
         job = _JOBS.get(f"entities:{name}")
+        live = _ENTITY_LIVE.get(name)
     running = job is not None and job.thread.is_alive()
-    return {"running": running, "has_result": entities_latest(paths, name) is not None}
+    payload: dict[str, Any] = {
+        "running": running,
+        "has_result": entities_latest(paths, name) is not None,
+    }
+    if live is not None:
+        payload["progress"] = {
+            "done": live.get("done", 0),
+            "total": live.get("total", 0),
+            "label": live.get("label", ""),
+        }
+        payload["error"] = live.get("error", "")
+        payload["pending"] = live.get("pending", 0)
+        payload["stopped"] = bool(live.get("stopped"))
+    return payload
 
 
 # ── 大纲 ────────────────────────────────────────────────────
@@ -2225,7 +2332,7 @@ def outline_plan(
 ) -> dict[str, Any]:
     from workshop.batch import _pick_price, load_chapter_tasks, price_bucket
     from workshop.config import load_config
-    from workshop.outline import build_outline_plan
+    from workshop.outline import build_outline_plan, missing_detail
 
     cfg = load_config(paths.root / "providers.yaml")
     provider, model_id = _resolve_provider_and_model(cfg, provider_id, model_id)
@@ -2245,8 +2352,10 @@ def outline_plan(
         price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
         price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
         bucket=bucket,
+        max_output_tokens=_model_max_tokens(model_cfg),
     )
     payload = plan.to_dict()
+    payload["missing_detail"] = missing_detail(plan.missing_reasons)
     payload["provider_name"] = provider.name
     payload["has_api_key"] = bool(_read_api_key(cfg, provider))
     # 可选模型必须列出来。**模型由用户显式选**——档位价差能到 4.5 倍，
@@ -2312,6 +2421,7 @@ def start_outline(
         price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
         price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
         bucket=bucket,
+        max_output_tokens=_model_max_tokens(model_cfg),
     )
     if not plan.blocks:
         raise ValueError(plan.warnings[0] if plan.warnings else "没有可归约的逐章梗概，请先跑标注")
@@ -2340,7 +2450,7 @@ def start_outline(
                 plan=plan,
                 client=client,
                 annotations_dir=paths.annotations_dir(name),
-                opts=OutlineOptions(block_size=block_size),
+                opts=OutlineOptions(block_size=block_size, max_tokens=_model_max_tokens(model_cfg)),
                 secrets=store.known_values,
                 on_progress=lambda i, total, label: job_state.update(
                     {"done": i, "total": total, "label": label}
