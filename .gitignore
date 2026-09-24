@@ -20,3 +20,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# 打包产物
+build/
+dist/
+*.spec

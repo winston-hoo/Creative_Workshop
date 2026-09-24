@@ -17,6 +17,8 @@ workshop/
 ├── annotate_cli.py              # 单章标注入口
 ├── ingest_cli.py                # 录入与切分入口
 ├── run_server.py                # 本地工作台
+├── launcher.py                  # exe 入口：起服务 + 自动开浏览器
+├── build_exe.py                 # 打包成单文件 exe
 ├── providers.yaml               # 服务商配置（文件系统是唯一真相源）
 ├── primitives.yaml              # 结构原语 P01-P21
 ├── requirements.txt
@@ -55,6 +57,27 @@ python -m venv .venv
 ```
 
 ⚠️ 在部分网络环境下国内的 pip 镜像源不可达，此时用默认源即可（上面的命令就是默认源）。
+
+---
+
+## 打包成 exe（给不装 Python 的人用）
+
+```bash
+python -m pip install --user pyinstaller
+python build_exe.py
+```
+
+产物是单个文件 `dist/创作工坊.exe`（约 17 MB，目标机器不需要装 Python）。
+双击即用：起本地服务 → 自动开浏览器 → 关掉那个控制台窗口即停。
+
+**数据不放在 exe 旁边，而是放 `%LOCALAPPDATA%\创作工坊`**。首次启动自动铺一份
+`providers.yaml` / `primitives.yaml` / `work.yaml` 模板，**已存在的文件一律不覆盖**——
+用户改过的配置比模板重要。源码方式运行仍然用项目目录，行为不变。
+
+端口默认 8765，被占用时自动换一个空闲端口，而不是启动失败。`--no-browser` 可以不开浏览器。
+**只绑 127.0.0.1 这条在 exe 里同样成立**——它写在 `launcher.py` 的常量里，不是命令行参数。
+
+单文件模式每次启动都要先解包到临时目录，比源码启动慢几秒，这是单文件换来的代价。
 
 ---
 

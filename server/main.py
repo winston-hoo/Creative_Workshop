@@ -40,6 +40,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -48,7 +49,9 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-ROOT = Path(__file__).resolve().parent.parent
+# 打包成 exe 后由 launcher.py 从环境变量指定数据根：
+# exe 里的项目目录是只读的临时解包目录，作品不能落在那里。
+ROOT = Path(os.environ.get("WORKSHOP_ROOT") or Path(__file__).resolve().parent.parent).resolve()
 sys.path.insert(0, str(ROOT / "src"))
 
 from server import services  # noqa: E402
