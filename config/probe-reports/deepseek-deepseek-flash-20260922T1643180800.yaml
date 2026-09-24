@@ -1,0 +1,64 @@
+provider: deepseek
+provider_name: DeepSeek
+model: deepseek-flash
+triggered_by: manual_test_connection
+checked_at: '2026-09-22T16:43:18+08:00'
+time_bucket: peak
+recipe_version: probe-recipe-v1
+config_snapshot:
+  base_url: https://api.deepseek.com
+  base_url_anthropic: https://api.deepseek.com/anthropic
+  protocol: openai_compatible
+  prompt_hash: 3bb4e4849ab1180d
+  max_tokens: 8
+  streaming: true
+  text_chars: 1000
+  samples: 3
+results:
+  reachable: true
+  models_discovered:
+  - deepseek-flash
+  - deepseek-v4-pro
+  structured_output: false
+  usage_in_response: true
+  tokens_per_cjk_char: 0.968
+  tokens_per_cjk_char_estimated: false
+benchmark:
+  samples: 3
+  success: 3/3
+  rtt_ms:
+    median: 130.19
+    min: 126.5
+    max: 161.64
+  ttft_ms: null
+  total_latency_ms:
+    median: 639.15
+    min: 528.36
+    max: 680.33
+  output_tokens: 8
+  output_tokens_per_sec:
+    median: 12.52
+    min: 11.76
+    max: 15.14
+derived:
+  suggested_timeout_sec: 10
+  est_single_chapter_sec: 39.9
+  est_full_run_hours: 2.77
+usage_total:
+  prompt_tokens: 1015
+  completion_tokens: 8
+  total_tokens: 1023
+  cached_tokens: 768
+  p5_total_tokens: 1548
+errors:
+- step: P3
+  kind: structured_output_unsupported
+  blocking: false
+  http_status: null
+  hint: 该模型不支持结构化输出，将自动走降级路径
+  detail: 返回内容无法解析为预期 JSON：
+report_id: deepseek-deepseek-flash-20260922T1643180800
+verdict:
+  enabled_ok: true
+  blocking_error_count: 0
+  non_blocking_error_count: 1

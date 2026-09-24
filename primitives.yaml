@@ -1,0 +1,185 @@
+# 结构原语定义
+#
+# ⚠️ 原语是全局唯一的，所有作品必须用同一套字段，否则跨作品聚合会失败。
+#    改动原语等于全量重跑标注，属破坏性变更。定稿后请把 frozen 置为 true。
+#
+# source 字段区分两类：
+#   script —— 纯脚本可算，不调模型（免费、确定、可重复）
+#   model  —— 语义判断，需要模型
+# 这个划分直接决定了成本结构：script 类字段不花一分钱。
+
+version: "1.0"
+frozen: false
+note: "首版原语，待用户确认字段增删后再冻结"
+
+enums:
+  perspective: [第一人称, 第三限知, 第三全知]
+  time_span: [即时, 数日, 跨月]
+  hook_type: [悬念, 危机, 期待, 情感, 信息]
+  payoff_type: [打脸, 反转, 获得, 揭露, 情感]
+  foreshadow_action: [埋设, 推进, 回收]
+  rating_1_5: [1, 2, 3, 4, 5]
+
+fields:
+  # ── 脚本轨：不调模型 ────────────────────────────────
+  - id: P01
+    key: vol_no
+    label: 卷序
+    source: script
+    type: int
+  - id: P02
+    key: chapter_no
+    label: 章序
+    source: script
+    type: int
+  - id: P03
+    key: char_count
+    label: 章字数
+    source: script
+    type: int
+  - id: P04
+    key: para_count
+    label: 段落数
+    source: script
+    type: int
+  - id: P05
+    key: avg_para_chars
+    label: 平均段长
+    source: script
+    type: float
+  - id: P06
+    key: dialogue_ratio
+    label: 对话占比
+    source: script
+    type: float
+  - id: P07
+    key: perspective_detected
+    label: 人称检测结果
+    source: script
+    type: str
+  - id: P08
+    key: style_violations
+    label: 风格规范违规
+    source: script
+    type: list
+
+  # ── 模型轨：语义判断 ────────────────────────────────
+  - id: P09
+    key: perspective
+    label: 视角人称
+    source: model
+    type: enum
+    enum: perspective
+  - id: P10
+    key: scene_switches
+    label: 场景切换次数
+    source: model
+    type: int
+    hint: "章节内地点或时间明显跳转的次数，无跳转填 0"
+  - id: P11
+    key: time_span
+    label: 时间跨度
+    source: model
+    type: enum
+    enum: time_span
+    hint: "本章覆盖的故事时间长度"
+  - id: P12
+    key: hook_strength
+    label: 章末钩子强度
+    source: model
+    type: rating
+    enum: rating_1_5
+    hint: "1 平淡收尾，5 强烈悬念逼人追读"
+  - id: P13
+    key: hook_type
+    label: 钩子类型
+    source: model
+    type: enum
+    enum: hook_type
+  - id: P14
+    key: emotion
+    label: 情绪值
+    source: model
+    type: rating
+    enum: rating_1_5
+    hint: "全章情绪强度，1 平缓，5 强烈"
+  - id: P15
+    key: conflict
+    label: 冲突等级
+    source: model
+    type: rating
+    enum: rating_1_5
+  - id: P16
+    key: info_release
+    label: 信息释放量
+    source: model
+    type: rating
+    enum: rating_1_5
+    hint: "本章新信息的密度"
+  - id: P17
+    key: mainline_progress
+    label: 主线推进度
+    source: model
+    type: rating
+    enum: rating_1_5
+  - id: P18
+    key: subplot_count
+    label: 支线在场数
+    source: model
+    type: int
+  - id: P19
+    key: payoffs
+    label: 爽点
+    source: model
+    type: list_of_objects
+    item_keys: [锚点, 类型, 强度]
+    item_enums:
+      类型: payoff_type
+      强度: rating_1_5
+  - id: P20
+    key: foreshadows
+    label: 伏笔动作
+    source: model
+    type: list_of_objects
+    item_keys: [动作, 编号, 描述]
+    item_enums:
+      动作: foreshadow_action
+    item_constraints:
+      描述: "不超过 20 字"
+    hint: "只登记「作者埋下、等后文揭晓」的悬念。本章已交代清楚的信息、本章发生的动作、主角的异能设定都不算。同一条线索后文再提到填「推进」，不要重复登记"
+  - id: P21
+    key: motive_strength
+    label: 主角核心动机呈现强度
+    source: model
+    type: rating
+    enum: rating_1_5
+    hint: "主角核心动机在本章的显性呈现强度，未出现填 1"
+  # P22 是「大纲」这条链路的原料。
+  # 关键点：它挂在**已有的标注调用**上，不额外花钱——
+  # 与其将来为了做摘要再单独跑一遍上千次调用，不如现在就一起产出。
+  # 现在加代价为零（本书还没跑过标注）；等跑完再改原语就得全量重跑。
+  - id: P22
+    key: chapter_summary
+    label: 本章剧情梗概
+    source: model
+    type: str
+    max_len: 60
+    # max_len 是**建议**长度，不是硬上限：实测 48 字会把句子砍在半截
+    # （「…却得知张老师生病异能课停」），而梗概是大纲的原料，句子断了就没用了。
+    hint: "一句话说清本章发生了什么：谁做了什么、结果如何。只写剧情，不评价、不剧透后文"
+
+# 模型必须额外返回的自评字段，用于分级复核
+meta_fields:
+  - key: confidence
+    label: 自评置信度
+    type: enum
+    values: [高, 中, 低]
+  - key: uncertain_fields
+    label: 存疑字段
+    type: list_of_str
+
+# 复核策略：按自评置信度分级，只强制复核低档
+review_policy:
+  high: auto_accept
+  medium: spot_check
+  low: must_review

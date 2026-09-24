@@ -1,0 +1,255 @@
+# providers.yaml —— 模型服务商配置（已接入：DeepSeek）
+#
+# 状态：DeepSeek 已按官方中文定价页预填，尚未经你核对确认（verified_by_user: false）
+# 其余服务商留空，按需再填。
+#
+# 数据来源：api-docs.deepseek.com/zh-cn/quick_start/pricing （2026-09-22 核对）
+# 提醒：定价会调整，接入前请在控制台复核一次。
+
+settings:
+  currency: CNY
+  budget_gate_mode: token
+
+  budget:
+    # 2026-09-23 调整：估算口径修正后，《示例作品》933 章约需 267 万 token
+    # （旧口径把合成文本的系数当成真实散文，算出 389 万，所以当时定的 200 万
+    # 是按错误数字设的）。这里放宽到 500 万，留出一次重跑全量的余量。
+    # 闸门仍然按**实测 usage 累计**拦，估算只是预估。
+    per_task_token_limit: 5000000
+    monthly_token_limit: 20000000
+    on_exceed: abort
+
+  probe:
+    enabled: true
+    on_config_save: false             # 已确定：只在手动点「测试连接」时触发，不自动跑
+    probe_model: deepseek-flash
+    probe_text_chars: 1000
+    samples: 3                        # 重复次数，取中位数，单次延迟波动大
+    streaming: true                   # 开流式才能测首字延迟
+    # 思考模式：disabled | enabled | auto
+    # DeepSeek 默认开启思考模式且 effort 为 high。实测发现开启时：
+    #   · max_tokens 被思维链占满，正文为空 → 结构化输出被误判为「不支持」
+    #   · 首字延迟测不到（思维链走 reasoning_content 字段）
+    #   · 速度与耗时被思维链污染，单章耗时估到 39.9 秒
+    # 探测是量性能，不是让模型想得深，所以默认关闭。
+    thinking: disabled
+
+  # 探测报告落盘存档，兼作基准测试记录
+  probe_reports:
+    archive: true
+    path: "config/probe-reports/"
+    keep_versions: true               # 保留历史，用于退化监测
+    comparable_by: "prompt_hash"      # 测试句哈希不同则不可直接对比
+    alert_on_change_pct: 50           # 延迟变化超此阈值时提示
+
+  # 固定前缀必须逐字不变且排在请求最前面
+  # 注意：单章输入约 3K token 时，固定前缀只占约 29%，
+  #       缓存真实收益约 16%（见方案文档的估算明细），
+  #       模型档位选择的影响远大于缓存。不要为了缓存牺牲正文处理质量。
+  prompt_cache:
+    enabled: true
+    stable_prefix_order:
+      - system_prompt
+      - primitives
+      - output_schema
+    variable_tail:
+      - prev_chapter_summary
+      - current_chapter_text
+    assert_prefix_stable: true
+
+  allow_run_all_model_tasks: false    # 反模式，保持关闭
+
+
+providers:
+  - id: deepseek
+    name: "DeepSeek"
+    type: cloud
+    protocol: openai_compatible
+    enabled: false                    # 探测通过后再置 true
+
+    base_url: "https://api.deepseek.com"          # OpenAI 格式（已核对）
+    base_url_anthropic: "https://api.deepseek.com/anthropic"   # 备选：Anthropic 格式
+    auth:
+      scheme: bearer
+      header_name: Authorization
+      api_key_ref: DEEPSEEK_API_KEY
+
+    probe_results:                    # 由探测脚本回填，勿手写
+      reachable: null
+      checked_at: null
+      models_discovered: []
+      structured_output: null
+      usage_in_response: null
+      tokens_per_cjk_char: null
+      errors: []
+
+    manual:
+      max_context: 1000000            # 官方：上下文 1M
+      max_output: 384000              # 官方：最大输出 384K
+      max_concurrency: 2500           # 官方：flash 并发限制 2500
+      rate_limit_note: "官方文档：更多并发限制细节见「限速与隔离」页"
+
+    snapshot_ref:
+      source: "api-docs.deepseek.com/zh-cn/quick_start/pricing"
+      date: "2026-09-22"
+      verified_by_user: false
+
+    pricing:
+      mode: per_token
+      currency: CNY
+
+      # 峰谷定价：空闲价为高峰价的一半
+      # 高峰 = 北京时间周一至周五 09:00-12:00、14:00-18:00
+      # 空闲 = 其余全部时段，含全部周末与中国法定节假日
+      # → 调度建议：全量标注排在周末或工作日夜间执行
+      time_of_day:
+        enabled: true
+        peak_hours_bjt: ["09:00-12:00", "14:00-18:00"]
+        peak_days_bjt: ["MO", "TU", "WE", "TH", "FR"]
+        offpeak_multiplier: 0.5
+
+      tiers:
+        enabled: false                # DeepSeek 无按输入长度分档
+        rules: []
+
+      service_tier:
+        default: standard             # 无 Priority 档
+        priority_multiplier: null
+
+      batch:
+        available: false
+
+      notes: "扣费 = token 消耗量 × 单价；优先扣减赠送余额。价格可能变动，以控制台为准。"
+
+    models:
+      # ── 主力模型：逐章语义标注 ──
+      - id: "deepseek-flash"          # 官方建议使用的模型名
+        alias: "DeepSeek 主力"
+        role: main
+        model_version: "DeepSeek-V4.1-Flash"
+        max_context: 1000000
+        max_output: 384000
+        thinking_mode: "默认思考模式，支持切换非思考"
+
+        capabilities:
+          structured_output: true      # 官方标注 Json Output 支持
+          tool_calls: true
+          responses_api: true
+          anthropic_api: true
+          chat_prefix_completion: true
+          fim_completion: "仅非思考模式"
+          vision: true
+
+        pricing:
+          input_per_mtok_offpeak: 1.0          # 元/百万 tokens，缓存未命中
+          input_per_mtok_peak: 2.0
+          cached_input_per_mtok_offpeak: 0.02  # 元/百万 tokens，缓存命中
+          cached_input_per_mtok_peak: 0.04
+          output_per_mtok_offpeak: 4.0
+          output_per_mtok_peak: 8.0
+
+        # ── 批量实测（2026-09-23，20 章真实样本，空闲时段，并发 1）──
+        # 这是**真实跑出来的**数字，比探测时的折算值可信，成本估算优先用它。
+        # 探测给的 est_single_chapter_sec=5.7 是按 500 输出 token 折算的，
+        # 而实际每章只输出约 263 token，所以那个值高估了 3 倍多。
+        measured_batch:
+          checked_at: "2026-09-23T21:39:29+08:00"
+          samples: 20
+          work: "示例作品（前 20 章）"
+          avg_input_tokens: 2695
+          avg_output_tokens: 263
+          avg_latency_ms: 1524
+          total_tokens: 59151
+          cost_cny: 0.0749
+          cost_per_chapter_cny: 0.0037
+          attempts_avg: 1.0
+
+          # ── 由这 20 章拟合出来的输入侧模型（最小二乘，残差约 ±100 token）──
+          #   prompt_tokens ≈ prompt_fixed_tokens + 正文字符数(含空白) × prompt_tokens_per_char
+          # 为什么要拟合：P5 探测算出的 0.968 是**合成文本**（千字文片段反复重复），
+          # 真实散文只有 0.675，差 1.43 倍；拿 0.968 估成本会整体高估约 40%。
+          prompt_fixed_tokens: 940
+          prompt_tokens_per_char: 0.6754
+          fit_note: "正文长度按**含空白与缩进**的原始字符数算。manifest 里的 char_count 是非空白字符数，两者差约 24%（源文本每段有 4 空格缩进）。"
+
+        # ── 实测结果（2026-09-22 探测，高峰时段，思考模式关闭）──
+        measured:
+          checked_at: "2026-09-22T16:46:16+08:00"
+          time_bucket: peak
+          thinking: disabled
+          tokens_per_cjk_char: 0.968        # 实测，比 0.7 的粗估高 38%，成本预估要用它
+          ttft_ms: 461
+          total_latency_ms: 546
+          output_tokens_per_sec: 96
+          est_single_chapter_sec: 5.7       # 按 500 输出 token 折算
+          suggested_timeout_sec: 10
+          report: "config/probe-reports/deepseek-deepseek-flash-20260922T1646160800.yaml"
+
+        # 思考模式：官方默认开启，effort 为 high。**标注任务必须关闭**，原因见文件顶部说明。
+        thinking:
+          default_state: enabled            # 官方默认值
+          required_for_annotation: disabled # 本项目的强制要求
+          param: '{"thinking": {"type": "disabled"}}'
+          note: "思考模式下 temperature 不生效，且思维链会占满短输出任务的预算"
+
+      # ── 高档模型：改写、词表抽取这类高要求任务 ──
+      - id: "deepseek-v4-pro"
+        alias: "DeepSeek 高档"
+        role: heavy
+        model_version: "DeepSeek-V4-Pro-0813"
+        max_context: 1000000
+        max_output: 384000
+        # ⚠️ 该模型的可用状态官方页面近期表述有变化，接入前在控制台确认
+
+        capabilities:
+          structured_output: true
+          tool_calls: true
+          responses_api: true
+          anthropic_api: true
+          chat_prefix_completion: true
+          fim_completion: "仅非思考模式"
+          vision: false
+
+        pricing:
+          input_per_mtok_offpeak: 4.5
+          input_per_mtok_peak: 9.0
+          cached_input_per_mtok_offpeak: 0.15
+          cached_input_per_mtok_peak: 0.30
+          output_per_mtok_offpeak: 13.5
+          output_per_mtok_peak: 27.0
+
+
+task_bindings:
+  chapter_annotation:                 # 逐章语义标注：主成本，用 flash
+    provider: deepseek
+    model: "deepseek-flash"
+    temperature: 0.3                  # 注意：思考模式开启时 temperature 不生效，所以必须配 thinking: disabled
+    thinking: disabled
+    max_concurrency: 4                # 保守起步，实测后再提
+    retry: 2
+    timeout_sec: 30                   # 实测单章约 5.7 秒，取约 5 倍余量
+
+  trial_run:                          # 试跑 20 章抽检
+    provider: deepseek
+    model: "deepseek-flash"
+    sample_size: 20
+
+  entity_extraction:                  # 实体词表抽取：一次性，可用高档
+    provider: deepseek
+    model: "deepseek-v4-pro"
+    temperature: 0.3
+
+  volume_review:                      # 卷级复盘：输入为标注摘要
+    provider: deepseek
+    model: "deepseek-flash"
+    temperature: 0.3
+
+  consistency_check:                  # 一致性校验：有明确检查项，中档够用
+    provider: deepseek
+    model: "deepseek-flash"
+    temperature: 0.2
+
+  rewrite:                            # 改写：质量要求最高
+    provider: deepseek
+    model: "deepseek-v4-pro"
+    temperature: 0.6

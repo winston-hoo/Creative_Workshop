@@ -1,0 +1,38 @@
+{
+  "reports": [
+    {
+      "report_id": "deepseek-deepseek-flash-20260922T1643180800",
+      "file": "deepseek-deepseek-flash-20260922T1643180800.yaml",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "checked_at": "2026-09-22T16:43:18+08:00",
+      "time_bucket": "peak",
+      "prompt_hash": "3bb4e4849ab1180d",
+      "reachable": true,
+      "structured_output": false,
+      "usage_in_response": true,
+      "tokens_per_cjk_char": 0.968,
+      "ttft_ms_median": null,
+      "total_latency_ms_median": 639.15,
+      "suggested_timeout_sec": 10,
+      "enabled_ok": true
+    },
+    {
+      "report_id": "deepseek-deepseek-flash-20260922T1646160800",
+      "file": "deepseek-deepseek-flash-20260922T1646160800.yaml",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "checked_at": "2026-09-22T16:46:16+08:00",
+      "time_bucket": "peak",
+      "prompt_hash": "3bb4e4849ab1180d",
+      "reachable": true,
+      "structured_output": true,
+      "usage_in_response": true,
+      "tokens_per_cjk_char": 0.968,
+      "ttft_ms_median": 461.04,
+      "total_latency_ms_median": 545.96,
+      "suggested_timeout_sec": 10,
+      "enabled_ok": true
+    }
+  ]
+}

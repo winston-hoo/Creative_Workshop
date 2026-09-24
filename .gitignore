@@ -1,0 +1,22 @@
+# ── 隐私与运行时数据：一律不入库 ──────────────────────────
+# 密钥（哪怕当前是空的，防止以后手滑填进去）
+.env
+config/.env
+config/secrets.json
+
+# 作品数据：原文、标注、报告都带真实作品内容与作者本机绝对路径
+workspaces/
+config/annotations/
+
+# 上传暂存与临时工作区：里面是整本原文
+.tmp/
+
+# 自检产生的模拟报告（跑一次生成一批，没有留存价值）
+config/probe-reports/_selftest/
+
+# ── 常规忽略 ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
