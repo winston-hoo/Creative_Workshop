@@ -129,8 +129,11 @@ function askConfirm({ title, html, confirmLabel = '确认', cancelLabel = '取�
 
     const done = (value) => {
       document.removeEventListener('keydown', onKey, true);
-      back.remove();
+      // 必须等 await 侧读完表单值再移除。如果先 remove 再 resolve，
+      // 回调里 document.getElementById(...) 会拿到 null——表现是
+      // 「点了确定但像没点一样」，而且原因在弹窗组件里，极难排查。
       resolve(value);
+      setTimeout(() => back.remove(), 0);
     };
     const onKey = (e) => {
       if (e.key === 'Escape') {
@@ -229,15 +232,78 @@ async function renderShelf() {
       imported.length
         ? `<div class="work-grid">${imported.map(workCard).join('')}</div>`
         : `<div class="empty">
-             <strong style="display:block;font-size:15px;margin-bottom:6px">还没有导入作品</strong>
-             点右上角「导入作品」，选一个 txt 文件，先看切分预览再确认。
+             <div class="empty-icon">📚</div>
+             <h3>还没有导入作品</h3>
+             <p style="margin:0 0 16px">点右上角「导入作品」，选一个 txt 或 docx 文件，先看切分预览再确认。</p>
+             <a class="btn primary" href="#/import" style="text-decoration:none;color:inherit">开始导入</a>
            </div>`
     }
+    <div id="archive-area" style="margin-top:20px"></div>
   `;
 
   view.querySelectorAll('[data-archive]').forEach((btn) => {
     btn.onclick = () => archiveWork(btn.dataset.archive);
   });
+  loadArchiveArea();
+}
+
+/* 归档区：移出书架的作品在这里列出，可一键恢复。
+   恢复是搬回（移动），不是复制；书架上已有同名会拒绝而不是覆盖。 */
+async function loadArchiveArea() {
+  const box = document.getElementById('archive-area');
+  if (!box) return;
+  let data;
+  try {
+    data = await getJSON('/api/archive');
+  } catch {
+    box.innerHTML = '';
+    return;
+  }
+  const items = data.items || [];
+  if (!items.length) {
+    box.innerHTML = '';
+    return;
+  }
+  const rows = items
+    .map(
+      (a) => `<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <strong>${esc(a.name)}</strong>
+        <span class="muted">${num(a.chapters)} 章${a.annotated ? ` · 已标注 ${num(a.annotated)}` : ''}${a.is_copy ? ' · 重名副本' : ''}</span>
+        <div class="spacer" style="flex:1"></div>
+        <button class="ghost" data-restore="${esc(a.name)}">恢复</button>
+      </div>`
+    )
+    .join('');
+  box.innerHTML = `
+    <div class="card">
+      <h3 style="margin:0 0 8px">归档区</h3>
+      <p class="muted" style="margin:0 0 8px">
+        移出书架的作品在这里，数据完整保留（章节、标注、知识库都在）。恢复即搬回书架，不会重跑任何任务。
+      </p>
+      ${rows}
+    </div>
+  `;
+  box.querySelectorAll('[data-restore]').forEach((btn) => {
+    btn.onclick = () => restoreArchived(btn.dataset.restore);
+  });
+}
+
+async function restoreArchived(name) {
+  const ok = await askConfirm({
+    title: `恢复「${name}」到书架？`,
+    html:
+      '<p style="margin:0 0 8px">把整个工作区从归档区搬回书架。</p>' +
+      '<p class="muted" style="margin:0">章节、标注、实体、知识库全部原样回来，不需要重新生成。</p>' +
+      '<p class="muted" style="margin:8px 0 0">如果书架上已有同名作品，会拒绝恢复而不是覆盖。</p>',
+    confirmLabel: '恢复',
+  });
+  if (!ok) return;
+  try {
+    await postJSON('/api/archive/restore', { name });
+    renderShelf();
+  } catch (e) {
+    await tellUser('恢复失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
 }
 
 function workCard(w) {
@@ -654,7 +720,7 @@ async function renderWork(name) {
   const anomalies = await getJSON(`/api/works/${encodeURIComponent(name)}/anomalies`).catch(() => []);
 
   view.innerHTML = `
-    <p class="muted" style="margin-bottom:6px"><a href="#/shelf">← 书架</a></p>
+    <p class="muted" style="margin-bottom:6px"><a href="#/shelf">书架</a></p>
     <h1>${esc(d.name)}</h1>
     <p class="lead">${esc(src.file || '')} · ${esc(src.encoding || '')} 编码 · ${bytes(src.bytes)}</p>
 
@@ -666,6 +732,8 @@ async function renderWork(name) {
       { k: '平均章长', v: num(s.chars_avg) },
       { k: '已标注', v: d.annotated },
     ])}
+
+    ${renderDataPipeline(d)}
 
     <div class="card" style="margin-top:14px">
       <h3>完整性核验</h3>
@@ -693,8 +761,14 @@ async function renderWork(name) {
       <div class="spread" style="margin-bottom:10px">
         <h2 style="margin:0">逐章标注</h2>
         <div class="row">
+          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/annotator"
+             style="text-decoration:none;color:inherit">进入标注台</a>
           <a class="btn" href="#/work/${encodeURIComponent(d.name)}/annotations"
              style="text-decoration:none;color:inherit">查看标注数据</a>
+          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/kb"
+             style="text-decoration:none;color:inherit">知识库</a>
+          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/rewrite"
+             style="text-decoration:none;color:inherit">改写台</a>
           <a class="btn" href="#/work/${encodeURIComponent(d.name)}/entities"
              style="text-decoration:none;color:inherit">世界观与人物</a>
           <a class="btn" href="#/work/${encodeURIComponent(d.name)}/report"
@@ -743,6 +817,109 @@ async function renderWork(name) {
   };
   loadChapters();
   loadTaskArea(detailState.name);
+  loadDataPipeline(d); // 数据依赖指引：异步填状态
+}
+
+/* 数据依赖指引：这本书各层数据「由哪个任务产出、当前有没有」。
+   核心目的：让「标注完为什么实体/大纲没动静」这种困惑显形——
+   每层都写清楚入口按钮和现状，缺了就告诉你去哪点。 */
+const dataPipeline = {
+  name: '',
+  entitiesHas: null,
+  outlineHas: null,
+  kbHas: null,
+  rewriteHas: null,
+  annot2: 0,
+};
+
+/* 同步占位：先把卡片容器画出来，状态由 loadDataPipeline 异步填充 */
+function renderDataPipeline(d) {
+  return `<div class="card" id="data-pipeline" style="margin-top:14px">
+    <p class="muted" style="margin:0">读取各层数据状态…</p>
+  </div>`;
+}
+
+async function loadDataPipeline(d) {
+  const name = d && d.name ? d.name : detailState.name;
+  const box = document.getElementById('data-pipeline');
+  if (!box) return;
+  box.innerHTML = '<p class="muted">读取各层数据状态…</p>';
+  dataPipeline.name = name;
+
+  try {
+    const [entities, outline, kb, annotations] = await Promise.all([
+      getJSON(`/api/works/${encodeURIComponent(name)}/entities`).catch(() => ({ exists: false })),
+      getJSON(`/api/works/${encodeURIComponent(name)}/outline`).catch(() => ({ exists: false })),
+      getJSON(`/api/works/${encodeURIComponent(name)}/kb`).catch(() => ({ exists: false })),
+      getJSON(`/api/works/${encodeURIComponent(name)}/annotations?limit=1`).catch(() => ({ total: 0 })),
+    ]);
+    dataPipeline.entitiesHas = !!entities.exists;
+    dataPipeline.outlineHas = !!outline.exists;
+    dataPipeline.kbHas = !!kb.exists;
+    dataPipeline.annot2 = annotations.total || 0;
+  } catch {
+    /* 状态读不到就保持未知，不阻塞页面 */
+  }
+  drawDataPipeline();
+}
+
+function drawDataPipeline() {
+  const box = document.getElementById('data-pipeline');
+  if (!box) return;
+  const prefix = `#/work/${encodeURIComponent(dataPipeline.name)}/`;
+  const chip = (b) => (b ? '<span class="chip ok">已有</span>' : '<span class="chip warn">还没有</span>');
+
+  // 每一行：数据层 → 产出任务 → 状态 → 入口
+  const rows = [
+    {
+      layer: '1 · 逐章标注',
+      desc: '每章结构字段：钩子、情绪、冲突、梗概、伏笔（主成本）',
+      state: dataPipeline.annot2 > 0 ? `<span class="chip ok">${num(dataPipeline.annot2)} 章</span>` : '<span class="chip warn">未开始</span>',
+      action: `<a class="btn" href="${prefix}annotator" style="text-decoration:none;color:inherit">标注台</a>`,
+      up: '',
+    },
+    {
+      layer: '2 · 实体统计',
+      desc: '人物/势力/能力/地点（读全书正文，会再花一次全本钱）',
+      state: chip(dataPipeline.entitiesHas),
+      action: `<a class="btn" href="${prefix}entities" style="text-decoration:none;color:inherit">世界观与人物</a>`,
+      up: dataPipeline.annot2 > 0 ? '' : '<span class="muted">先跑标注才有梗概原料，正文实体不受限</span>',
+    },
+    {
+      layer: '2 · 大纲',
+      desc: '吃标注的逐章梗概归约，几乎不再花钱',
+      state: chip(dataPipeline.outlineHas),
+      action: `<a class="btn" href="${prefix}outline" style="text-decoration:none;color:inherit">大纲</a>`,
+      up: dataPipeline.annot2 > 0 ? '' : '<span class="muted">需先有逐章梗概（标注产出）</span>',
+    },
+    {
+      layer: '3 · 知识库',
+      desc: '聚合标注+实体，纯本地零成本',
+      state: chip(dataPipeline.kbHas),
+      action: `<a class="btn" href="${prefix}kb" style="text-decoration:none;color:inherit">知识库</a>`,
+      up: dataPipeline.entitiesHas ? '' : '<span class="muted">人物卡片依赖实体统计</span>',
+    },
+  ];
+
+  box.innerHTML = `
+    <h3 style="margin:0 0 8px">数据依赖指引</h3>
+    <p class="muted" style="margin:0 0 8px">
+      每种数据由独立任务产出，不会自动一起跑。<strong>实体统计是唯一需要再花一次全本钱的</strong>；
+      大纲吃标注梗概、知识库纯本地，都不额外烧全本。
+    </p>
+    ${rows
+      .map(
+        (r) => `<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:flex-start">
+          <div style="min-width:120px"><strong>${esc(r.layer)}</strong></div>
+          <div style="flex:1;min-width:0">
+            <div>${esc(r.desc)}</div>
+            <div>${r.up}</div>
+          </div>
+          <div class="row" style="flex-shrink:0">${r.state}${r.action}</div>
+        </div>`
+      )
+      .join('')}
+  `;
 }
 
 /* ── 模型任务区 ──────────────────────────────────────────
@@ -1601,11 +1778,45 @@ async function annotateSelected() {
   }
 
   if (!plan.pending) {
-    await tellUser(
-      '这几章都不用跑',
-      '<p style="margin:0">选中的章节都已经有标注且原文未变。' +
-        '要重跑请勾上下面那个「连已标注的也重跑」。</p>'
-    );
+    // 全部已标注且原文未变 → 默认不重跑，但提示要把「连已标注的也重跑」
+    // 直接摆在用户面前：**就在这里勾选**，而不是只给一句「去勾那个」，结果没地方勾。
+    const ok = await askConfirm({
+      title: '选中的章节都已标注',
+      html:
+        '<p style="margin:0">选中的章节都已经有标注且原文未变，默认不重跑。</p>' +
+        '<label class="check" style="margin-top:12px">' +
+        '<input type="checkbox" id="force-rerun">' +
+        `<span>连已标注的也重跑<small>改过提示词或作品配置时用，否则新旧口径的数据不能混着看</small></span>` +
+        '</label>' +
+        notice('warn', '勾选后会把选中的章节全部重跑，会发起模型调用、产生费用。'),
+      confirmLabel: '开始重跑',
+    });
+    if (!ok) return;
+    const force = document.getElementById('force-rerun')?.checked || false;
+    if (!force) {
+      // 不能静默。「没勾选」和「勾选后报错」如果长得一样，用户就分不清
+      // 是放弃还是失败了——这正是这个界面最该避免的静默失效。
+      await tellUser(
+        '没有重跑',
+        '<p style="margin:0">没有勾选「连已标注的也重跑」，所以没有发起任何调用。</p>' +
+          '<p class="muted" style="margin:8px 0 0">想重跑就再选一次并勾上那个框。</p>'
+      );
+      return;
+    }
+    try {
+      // 点完确定先给即时反馈，别让 postJSON 的几百毫秒看起来像「没反应」
+      const taskBox = document.getElementById('task-body');
+      if (taskBox) taskBox.innerHTML = notice('info', '<span class="spinner"></span>正在启动标注…');
+      await postJSON(
+        `/api/works/${encodeURIComponent(detailState.name)}/annotate/start`,
+        { chapter_ids: ids, force: true, allow_over_budget: false }
+      );
+      selected.clear();
+      loadChapters();
+      renderWork(detailState.name); // 回到任务区看进度
+    } catch (e) {
+      await tellUser('启动失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    }
     return;
   }
 
@@ -1632,6 +1843,9 @@ async function annotateSelected() {
 
   const force = document.getElementById('force-rerun')?.checked || false;
   try {
+    // 点完确定先给即时反馈，别让 postJSON 的几百毫秒看起来像「没反应」
+    const taskBox = document.getElementById('task-body');
+    if (taskBox) taskBox.innerHTML = notice('info', '<span class="spinner"></span>正在启动标注…');
     await postJSON(
       `/api/works/${encodeURIComponent(detailState.name)}/annotate/start`,
       { chapter_ids: ids, force, allow_over_budget: false }
@@ -1817,7 +2031,7 @@ async function renderReport(name) {
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
-      <a href="#/work/${encodeURIComponent(name)}">← ${esc(name)}</a>
+      <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
     </p>
     <h1>结构体检报告 · ${esc(r.work)}</h1>
     <p class="lead">生成于 ${when(r.generated_at)}　·　标注覆盖 ${num(cov.annotated)}/${num(cov.chapters)} 章（${((cov.ratio || 0) * 100).toFixed(1)}%）</p>
@@ -2546,7 +2760,7 @@ async function renderChapter(name, chapterId) {
     );
   } catch (e) {
     view.innerHTML = notice('bad', `读取章节失败：${esc(e.message)}`) +
-      `<p><a href="#/work/${encodeURIComponent(name)}">← 返回作品</a></p>`;
+      `<p><a href="#/work/${encodeURIComponent(name)}">返回作品</a></p>`;
     return;
   }
   chapterState.data = d;
@@ -2588,7 +2802,7 @@ function drawChapter() {
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
-      <a href="#/work/${encodeURIComponent(chapterState.name)}">← ${esc(chapterState.name)}</a>
+      <a href="#/work/${encodeURIComponent(chapterState.name)}">${esc(chapterState.name)}</a>
     </p>
 
     <div class="spread chapter-head">
@@ -2754,7 +2968,7 @@ async function renderOutline(name) {
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
-      <a href="#/work/${encodeURIComponent(name)}">← ${esc(name)}</a>
+      <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
     </p>
     <h1>《${esc(name)}》大纲</h1>
     <p class="lead">
@@ -2867,6 +3081,12 @@ async function renderOutline(name) {
    体检报告给的是汇总，单章阅读给的是某一章的全部。
    中间缺「这本书标出来的数据长什么样」——一页表格扫完。 */
 
+function summaryCell(text) {
+  const full = esc(text || '—');
+  // 完整显示三段前的梗概；更长仍可读（表格内换行），不截断内容
+  return `<span style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden" title="${full}">${full}</span>`;
+}
+
 const annotListState = { name: '', offset: 0, limit: 50, only: 'all' };
 
 async function renderAnnotations(name) {
@@ -2906,14 +3126,14 @@ async function renderAnnotations(name) {
         <td class="num">${r.mainline_progress ?? '—'}</td>
         <td class="num">${num(r.payoff_count)}</td>
         <td class="num">${num(r.foreshadow_count)}</td>
-        <td>${esc((r.chapter_summary || '').slice(0, 40))}</td>
+        <td style="min-width:220px">${summaryCell(r.chapter_summary)}</td>
       </tr>`
     )
     .join('');
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
-      <a href="#/work/${encodeURIComponent(name)}">← ${esc(name)}</a>
+      <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
     </p>
     <h1>标注数据 · ${esc(name)}</h1>
     <p class="lead">共 ${num(total)} 章有标注　·　1-5 量表实测有 ±1 噪声，看趋势别抠单章值　·　点章节号看完整标注</p>
@@ -2924,7 +3144,7 @@ async function renderAnnotations(name) {
         <option value="review">仅待复核</option>
         <option value="ok">仅正常</option>
       </select>
-      <span class="muted">梗概列只显示前 40 字，完整内容在单章阅读页里</span>
+      <span class="muted">梗概是模型一句话总结，完整看单章阅读页</span>
     </div>
 
     ${
@@ -3027,7 +3247,7 @@ async function renderEntities(name) {
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
-      <a href="#/work/${encodeURIComponent(name)}">← ${esc(name)}</a>
+      <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
     </p>
     <h1>世界观与人物 · ${esc(name)}</h1>
     <p class="lead">生成于 ${when(latest.generated_at)}　·　模型 ${esc(latest.model)}</p>
@@ -3155,6 +3375,1309 @@ async function pollEntitiesDone(name) {
   }
 }
 
+/* ── 题材库 · 对比分析 · 融合器 ─────────────────────────────
+   L2 题材库（M6）：作品登记题材，同题材多作品聚合规则
+   M8 对比分析：同题材/跨题材/偏离度三份报告
+   M5 融合器：用自有素材生成新故事骨架
+   三者都是纯脚本聚合，不调模型。 */
+
+async function renderGenreLab() {
+  setTab('');
+  stopTaskPolling();
+  chapterState.data = null;
+  view.innerHTML = '<p class="muted">读取题材库…</p>';
+
+  let idx;
+  try {
+    idx = await getJSON('/api/genres');
+  } catch (e) {
+    view.innerHTML = notice('bad', `读取题材库失败：${esc(e.message)}`);
+    return;
+  }
+  const mapping = idx.mapping || {};
+  const genres = idx.genres || [];
+
+  // 找到当前书架里的作品名（用于登记题材与做对比）
+  let works = [];
+  try {
+    works = await getJSON('/api/works');
+  } catch {
+    works = [];
+  }
+
+  const genreRows = genres
+    .map((g) => `<tr>
+      <td><strong>${esc(g.genre)}</strong></td>
+      <td class="num">${num(g.work_count)}</td>
+      <td>${g.sample_ok ? '<span class="chip ok">样本足</span>' : '<span class="chip warn">样本不足</span>'}</td>
+      <td>${g.rules_ready ? '<span class="chip ok">已聚合</span>' : '<span class="chip">未聚合</span>'}
+          <button class="ghost" data-aggregate="${esc(g.genre)}" style="font-size:12px">聚合</button></td>
+    </tr>`).join('');
+
+  const assignRows = works
+    .map((w) => `<tr>
+      <td>${esc(w.name)}</td>
+      <td>
+        <select data-genre-of="${esc(w.name)}" style="font:inherit;font-size:12px;padding:4px 6px;border-radius:8px;border:1px solid var(--border-strong)">
+          <option value="">（未登记）</option>
+          ${genres.map((g) => `<option value="${esc(g.genre)}" ${mapping[w.name] === g.genre ? 'selected' : ''}>${esc(g.genre)}</option>`).join('')}
+        </select>
+        <input data-new-genre="${esc(w.name)}" type="text" placeholder="或新题材名" style="font:inherit;font-size:12px;padding:4px 6px;margin-left:6px;width:110px">
+        <button class="ghost" data-assign="${esc(w.name)}" style="font-size:12px">登记</button>
+      </td>
+    </tr>`).join('');
+
+  const compareForm = works.length
+    ? `<div class="row wrap">
+        <select id="cmp-work" style="font:inherit;font-size:13px;padding:5px 8px;border-radius:10px;border:1px solid var(--border-strong)">
+          ${works.map((w) => `<option value="${esc(w.name)}">${esc(w.name)}</option>`).join('')}
+        </select>
+        <select id="cmp-genre" style="font:inherit;font-size:13px;padding:5px 8px;border-radius:10px;border:1px solid var(--border-strong)">
+          ${(genres.length ? genres : [{ genre: '' }]).map((g) => `<option value="${esc(g.genre)}">${esc(g.genre || '选择题材')}</option>`).join('')}
+        </select>
+        <button id="cmp-run" class="primary">生成对比报告</button>
+      </div>`
+    : '<p class="muted">书架为空，先导入作品并登记题材。</p>';
+
+  view.innerHTML = `
+    <h1>题材库 · 对比分析 · 融合器</h1>
+    <p class="lead">L2 题材规则（M6）· 三份对比报告（M8）· 融合骨架（M5）　·　纯本地计算，不调模型</p>
+
+    <div class="card">
+      <h2>作品 → 题材登记</h2>
+      ${
+        assignRows
+          ? `<div class="table-wrap"><table><thead><tr><th>作品</th><th>题材</th></tr></thead><tbody>${assignRows}</tbody></table></div>`
+          : '<p class="muted">书架为空。</p>'
+      }
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">L2 题材规则库</h2>
+        <button id="reload-genres" class="ghost">刷新</button>
+      </div>
+      <p class="muted" style="margin:0 0 8px">
+        同题材 ≥3 部作品才聚合规则；3-9 部置信度最高「中」，≥10 部且命中率高可到「高」。
+      </p>
+      ${
+        genreRows
+          ? `<div class="table-wrap"><table><thead><tr><th>题材</th><th class="num">作品数</th><th>样本</th><th>规则</th></tr></thead><tbody>${genreRows}</tbody></table></div>`
+          : '<p class="muted">还没有题材。把作品登记到题材后这里会有。</p>'
+      }
+      <div id="genre-rules" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>M8 对比分析</h2>
+      ${compareForm}
+      <div id="compare-out" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">M5 融合器</h2>
+        <button id="fusion-run" class="primary">生成新故事骨架</button>
+      </div>
+      <p class="muted" style="margin:0 0 8px">
+        从已入库作品（K1 实体卡片）里挑人物/地点/势力/能力拼一个新骨架，每条素材带来源，可编辑草稿不是成品。
+      </p>
+      <div id="fusion-out"></div>
+    </div>
+  `;
+
+  // 登记题材
+  view.querySelectorAll('[data-assign]').forEach((btn) => {
+    btn.onclick = async () => {
+      const work = btn.dataset.assign;
+      const sel = view.querySelector(`[data-genre-of="${CSS.escape(work)}"]`);
+      const input = view.querySelector(`[data-new-genre="${CSS.escape(work)}"]`);
+      const genre = (input && input.value.trim()) || (sel && sel.value) || '';
+      try {
+        await api('/api/genres/assign', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ work, genre }),
+        });
+        renderGenreLab();
+      } catch (e) {
+        await tellUser('登记失败', `<p style="margin:0">${esc(e.message)}</p>`);
+      }
+    };
+  });
+  // 聚合某题材
+  view.querySelectorAll('[data-aggregate]').forEach((btn) => {
+    btn.onclick = async () => {
+      const genre = btn.dataset.aggregate;
+      const box = document.getElementById('genre-rules');
+      await withBusy(btn, '<span class="spinner"></span>聚合中…', async () => {
+        try {
+          const r = await postJSON(`/api/genres/${encodeURIComponent(genre)}/aggregate`, {});
+          box.innerHTML = renderGenreRules(r);
+        } catch (e) {
+          box.innerHTML = notice('bad', esc(e.message));
+        }
+      });
+    };
+  });
+  // 对比
+  const cmpRun = document.getElementById('cmp-run');
+  if (cmpRun) cmpRun.onclick = () => runCompare();
+  // 融合
+  document.getElementById('fusion-run').onclick = () => runFusion();
+  if (typeof loadFusionLatest === 'function') loadFusionLatest();
+}
+
+function renderGenreRules(r) {
+  if (!r || !r.rules || !r.rules.length) return notice('warn', r.note || '没有产出规则。');
+  const rows = (r.rules || []).map((rule) => `<tr>
+    <td>${esc(rule.id)}</td>
+    <td>${esc(rule.rule)}</td>
+    <td class="num">${Math.round((rule.hit_rate || 0) * 100)}%</td>
+    <td>${esc(rule.confidence)}</td>
+  </tr>`).join('');
+  return `
+    ${r.note ? notice('info', esc(r.note)) : ''}
+    <div class="table-wrap"><table><thead><tr><th>规则</th><th>内容</th><th class="num">命中率</th><th>置信度</th></tr></thead><tbody>${rows}</tbody></table></div>
+  `;
+}
+
+async function runCompare() {
+  const work = document.getElementById('cmp-work') && document.getElementById('cmp-work').value;
+  const genre = document.getElementById('cmp-genre') && document.getElementById('cmp-genre').value;
+  if (!work || !genre) return;
+  const box = document.getElementById('compare-out');
+  const btn = document.getElementById('cmp-run');
+  await withBusy(btn, '<span class="spinner"></span>对比中…', async () => {
+    try {
+      const r = await postJSON('/api/compare/build', { work, genre });
+      box.innerHTML = renderCompare(r);
+    } catch (e) {
+      box.innerHTML = notice('bad', esc(e.message));
+    }
+  });
+}
+
+function renderCompare(r) {
+  const out = [];
+  const sg = r.same_genre || {};
+  if (sg.rows && sg.rows.length) {
+    const metrics = Object.keys(sg.metrics || {});
+    out.push(`<h3>同题材对比（${esc(sg.genre)}）</h3>`);
+    const table = sg.rows.map((row) => `<tr>
+      <td>${esc(row.work)}</td>
+      ${metrics.map((m) => `<td class="num">${row.means[m] != null ? row.means[m] : '—'}</td>`).join('')}
+    </tr>`).join('');
+    out.push(`<div class="table-wrap"><table><thead><tr><th>作品</th>${metrics.map((m) => `<th class="num">${esc(sg.metrics[m])}</th>`).join('')}</tr></thead><tbody>${table}</tbody></table></div>`);
+  }
+
+  const cg = r.cross_genre || {};
+  if (cg.comparisons && cg.comparisons.length) {
+    out.push('<h3>跨题材差异（最大的先列）</h3>');
+    const rows = cg.comparisons.slice(0, 10).map((c) => `<tr>
+      <td>${esc(c.title)}</td>
+      <td class="num">${c.spread}</td>
+      <td>${Object.entries(c.per_genre || {}).map(([g, v]) => `${esc(g)} ${v}`).join(' · ')}</td>
+    </tr>`).join('');
+    out.push(`<div class="table-wrap"><table><thead><tr><th>指标</th><th class="num">跨度</th><th>各题材均值</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+  }
+
+  const dv = r.deviation || {};
+  out.push(`<h3>作品偏离题材基线（${esc(dv.work || '')} vs ${esc(dv.genre || '')}）</h3>`);
+  if (!dv.available) out.push(notice('warn', esc(dv.note || '无数据')));
+  else if (!dv.deviations.length) out.push(notice('ok', '没有偏离超过 ±0.8 的指标，作品贴合题材基线。'));
+  else {
+    const rows = dv.deviations.map((d) => `<tr>
+      <td>${esc(d.title)}</td>
+      <td class="num">${d.work_mean} vs ${d.genre_mean}</td>
+      <td class="num">${d.delta > 0 ? '+' : ''}${d.delta}</td>
+      <td>${esc(d.direction)}</td>
+    </tr>`).join('');
+    out.push(`<div class="table-wrap"><table><thead><tr><th>指标</th><th class="num">作品 vs 题材均值</th><th class="num">偏差</th><th>方向</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+  }
+  return out.join('');
+}
+
+async function runFusion() {
+  const btn = document.getElementById('fusion-run');
+  const box = document.getElementById('fusion-out');
+  await withBusy(btn, '<span class="spinner"></span>生成中…', async () => {
+    try {
+      const r = await postJSON('/api/fusion/generate', {});
+      box.innerHTML = renderFusion(r);
+    } catch (e) {
+      box.innerHTML = notice('bad', esc(e.message));
+    }
+  });
+}
+
+function renderFusion(r) {
+  const cast = (r.cast || []).map((c) => `<tr>
+    <td><strong>${esc(c.slot)}</strong></td>
+    <td>${esc(c.name)}</td>
+    <td>${esc(c.identity || '—')}</td>
+    <td class="muted">${esc(c.source || '')}</td>
+  </tr>`).join('');
+  const world = (r.world || []).map((w) => `<tr>
+    <td>${esc(w.kind)}</td><td>${esc(w.name)}</td><td>${esc(w.note || '—')}</td><td class="muted">${esc(w.source || '')}</td>
+  </tr>`).join('');
+  const beats = (r.beats || []).map((b) => `<tr>
+    <td class="num">${b.no}</td><td>${esc(b.stage)}</td><td>${esc(b.action)}</td>
+  </tr>`).join('');
+  return `
+    ${r.note ? notice('info', esc(r.note)) : ''}
+    <div class="card"><h3>一句话前提</h3><p style="margin:0">${esc((r.logline || {}).template || '').replace('{protagonist}', esc((r.logline || {}).protagonist || '（待定）')).replace('{world}', esc((r.logline || {}).world || '（待定）')).replace('{conflict}', esc((r.logline || {}).conflict || '')).replace('{ability}', esc((r.logline || {}).ability || '（待定）'))}</p>
+    <p class="muted" style="margin:6px 0 0">素材来源：${esc((r.sources || []).join('、'))}</p></div>
+    <h3>人物</h3>
+    <div class="table-wrap"><table><thead><tr><th>槽位</th><th>名字</th><th>身份</th><th>来源</th></tr></thead><tbody>${cast}</tbody></table></div>
+    <h3>世界元素</h3>
+    <div class="table-wrap"><table><thead><tr><th>种类</th><th>名称</th><th>说明</th><th>来源</th></tr></thead><tbody>${world}</tbody></table></div>
+    <h3>骨架节拍</h3>
+    <div class="table-wrap"><table><thead><tr><th class="num">#</th><th>阶段</th><th>动作</th></tr></thead><tbody>${beats}</tbody></table></div>
+  `;
+}
+
+async function loadFusionLatest() {
+  try {
+    const data = await getJSON('/api/fusion');
+    if (data.exists) {
+      const box = document.getElementById('fusion-out');
+      if (box) box.innerHTML = renderFusion(data);
+    }
+  } catch {
+    /* 没有也是一个正常状态 */
+  }
+}
+
+/* ── 标注台 ──────────────────────────────────────────────
+   三栏：左章节列表 / 中正文 / 右标注面板。
+   模型先跑一遍，人只修正低置信度章节——这是省人力的核心，不是让
+   人从零标 1000 章。键盘是硬需求：J/K 翻章、1-5 打分、空格确认。 */
+
+const annState = {
+  name: '',
+  chapters: [],       // 左栏列表
+  cur: null,          // 当前章节明细
+  fields: {},         // 当前字段定义
+  activeField: 0,     // 右栏焦点字段
+  dirty: false,
+  editing: false,
+};
+
+function annotStatusClass(item) {
+  const st = item && item.status;
+  if (st === 'ok') return 'st-ok';
+  if (st === 'needs_review') return 'st-review';
+  if (st === 'failed') return 'st-failed';
+  return 'st-unannotated';
+}
+
+async function renderAnnotator(name) {
+  setTab('');
+  stopTaskPolling();
+  chapterState.data = null;
+  annState.name = name;
+  view.innerHTML = '<p class="muted">加载中…</p>';
+
+  try {
+    const [chapters, fields] = await Promise.all([
+      getJSON(`/api/works/${encodeURIComponent(name)}/annotator/chapters`),
+      getJSON(`/api/works/${encodeURIComponent(name)}/annotator/fields`),
+    ]);
+    annState.chapters = chapters.items || [];
+    annState.fields = fields;
+  } catch (e) {
+    view.innerHTML = notice('bad', `读取标注台失败：${esc(e.message)}`) +
+      `<p><a href="#/work/${encodeURIComponent(name)}">返回作品页</a></p>`;
+    return;
+  }
+
+  if (!annState.chapters.length) {
+    view.innerHTML = notice('warn', '这本书还没有章节数据。') +
+      `<a class="btn" href="#/work/${encodeURIComponent(name)}" style="text-decoration:none;color:inherit">回作品页</a>`;
+    return;
+  }
+
+  // 默认定位到第一章
+  gotoAnnotChapter(annState.chapters[0].id);
+}
+
+function annotHeadHtml() {
+  const d = annState.cur;
+  const stLabel = {
+    ok: '<span class="chip ok">已标注</span>',
+    needs_review: '<span class="chip warn">待复核</span>',
+    failed: '<span class="chip bad">异常</span>',
+    unannotated: '<span class="chip">未标注</span>',
+  }[d.status] || '<span class="chip">未标注</span>';
+
+  const conf = d.self_report || {};
+  const confChip = conf.confidence
+    ? `<span class="chip ${conf.confidence === '高' ? 'ok' : conf.confidence === '中' ? 'warn' : 'bad'}">模型自评 ${esc(conf.confidence)}</span>`
+    : '<span class="chip info">无自评</span>';
+
+  return `
+    <div class="spread" style="align-items:flex-start;margin-bottom:10px">
+      <div>
+        <p class="muted" style="margin:0 0 2px">
+          <a href="#/work/${encodeURIComponent(annState.name)}">${esc(annState.name)}</a>
+        </p>
+        <h1 style="margin:0">第${d.chapter_no ?? '—'}章 ${esc(d.title)}</h1>
+      </div>
+      <div class="row wrap">
+        ${stLabel}${confChip}
+        <span class="muted">${num(d.index + 1)} / ${num(d.total)} 章</span>
+      </div>
+    </div>
+    ${d.issues && d.issues.length ? notice('warn', d.issues.slice(0, 5).map((i) => esc(i)).join('<br>')) : ''}
+  `;
+}
+
+function showAnnotHelp() {
+  return askConfirm({
+    title: '标注台快捷键',
+    html: `<div class="annot-help">
+      <kbd>J</kbd><span>下一章</span>
+      <kbd>K</kbd><span>上一章</span>
+      <kbd>1</kbd><span>给当前字段打 1 分（1-5 量表的字段）</span>
+      <kbd>Tab</kbd><span>下一个字段（Shift+Tab 上一个）</span>
+      <kbd>Space</kbd><span>确认本章并进入下一章</span>
+      <kbd>Ctrl+S</kbd><span>保存当前修改</span>
+      <kbd>?</kbd><span>这个面板</span>
+    </div>`,
+    confirmLabel: '知道了',
+    cancelLabel: '关闭',
+  });
+}
+
+async function gotoAnnotChapter(chapterId) {
+  if (annState.cur && annState.dirty) return; // 有未保存的修改，等待保存
+  try {
+    const detail = await getJSON(
+      `/api/works/${encodeURIComponent(annState.name)}/annotator/chapters/${encodeURIComponent(chapterId)}`
+    );
+    annState.cur = detail;
+    annState.fields = annState.fields || {};
+    annState.activeField = 0;
+    annState.dirty = false;
+    annState.editing = false;
+    drawAnnotator();
+  } catch (e) {
+    view.innerHTML = notice('bad', `读取章节失败：${esc(e.message)}`);
+  }
+}
+
+function annotFieldSpec(key) {
+  const list = (annState.fields.model_fields || []).filter((f) => f.key === key);
+  return list[0] || null;
+}
+
+function annotRenderFields(fields, target, options) {
+  const order = annState.fields.field_order || Object.keys(fields);
+  const html = order
+    .filter((key) => annotFieldSpec(key))
+    .map((key) => annotFieldHtml(key, fields[key], fields))
+    .join('');
+  target.innerHTML = html;
+}
+
+function annotFieldHtml(key, value, allFields) {
+  const spec = annotFieldSpec(key);
+  if (!spec) return '';
+  const label = esc(spec.label);
+  const active = annState.editing;
+  let control = '';
+  if (spec.type === 'rating') {
+    control = `
+      <div class="annot-rating" data-key="${esc(key)}">
+        ${[1, 2, 3, 4, 5]
+          .map(
+            (n) =>
+              `<button type="button" class="r-btn${Number(value) === n ? ' on' : ''}" data-val="${n}">${n}</button>`
+          )
+          .join('')}
+        <button type="button" class="r-btn clear" data-val="">清</button>
+      </div>`;
+  } else if (spec.type === 'enum') {
+    control = `<select data-key="${esc(key)}" ${active ? '' : 'disabled'}>
+      <option value="">（未填）</option>
+      ${(spec.values || []).map((v) => `<option value="${esc(v)}" ${value === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}
+    </select>`;
+  } else if (spec.type === 'int') {
+    control = `<input type="number" data-key="${esc(key)}" value="${value == null ? '' : esc(value)}" ${active ? '' : 'disabled'}>`;
+  } else if (spec.type === 'str') {
+    control = `<textarea data-key="${esc(key)}" rows="3" ${active ? '' : 'disabled'}>${esc(value || '')}</textarea>`;
+  } else if (spec.type === 'list_of_objects') {
+    control = annotListControl(key, value, spec);
+  }
+  return `
+    <div class="pfield" data-field="${esc(key)}">
+      <div class="pf-label">${label}${active ? '' : ' <span class="muted">（禁用）</span>'}</div>
+      ${control}
+      ${spec.hint ? `<div class="pf-hint">${esc(spec.hint)}</div>` : ''}
+    </div>`;
+}
+
+function annotListControl(key, items, spec) {
+  const list = Array.isArray(items) ? items : [];
+  const sub = list
+    .map(
+      (row, i) => `
+      <div class="list-item" style="margin-bottom:8px;padding:8px;border:1px solid var(--border);border-radius:8px">
+        ${(spec.item_keys || [])
+          .map((ik) => {
+            const enumVals = (spec.item_enums || {})[ik];
+            const val = row && row[ik];
+            if (enumVals && enumVals.length) {
+              return `<select data-key="${esc(key)}" data-idx="${i}" data-ik="${esc(ik)}">
+                <option value="">（选${esc(ik)}）</option>
+                ${enumVals.map((v) => `<option value="${esc(v)}" ${val === v ? 'selected' : ''}>${esc(v)}</option>`).join('')}
+              </select>`;
+            }
+            if (ik === '强度') {
+              return `<input type="number" data-key="${esc(key)}" data-idx="${i}" data-ik="强度" value="${val == null ? '' : esc(val)}" placeholder="1-5">`;
+            }
+            return `<input type="text" data-key="${esc(key)}" data-idx="${i}" data-ik="${esc(ik)}" value="${esc(val || '')}" placeholder="${esc(ik)}">`;
+          })
+          .join('')}
+        <button type="button" class="ghost" data-remove-item="${esc(key)}" data-idx="${i}" style="margin-top:4px;font-size:12px">删除</button>
+      </div>`
+    )
+    .join('');
+  return `
+    <div class="annot-list" data-list="${esc(key)}">
+      ${sub || '<p class="muted">（空）</p>'}
+      <button type="button" class="ghost" data-add-item="${esc(key)}" style="font-size:12px">+ 加一条</button>
+    </div>`;
+}
+
+function drawAnnotator() {
+  const d = annState.cur;
+  if (!d) return;
+
+  // 左栏：章节列表，按卷分组
+  const listHtml = [];
+  let lastVol = null;
+  for (const item of annState.chapters) {
+    if (item.vol_no !== lastVol) {
+      lastVol = item.vol_no;
+      listHtml.push(`<span class="vol-tag">第 ${item.vol_no} 卷</span>`);
+    }
+    const active = item.id === d.id ? ' active' : '';
+    const stc = annotStatusClass(item);
+    listHtml.push(
+      `<a class="annot-ch ${stc}${active}" data-chapter="${esc(item.id)}" href="#/work/${encodeURIComponent(
+        annState.name
+      )}/annotator">第${item.chapter_no ?? '·'}章 <span class="muted">${esc((item.title || '').slice(0, 8))}</span></a>`
+    );
+  }
+
+  // 中栏：正文 + 爽点高亮
+  const paras = String(d.text || '')
+    .split(/\n{2,}/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+  const payoffs = ((d.fields && d.fields.payoffs) || [])
+    .map((p) => p && p['锚点'])
+    .filter(Boolean)
+    .map((s) => String(s).trim());
+  const middle = paras
+    .map((para) => {
+      let text = esc(para).replace(/\n/g, '<br>');
+      const hit = payoffs.find((h) => h && text.includes(esc(h)));
+      const cls = hit ? 'annot-hocha' : '';
+      return `<p class="${cls}" ${cls ? `title="模型判断的爽点候选：${esc(hit)}"` : ''}>${text}</p>`;
+    })
+    .join('');
+
+  // 右栏：字段面板
+  const fieldPanel = document.createElement('div');
+  const fieldsWrap = `<div id="annot-fields"></div>`;
+
+  view.innerHTML = `
+    <div class="annot-batbar">
+      <strong>标注台</strong>
+      <span class="muted">模型先跑，你只修正低置信度</span>
+      <div class="spacer"></div>
+      <span class="muted">${annState.dirty ? '有未保存修改' : ''}</span>
+      <a href="#/work/${encodeURIComponent(annState.name)}">回作品页</a>
+    </div>
+    <div class="annotator" id="annotator">
+      <nav class="annot-chlist">${listHtml.join('')}</nav>
+      <main class="annot-main">
+        ${annotHeadHtml()}
+        <div class="prose">${middle}</div>
+      </main>
+      <aside class="annot-panel">
+        <div class="annot-conf">${annotConfHtml(d)}</div>
+        ${fieldsWrap}
+        <div class="annot-actions">
+          <button id="annot-toggle-edit" class="primary">${annState.editing ? '完成编辑' : '编辑字段'}</button>
+          <button id="annot-save" class="primary" ${annState.editing ? '' : 'disabled'}>保存修改</button>
+          <button id="annot-ok" class="ghost">确认本章</button>
+          <button id="annot-help" class="ghost">?</button>
+        </div>
+      </aside>
+    </div>
+  `;
+
+  // 绑定字段渲染
+  annotRenderFields(d.fields || {}, document.getElementById('annot-fields'), { readOnly: !annState.editing });
+  bindAnnotControls();
+
+  // 左栏跳转
+  view.querySelectorAll('.annot-ch').forEach((a) => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      gotoAnnotChapter(a.dataset.chapter);
+    };
+  });
+
+  // 右栏按钮
+  document.getElementById('annot-toggle-edit').onclick = toggleAnnotEdit;
+  document.getElementById('annot-save').onclick = () => saveAnnot(undefined);
+  document.getElementById('annot-ok').onclick = () => saveAnnot('ok');
+  document.getElementById('annot-help').onclick = showAnnotHelp;
+}
+
+function annotConfHtml(d) {
+  const conf = d.self_report || {};
+  const uncertain = conf.uncertain_fields || [];
+  return `<span class="chip ${conf.confidence === '高' ? 'ok' : conf.confidence === '中' ? 'warn' : conf.confidence ? 'bad' : 'info'}">
+    自评 <strong>${esc(conf.confidence || '—')}</strong></span>
+    ${uncertain.length ? `<span class="muted">存疑：${esc(uncertain.join('、'))}</span>` : ''}`;
+}
+
+function toggleAnnotEdit() {
+  annState.editing = !annState.editing;
+  if (!annState.editing) {
+    // 退出编辑时把我改过的值收集回来
+    annState.fields = collectAnnotFields();
+  }
+  drawAnnotator();
+}
+
+function collectAnnotFields() {
+  const fields = { ...(annState.cur.fields || {}) };
+  // 简单字段：在 list-item 之外的 input/select/textarea（list-item 里的有 data-ik，是对象子字段）
+  for (const el of view.querySelectorAll(
+    '.annot-panel .pfield > input[data-key], .annot-panel .pfield > select[data-key], .annot-panel .pfield > textarea[data-key], .annot-panel .annot-rating[data-key]'
+  )) {
+    const key = el.dataset.key;
+    if (el.classList.contains('annot-rating')) continue; // rating 按钮由 r-btn 处理
+    if (el.type === 'number') {
+      fields[key] = el.value === '' ? null : Number(el.value);
+    } else if (el.tagName === 'SELECT') {
+      fields[key] = el.value === '' ? null : el.value;
+    } else if (el.tagName === 'TEXTAREA') {
+      fields[key] = el.value;
+    } else {
+      fields[key] = el.value;
+    }
+  }
+  // rating：取 .on 按钮的值
+  view.querySelectorAll('.annot-rating[data-key]').forEach((wrap) => {
+    const key = wrap.dataset.key;
+    const on = wrap.querySelector('.r-btn.on');
+    fields[key] = on ? Number(on.dataset.val) : null;
+  });
+  // 列表对象字段
+  view.querySelectorAll('.annot-panel [data-list]').forEach((wrap) => {
+    const key = wrap.dataset.list;
+    const rows = [];
+    wrap.querySelectorAll('.list-item').forEach((item) => {
+      const row = {};
+      item.querySelectorAll('[data-ik]').forEach((el) => {
+        row[el.dataset.ik] = el.type === 'number' ? (el.value === '' ? null : Number(el.value)) : el.value;
+      });
+      rows.push(row);
+    });
+    fields[key] = rows;
+  });
+  return fields;
+}
+
+function bindAnnotControls() {
+  const panel = view.querySelector('.annot-panel');
+  if (!panel) return;
+  panel.querySelectorAll('.r-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      if (!annState.editing) return;
+      e.preventDefault();
+      const wrap = btn.closest('.annot-rating');
+      const key = wrap.dataset.key;
+      const val = btn.dataset.val;
+      wrap.querySelectorAll('.r-btn').forEach((b) => b.classList.remove('on'));
+      if (val !== '') btn.classList.add('on');
+      annState.cur.fields[key] = val === '' ? null : Number(val);
+      annState.dirty = true;
+      markDirty();
+    };
+  });
+  panel.querySelectorAll('input[data-key], select[data-key], textarea[data-key]').forEach((el) => {
+    el.onchange = () => {
+      if (!annState.editing) return;
+      annState.dirty = true;
+      markDirty();
+    };
+  });
+  panel.querySelectorAll('[data-add-item]').forEach((btn) => {
+    btn.onclick = () => {
+      if (!annState.editing) return;
+      const key = btn.dataset.addItem;
+      const spec = annotFieldSpec(key);
+      const list = annState.cur.fields[key] || [];
+      const row = {};
+      (spec.item_keys || []).forEach((ik) => (row[ik] = ''));
+      list.push(row);
+      annState.cur.fields[key] = list;
+      annState.dirty = true;
+      drawAnnotator(); // 重新渲染（保留编辑态）
+    };
+  });
+  panel.querySelectorAll('[data-remove-item]').forEach((btn) => {
+    btn.onclick = () => {
+      if (!annState.editing) return;
+      const key = btn.dataset.removeItem;
+      const idx = Number(btn.dataset.idx);
+      const list = (annState.cur.fields[key] || []).slice();
+      list.splice(idx, 1);
+      annState.cur.fields[key] = list;
+      annState.dirty = true;
+      drawAnnotator();
+    };
+  });
+}
+
+function markDirty() {
+  const el = view.querySelector('.annot-batbar');
+  if (!el) return;
+  const hint = el.querySelector('.muted');
+  if (hint) hint.textContent = '有未保存修改';
+  document.getElementById('annot-toggle-edit').textContent = '完成编辑';
+}
+
+async function saveAnnot(status) {
+  const fields = collectAnnotFields();
+  const btn = document.getElementById('annot-save') || document.getElementById('annot-ok');
+  await withBusy(btn, '<span class="spinner"></span>保存中…', async () => {
+    try {
+      await api(`/api/works/${encodeURIComponent(annState.name)}/annotator/chapters/${encodeURIComponent(annState.cur.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fields: status ? annState.cur.fields : fields, // 确认时只改状态
+          status: status || (annState.editing ? 'needs_review' : undefined),
+        }),
+      });
+      annState.dirty = false;
+      annState.editing = false;
+      await gotoAnnotChapter(annState.cur.id); // 重读已保存状态
+      // 更新左栏状态点
+      if (status === 'ok') {
+        const item = annState.chapters.find((c) => c.id === annState.cur.id);
+        if (item) item.status = 'ok';
+      }
+      drawAnnotator();
+    } catch (e) {
+      await tellUser('保存失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    }
+  });
+}
+
+/* 快捷键（标注台专用）。与阅读页的 ←/→ 不冲突：这里用 J/K。 */
+document.addEventListener('keydown', (e) => {
+  if (!annState.cur) return;
+  const tag = e.target && e.target.tagName;
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) return;
+
+  if (e.key === 'j' || e.key === 'J') {
+    e.preventDefault();
+    const idx = annState.chapters.findIndex((c) => c.id === annState.cur.id);
+    const next = annState.chapters[idx + 1];
+    if (next && !annState.dirty) gotoAnnotChapter(next.id);
+    else if (next) saveAnnot(undefined).then(() => gotoAnnotChapter(next.id));
+  }
+  if (e.key === 'k' || e.key === 'K') {
+    e.preventDefault();
+    const idx = annState.chapters.findIndex((c) => c.id === annState.cur.id);
+    const prev = annState.chapters[idx - 1];
+    if (prev && !annState.dirty) gotoAnnotChapter(prev.id);
+    else if (prev) saveAnnot(undefined).then(() => gotoAnnotChapter(prev.id));
+  }
+  if (e.key >= '1' && e.key <= '5') {
+    const fields = annState.fields.field_order || [];
+    const key = fields[annState.activeField];
+    const spec = annotFieldSpec(key);
+    if (spec && spec.type === 'rating' && annState.editing) {
+      annState.cur.fields[key] = Number(e.key);
+      annState.dirty = true;
+      drawAnnotator();
+    }
+  }
+  if (e.key === 'Tab') {
+    // Tab 切字段只在编辑态生效
+    if (!annState.editing) return;
+    e.preventDefault();
+    const fields = annState.fields.field_order || [];
+    if (fields.length < 2) return;
+    const dir = e.shiftKey ? -1 : 1;
+    annState.activeField = (annState.activeField + dir + fields.length) % fields.length;
+    highlightActiveField();
+  }
+  if (e.key === ' ') {
+    e.preventDefault();
+    if (annState.dirty) saveAnnot(undefined);
+    else {
+      const idx = annState.chapters.findIndex((c) => c.id === annState.cur.id);
+      const next = annState.chapters[idx + 1];
+      if (next) gotoAnnotChapter(next.id);
+    }
+  }
+  if (e.key === '?') {
+    e.preventDefault();
+    showAnnotHelp();
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    saveAnnot(undefined);
+  }
+});
+
+function highlightActiveField() {
+  view.querySelectorAll('.annot-panel .pfield').forEach((el, i) => {
+    el.style.background = i === annState.activeField ? 'var(--warn-bg)' : '';
+  });
+}
+
+/* ── 知识库 ──────────────────────────────────────────────
+   K1 实体卡片 / K2 四类台账 / K3 作品指纹。纯脚本聚合，不调模型。
+   没构建过就明说，点「构建」随时可建。 */
+
+async function renderKnowledgeBase(name) {
+  setTab('');
+  stopTaskPolling();
+  chapterState.data = null;
+  view.innerHTML = '<p class="muted">读取知识库…</p>';
+
+  let data;
+  try {
+    data = await getJSON(`/api/works/${encodeURIComponent(name)}/kb`);
+  } catch (e) {
+    view.innerHTML = notice('bad', `读取知识库失败：${esc(e.message)}`);
+    return;
+  }
+
+  if (!data.exists) {
+    view.innerHTML =
+      notice('warn', '还没有构建过知识库。') +
+      '<p class="muted" style="margin:0 0 12px">' +
+      '知识库从标注、实体统计与正文聚合出人物出场、支线区间、时间线与作品指纹，' +
+      '全部是本地脚本计算，不花模型费用。</p>' +
+      `<button id="kb-build" class="primary">构建知识库</button>`;
+    const btn = document.getElementById('kb-build');
+    btn.onclick = async () => {
+      await withBusy(btn, '<span class="spinner"></span>构建中…', async () => {
+        try {
+          await postJSON(`/api/works/${encodeURIComponent(name)}/kb/build`, {});
+          renderKnowledgeBase(name);
+        } catch (e) {
+          await tellUser('构建失败', `<p style="margin:0">${esc(e.message)}</p>`);
+        }
+      });
+    };
+    return;
+  }
+
+  const k1 = data.k1 || {};
+  const k2 = data.k2 || {};
+  const k3 = data.k3 || {};
+  const person = k2.person || {};
+  const sideplot = k2.sideplot || {};
+  const timeline = k2.timeline || {};
+
+  const personRows = (person.rows || [])
+    .map(
+      (r) => `<tr>
+        <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.role || r.identity || '')}</div></td>
+        <td class="num">${num(r.appearance_count)}</td>
+        <td class="num">第${r.first_seen ?? '—'}章</td>
+        <td class="num">第${r.last_seen ?? '—'}章</td>
+        <td class="num">${((r.coverage || 0) * 100).toFixed(0)}%</td>
+      </tr>`
+    )
+    .join('');
+
+  const sideplotRanges = (sideplot.ranges || [])
+    .map(
+      (r) =>
+        `<span class="chip">第 ${r.from_chapter ?? '—'} 至 ${r.to_chapter ?? '—'} 章（${r.span_count} 章 × ${r.max_subplot_count} 根在场）</span>`
+    )
+    .join(' ');
+
+  const timelineRows = (timeline.events || [])
+    .slice(0, 80)
+    .map(
+      (e) =>
+        `<tr><td class="num">第${e.chapter_no ?? '—'}章</td><td>${esc(e.time_span)}</td><td>${esc(e.summary || '—')}</td></tr>`
+    )
+    .join('');
+
+  const k3Items = (k3.items || [])
+    .map((it) => {
+      const stat = it.statistic || {};
+      let detail = '';
+      if (stat.mean != null) detail = `均值 ${stat.mean}`;
+      else if (stat.dominant) detail = `${esc(stat.dominant)}（${num(stat.dominant_count)} 章）`;
+      if (stat.runs && stat.runs.length) {
+        detail += (detail ? ' · ' : '') + '走平：' + stat.runs.map((r) => `第${r.from}-${r.to}章`).join('、');
+      }
+      if (stat.chapters && stat.chapters.length) {
+        detail += (detail ? ' · ' : '') + `弱钩子 ${num(stat.chapters.length)} 章（第 ${stat.chapters.slice(0, 8).join('、')} 章…）`;
+      }
+      return `<li style="margin-bottom:10px">
+        <strong>${esc(it.rule)}</strong>${detail ? `：${detail}` : ''}
+        <div class="muted">样本 ${num(it.sample)} 章 · 置信度 ${esc(it.confidence)}${it.note ? ' · ' + esc(it.note) : ''}</div>
+      </li>`;
+    })
+    .join('');
+
+  view.innerHTML = `
+    <p class="muted" style="margin-bottom:6px">
+      <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
+    </p>
+    <h1>知识库 · ${esc(name)}</h1>
+    <p class="lead">K1 实体卡片 · K2 台账 · K3 作品指纹　·　纯本地计算，不调模型</p>
+
+    <div class="spread" style="margin-bottom:14px">
+      <button id="kb-rebuild" class="ghost">重新构建</button>
+      <span class="muted">${data.generated_at ? `构建于 ${when(data.generated_at)}` : ''}</span>
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">K1 · 实体卡片</h2>
+        ${
+          k1.available
+            ? '<span class="chip ok">有数据</span>'
+            : '<span class="chip warn">无实体统计</span>'
+        }
+      </div>
+      ${
+        k1.available
+          ? tableOrEmpty(
+              ['人物', '角色', '势力', '能力'],
+              (k1.characters || []).slice(0, 60).map((c) => [
+                esc(c.name || ''),
+                esc(c.role || c.identity || '—'),
+                esc((c.factions || []).join('、') || '—'),
+                esc((c.abilities || []).slice(0, 3).join('、') || '—'),
+              ]),
+              '暂无人物'
+            )
+          : `<p class="muted" style="margin:0">${esc(
+              k1.note || '还没有实体统计。回作品页生成「世界观与人物」后再构建。'
+            )}</p>`
+      }
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">K2 · 人物出场</h2>
+        <span class="muted">${esc(person.note || '')}</span>
+      </div>
+      ${
+        personRows
+          ? `<div class="table-wrap"><table><thead><tr>
+               <th>人物</th><th class="num">出场</th><th class="num">首次</th><th class="num">最后</th><th class="num">覆盖</th>
+             </tr></thead><tbody>${personRows}</tbody></table></div>`
+          : `<p class="muted" style="margin:0">暂无人物出场（先跑实体统计并给它构建一版）。</p>`
+      }
+    </div>
+
+    <div class="card">
+      <h2>K2 · 支线在场区间</h2>
+      <p class="muted" style="margin:0 0 8px">${esc(sideplot.note || '')}</p>
+      <div class="row wrap">${sideplotRanges || '<span class="muted">暂无支线在场记录</span>'}</div>
+      ${
+        (sideplot.changes || []).length
+          ? `<p class="muted" style="margin:8px 0 0">变化点：${(sideplot.changes || [])
+              .slice(0, 20)
+              .map((c) => `第${c.at_chapter}章（${c.from}→${c.to} 根）`)
+              .join(' · ')}</p>`
+          : ''
+      }
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">K2 · 时间线</h2>
+        <div class="row wrap">
+          ${Object.entries(timeline.span_counts || {})
+            .map(([k, v]) => `<span class="chip">${esc(k)} ${num(v)} 章</span>`)
+            .join('')}
+        </div>
+      </div>
+      ${
+        timelineRows
+          ? `<div class="table-wrap"><table><thead><tr>
+               <th>章节</th><th>时间跨度</th><th>梗概</th>
+             </tr></thead><tbody>${timelineRows}</tbody></table></div>`
+          : `<p class="muted" style="margin:0">暂无时间线事件（没有标注，或标注没有 time_span）。</p>`
+      }
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">K3 · 作品指纹</h2>
+        ${
+          k3.available
+            ? '<span class="chip info">L3</span>'
+            : '<span class="chip warn">样本不足</span>'
+        }
+      </div>
+      ${
+        k3.available
+          ? `<ol style="margin:0;padding-left:22px">${k3Items}</ol>
+             <p class="muted" style="margin:10px 0 0">${esc(k3.note || '')}</p>`
+          : `<p class="muted" style="margin:0">${esc(k3.note || '标注不足，指纹没有统计意义。')}</p>`
+      }
+    </div>
+  `;
+
+  const rebuild = document.getElementById('kb-rebuild');
+  if (rebuild) {
+    rebuild.onclick = async () => {
+      await withBusy(rebuild, '<span class="spinner"></span>构建中…', async () => {
+        try {
+          await postJSON(`/api/works/${encodeURIComponent(name)}/kb/build`, {});
+          renderKnowledgeBase(name);
+        } catch (e) {
+          await tellUser('构建失败', `<p style="margin:0">${esc(e.message)}</p>`);
+        }
+      });
+    };
+  }
+}
+
+/* ── 改写台 ──────────────────────────────────────────────
+   选章 → 选指令 → 执行（花钱）→ 原稿/改写稿并排对比 + 六类校验 →
+   接受（写新版本，原稿保留）或放弃。 */
+
+const rwState = { name: '', plan: null, current: null, busy: false };
+
+async function renderWorkbench(name) {
+  setTab('');
+  stopTaskPolling();
+  chapterState.data = null;
+  rwState.name = name;
+  view.innerHTML = '<p class="muted">读取改写台…</p>';
+
+  let plan;
+  try {
+    plan = await getJSON(`/api/works/${encodeURIComponent(name)}/rewrite/plan`);
+  } catch (e) {
+    view.innerHTML = notice('bad', `读不到改写台：${esc(e.message)}`) +
+      `<p><a href="#/work/${encodeURIComponent(name)}">返回作品页</a></p>`;
+    return;
+  }
+  rwState.plan = plan;
+
+  const chapters = (plan.chapters || []).map(
+    (c) => `<option value="${esc(c.id)}">第${c.chapter_no ?? '·'}章 ${esc((c.title || '').slice(0, 16))}（${wan(c.chars || 0)}字）</option>`
+  ).join('');
+
+  view.innerHTML = `
+    <p class="muted" style="margin-bottom:6px">
+      <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
+    </p>
+    <h1>改写台 · ${esc(name)}</h1>
+    <p class="lead">原稿永远保留，改写出新版本。执行会调模型产生费用。</p>
+
+    <div class="card">
+      <div class="row wrap" style="margin-bottom:10px">
+        <select id="rw-chapter" style="font:inherit;font-size:13px;padding:5px 8px;border-radius:10px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);min-width:220px">${chapters}</select>
+        <select id="rw-directive" style="font:inherit;font-size:13px;padding:5px 8px;border-radius:10px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text)">
+          ${(plan.directives || []).map((d) => `<option value="${esc(d)}">${esc(d)}</option>`).join('')}
+        </select>
+        <input id="rw-instruction" type="text" placeholder="补充说明（可选，如：把这段改成双视角对照）"
+               style="font:inherit;font-size:13px;padding:6px 10px;border-radius:10px;border:1px solid var(--border-strong);flex:1;min-width:240px">
+        <button id="rw-run" class="primary">改写这一章</button>
+      </div>
+      <p class="muted" style="margin:0">
+        模型 ${esc(plan.provider_name)} / ${esc(plan.model)}　
+        ${plan.has_api_key ? '' : '<span class="chip bad">读不到密钥</span>'}
+        ${plan.core_motive ? `　核心动机：${esc(plan.core_motive)}` : ''}
+      </p>
+      <div id="rw-result"></div>
+    </div>
+
+    <div class="row" style="gap:14px;margin-top:14px;align-items:stretch">
+      <div class="card" style="flex:1;min-width:0">
+        <h3>原稿</h3>
+        <div id="rw-original" class="prose"><p class="muted">选章节后在这里看原稿。</p></div>
+      </div>
+      <div class="card" style="flex:1;min-width:0">
+        <h3>改写稿</h3>
+        <div id="rw-rewritten" class="prose"><p class="muted">改写完成后在这里看结果与校验。</p></div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('rw-run').onclick = () => runRewrite();
+  // 选中的章节如果有旧改写记录，直接展示
+  const chapterSel = document.getElementById('rw-chapter');
+  chapterSel.onchange = () => loadRewriteRecord();
+  loadRewriteRecord();
+}
+
+async function loadRewriteRecord() {
+  const sel = document.getElementById('rw-chapter');
+  if (!sel || !sel.value) return;
+  const cid = sel.value;
+  try {
+    const rec = await getJSON(`/api/works/${encodeURIComponent(rwState.name)}/rewrite/${encodeURIComponent(cid)}`);
+    rwState.current = rec;
+    drawRewrite(rec);
+  } catch {
+    // 没有改写记录是正常状态
+    rwState.current = null;
+    const box = document.getElementById('rw-original');
+    if (box) box.innerHTML = '<p class="muted">还没有读过原稿。点「改写这一章」会先展示。</p>';
+    const box2 = document.getElementById('rw-rewritten');
+    if (box2) box2.innerHTML = '<p class="muted">这一章还没有改写记录。</p>';
+    const res = document.getElementById('rw-result');
+    if (res) res.innerHTML = '';
+  }
+}
+
+function drawRewrite(rec) {
+  const originalBox = document.getElementById('rw-original');
+  const rewrittenBox = document.getElementById('rw-rewritten');
+  if (!originalBox || !rewrittenBox) return;
+  if (rec.original) originalBox.innerHTML = renderParagraphs(rec.original);
+  if (rec.rewritten) rewrittenBox.innerHTML = renderParagraphs(rec.rewritten);
+
+  const res = document.getElementById('rw-result');
+  if (!res) return;
+  const v = rec.validation || {};
+  const blocking = v.blocking || [];
+  const items = v.items || [];
+  const ok = !blocking.length;
+
+  const rows = items
+    .map(
+      (i) => `<li>
+        <span class="chip ${i.severity === 'high' ? 'bad' : i.severity === 'medium' ? 'warn' : 'info'}">${esc(i.severity)}</span>
+        <strong>${esc(i.message)}</strong>
+        <div class="muted">${esc(i.detail || '')}</div>
+      </li>`
+    )
+    .join('');
+
+  res.innerHTML = `
+    ${
+      ok
+        ? notice('ok', '六类校验全部通过，可以接受。')
+        : notice('bad', `有 ${blocking.length} 个阻断级问题（${esc(blocking.map((b) => b.id).join(', '))}），不改的话「接受」会被拒绝。`)
+    }
+    ${items.length ? `<details ${blocking.length ? 'open' : ''} style="margin-top:8px">
+      <summary>校验明细（${num(v.total)} 项）</summary>
+      <ul class="list">${rows}</ul>
+    </details>` : '<p class="muted">（没有可展示的校验项）</p>'}
+    <div class="row wrap" style="margin-top:12px">
+      <button id="rw-accept" class="primary">接受改写（写新版本）</button>
+      <button id="rw-force" class="ghost">强制接受（改坏也认）</button>
+      <button id="rw-rerun" class="ghost">重新改写</button>
+    </div>
+    <p class="muted" style="margin:8px 0 0">
+      ${rec.accepted ? `<span class="chip ok">已接受</span> 版本在 ${esc(rec.version_file)}` : '原稿在录入数据里，接受只多一份新版本文件，不会覆盖。'}
+    </p>
+  `;
+
+  const accept = document.getElementById('rw-accept');
+  if (accept) accept.onclick = () => acceptRewrite(false);
+  const force = document.getElementById('rw-force');
+  if (force) force.onclick = () => acceptRewrite(true);
+  const rerun = document.getElementById('rw-rerun');
+  if (rerun) rerun.onclick = () => runRewrite();
+}
+
+async function runRewrite() {
+  const sel = document.getElementById('rw-chapter');
+  const directive = document.getElementById('rw-directive').value;
+  const instruction = document.getElementById('rw-instruction').value.trim();
+  if (!sel || !sel.value) return;
+
+  const cid = sel.value;
+  const ok = await askConfirm({
+    title: '执行改写？',
+    html:
+      `<dl class="kv">` +
+      `<dt>章节</dt><dd>${esc(cid)}</dd>` +
+      `<dt>指令</dt><dd>${esc(directive)}${instruction ? ' · ' + esc(instruction) : ''}</dd>` +
+      `</dl>` +
+      notice('warn', '会调用模型、产生费用。原稿不会改，改写出新版本。'),
+    confirmLabel: '开始改写',
+  });
+  if (!ok) return;
+
+  const btn = document.getElementById('rw-run');
+  await withBusy(btn, '<span class="spinner"></span>改写中…', async () => {
+    try {
+      const r = await postJSON(`/api/works/${encodeURIComponent(rwState.name)}/rewrite/start`, {
+        chapter_id: cid,
+        directive,
+        instruction,
+      });
+      rwState.current = r;
+      // 拿完整记录（含原稿正文）
+      const rec = await getJSON(`/api/works/${encodeURIComponent(rwState.name)}/rewrite/${encodeURIComponent(cid)}`);
+      rwState.current = rec;
+      drawRewrite(rec);
+    } catch (e) {
+      await tellUser('改写失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    }
+  });
+}
+
+async function acceptRewrite(force) {
+  const sel = document.getElementById('rw-chapter');
+  if (!sel || !sel.value) return;
+  const cid = sel.value;
+  const ok = await askConfirm({
+    title: force ? '强制接受？' : '接受改写？',
+    html: force
+      ? `<p style="margin:0">存在阻断级校验问题，但仍写为新版本。原稿保留，不会覆盖。</p>`
+      : `<p style="margin:0">把改写稿写为新版本文件。原稿保留不变，任何产出物都能追溯到原稿。</p>`,
+    confirmLabel: force ? '强制接受' : '接受',
+    danger: force,
+  });
+  if (!ok) return;
+  try {
+    await postJSON(`/api/works/${encodeURIComponent(rwState.name)}/rewrite/${encodeURIComponent(cid)}/accept`, {
+      force,
+    });
+    await tellUser('已接受', `<p style="margin:0">改写稿已写为新版本。原稿保留不变。</p>`);
+    const rec = await getJSON(`/api/works/${encodeURIComponent(rwState.name)}/rewrite/${encodeURIComponent(cid)}`);
+    rwState.current = rec;
+    drawRewrite(rec);
+  } catch (e) {
+    await tellUser('无法接受', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+/* ── 使用说明 ──────────────────────────────────────────────
+   把工作台的功能、顺序、开销讲清楚。原则：每个功能说清
+   「干什么、花不花钱、依赖什么、入口在哪」。 */
+
+function renderHelp() {
+  setTab('help');
+  stopTaskPolling();
+  chapterState.data = null;
+
+  const flow = [
+    { name: '导入作品', cls: 'done' },
+    { name: '逐章标注', cls: 'done' },
+    { name: '实体统计', cls: 'now' },
+    { name: '大纲', cls: '' },
+    { name: '知识库', cls: '' },
+  ];
+  const flowHtml = flow
+    .map((f) => `<span class="step-chip ${f.cls}">${esc(f.name)}</span><span class="arrow">→</span>`)
+    .join('')
+    .replace(/→<span class="arrow">→<\/span>$/, '');
+
+  const cards = [
+    {
+      icon: '📥',
+      title: '导入作品',
+      body: '把 txt/docx 拖进来，先看切分预览再确认。纯本地处理，不花钱。',
+      items: ['入口：顶栏「导入作品」', '自动识别章节标题并切分', '核对通过后才落盘'],
+    },
+    {
+      icon: '📋',
+      title: '逐章标注',
+      body: '让模型给每一章打结构标签：钩子、情绪、冲突、梗概、伏笔。这是主成本。',
+      items: ['入口：作品页「标注台」', '可选试跑 20 章后再全量', '花费 = 全书 token × 单价'],
+    },
+    {
+      icon: '🧭',
+      title: '实体统计（世界观与人物）',
+      body: '从全书正文抽人物/势力/能力/地点/关系。注意：这是唯一需要再读一遍全本的步骤。',
+      items: ['入口：作品页「世界观与人物」', '原料是正文，不是标注', '人物关系细节只存在于正文'],
+    },
+    {
+      icon: '🗂',
+      title: '大纲',
+      body: '把标注产出的逐章梗概归约成分段大纲。基本不额外花钱。',
+      items: ['入口：作品页「大纲」', '原料是标注的梗概', '先跑标注才有数据'],
+    },
+    {
+      icon: '📚',
+      title: '知识库',
+      body: '聚合标注与实体，生成人物出场、支线区间、时间线与作品指纹。纯本地计算，零成本。',
+      items: ['入口：作品页「知识库」', '人物卡片依赖实体统计', '什么时候构建都行'],
+    },
+    {
+      icon: '✍️',
+      title: '改写台',
+      body: '按指令重写一章，原稿永远保留，改写出新版本。六类校验把关。',
+      items: ['入口：作品页「改写台」', '改视角/扩写/精简/调节奏/强化动机', '有阻断问题会拒绝接受'],
+    },
+    {
+      icon: '📊',
+      title: '体检报告',
+      body: '章节长度、情绪曲线、伏笔追踪、风格违规等图表汇总。纯本地，零成本。',
+      items: ['入口：作品页「查看体检报告」', '零标注也能出部分报告', '图表可点击下钻到章节'],
+    },
+    {
+      icon: '🔬',
+      title: '题材与对比',
+      body: '把作品登记到题材，聚合题材规则，跨作品对比，并用自有素材生成新故事骨架。纯本地。',
+      items: ['入口：顶栏「题材与对比」', '同题材 ≥3 部才聚合成规则', '融合骨架的素材都可追溯来源'],
+    },
+  ];
+
+  view.innerHTML = `
+    <h1>使用说明</h1>
+    <p class="lead">工作台按「导入 → 标注 → 实体 → 大纲 → 知识库」的顺序产出数据。下面告诉你每一步该去哪、花不花钱。</p>
+
+    <div class="card">
+      <h2>数据产出顺序</h2>
+      <div class="help-flow">${flowHtml}</div>
+      <p class="muted" style="margin:0">
+        标注是主成本；实体统计需要再读一遍全本；大纲吃标注梗概、知识库纯本地，都不再烧全本。
+        作品页顶部的「数据依赖指引」会实时显示每层当前有没有。
+      </p>
+    </div>
+
+    <div class="help-grid">
+      ${cards
+        .map(
+          (c) => `
+        <div class="help-card">
+          <h3><span class="help-icon">${c.icon}</span>${esc(c.title)}</h3>
+          <p>${esc(c.body)}</p>
+          <ul>${c.items.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>
+        </div>`
+        )
+        .join('')}
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h2>费用提示</h2>
+      <p style="margin:0 0 8px;font-size:13px">
+        只有「逐章标注」和「实体统计」真正调用模型花钱，其他功能都是本地计算。
+        所有花钱操作都会先弹确认框，把范围、token 和预估费用列清楚，点确认才执行。
+      </p>
+      <p class="muted" style="margin:0">
+        密钥只在设置页保存，保存在本机，不会外传；服务只绑定 127.0.0.1。
+      </p>
+    </div>
+  `;
+}
+
 /* ── 路由 ──────────────────────────────────────────────── */
 
 function setTab(name) {
@@ -3168,6 +4691,8 @@ function route() {
   // 用户看到的只是「点了没反应」，而真正的错误躺在 Console 里。
   try {
     chapterState.data = null; // 离开阅读页就清掉，否则方向键会在别的页面上翻章
+    const onAnnotator = (location.hash || '').includes('/annotator');
+    if (!onAnnotator) annState.cur = null; // 离开标注台就清掉当前章，别让 J/K 在别的页面上翻章
     const hash = location.hash || '#/shelf';
     const parts = hash.replace(/^#\/?/, '').split('/');
     if (parts[0] === 'import') {
@@ -3175,6 +4700,8 @@ function route() {
       chapterState.data = null;
       return renderImport();
     }
+    if (parts[0] === 'genres') return renderGenreLab();
+    if (parts[0] === 'help') return renderHelp();
     if (parts[0] === 'settings') return renderSettings();
     if (parts[0] === 'work' && parts[1]) {
       if (parts[2] === 'report') {
@@ -3182,8 +4709,17 @@ function route() {
         chapterState.data = null;
         return renderReport(decodeURIComponent(parts[1]));
       }
+      if (parts[2] === 'annotator') {
+        return renderAnnotator(decodeURIComponent(parts[1]));
+      }
       if (parts[2] === 'entities') {
         return renderEntities(decodeURIComponent(parts[1]));
+      }
+      if (parts[2] === 'kb') {
+        return renderKnowledgeBase(decodeURIComponent(parts[1]));
+      }
+      if (parts[2] === 'rewrite') {
+        return renderWorkbench(decodeURIComponent(parts[1]));
       }
       if (parts[2] === 'annotations') {
         return renderAnnotations(decodeURIComponent(parts[1]));

@@ -523,6 +523,87 @@ def archive_work(paths: Paths, name: str) -> dict[str, Any]:
     return {"ok": True, "work": name, "moved_to": str(target)}
 
 
+def list_archived(paths: Paths) -> list[dict[str, Any]]:
+    """列出归档区里的作品，供恢复界面使用。
+
+    归档目录下可能有带时间戳的同名副本（重名时 archive_work 自动加后缀），
+    这里只读不改，别动用户文件。
+    """
+    archive_root = paths.workspaces / ARCHIVE_DIR_NAME
+    if not archive_root.is_dir():
+        return []
+    items = []
+    for entry in sorted(archive_root.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir():
+            continue
+        # 归档的恢复要以「00-ingest/manifest.json 存在」为作品判据，
+        # 和书架保持一致（下划线开头的不算作品，防止把杂物列进来）。
+        if entry.name.startswith(("_", ".")):
+            continue
+        manifest_path = entry / "00-ingest" / "manifest.json"
+        chapters = 0
+        annotated = 0
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+                chapters = len(manifest.get("chapters") or [])
+                annotations_dir = entry / "10-annotations"
+                if annotations_dir.is_dir():
+                    annotated = len(list(annotations_dir.glob("*.json")))
+            except (ValueError, OSError):
+                pass
+        items.append(
+            {
+                "name": entry.name,
+                "path": str(entry),
+                "chapters": chapters,
+                "annotated": annotated,
+                # 带 .时间戳 后缀的是重名副本，恢复时会还原成原名。
+                "is_copy": _is_archive_timestamp_suffix(entry.name),
+            }
+        )
+    return items
+
+
+def _is_archive_timestamp_suffix(name: str) -> bool:
+    """判断是否是「.20260924T151222」这种归档副本后缀。"""
+    import re
+
+    parts = name.rsplit(".", 1)
+    return len(parts) == 2 and re.fullmatch(r"\d{8}T\d{6}", parts[1]) is not None
+
+
+def restore_work(paths: Paths, name: str) -> dict[str, Any]:
+    """把归档作品搬回书架。
+
+    `name` 可能是 `作品名` 或 `作品名.时间戳`（重名时 archive_work 自动加的后缀）。
+    恢复后一律落到**基础名**（去掉末尾的 .数字 后缀）：如果书架上已有同名，
+    拒绝而非覆盖——归档是保险，不是用来覆盖现役数据的。
+    """
+    archive_root = paths.workspaces / ARCHIVE_DIR_NAME
+    source = archive_root / name
+    if not source.is_dir():
+        raise FileNotFoundError(f"归档区里找不到「{name}」")
+
+    # 去掉末尾的 .20260924T151222 这类时间戳后缀，还原成作品原名
+    if _is_archive_timestamp_suffix(name):
+        base = name.rsplit(".", 1)[0]
+    else:
+        base = name
+
+    target = paths.work_dir(base)
+    if target.exists():
+        # 注意：target 可能是 archive 里同名的源之外的存在。
+        # restore 的语义就是「把归档品恢复到书架」，书架已有同名 = 冲突，拒绝。
+        if target.resolve() == source.resolve():
+            raise ValueError(f"作品「{base}」已经在书架上")
+        raise ValueError(f"书架里已有作品「{base}」，归档恢复不会覆盖它。请先移出原来的，再恢复这一份。")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(target))
+    return {"ok": True, "work": base, "restored_to": str(target)}
+
+
 def cleanup_upload(paths: Paths, token: str) -> None:
     folder = paths.uploads / token
     if folder.is_dir():
@@ -1510,6 +1591,483 @@ def list_annotations(
         "limit": limit,
         "items": rows[offset : offset + limit],
     }
+
+
+# ── 标注台 ────────────────────────────────────────────────
+#
+# UI-P3 的核心工作界面：模型先跑一遍，人只修正低置信度章节。
+# 接口只要三件东西：
+#   1. 原语字段定义 —— 决定右栏「标注面板」长什么样
+#   2. 章节列表 —— 左栏，带状态色标
+#   3. 单章明细 + 保存修正 —— 中栏正文、右栏字段与保存
+
+def annotator_fields(paths: Paths) -> dict[str, Any]:
+    """标注台用的原语字段定义（模型轨）。脚本轨不在这里——标注台只管人看的字段。"""
+    from workshop.primitives import load_primitives
+
+    primitives = load_primitives(paths.root / "primitives.yaml")
+    model_fields = []
+    for f in primitives.model_fields:
+        item: dict[str, Any] = {
+            "key": f.key,
+            "label": f.label,
+            "type": f.type,
+            "hint": f.hint,
+            "item_keys": f.item_keys,
+            "item_enums": f.item_enums,
+            "max_len": f.max_len,
+        }
+        if f.type == "enum":
+            item["values"] = f.values
+        elif f.type == "list_of_objects":
+            item["item_enums"] = {
+                k: primitives.enums.get(ref, []) for k, ref in f.item_enums.items()
+            }
+        model_fields.append(item)
+
+    order: list[str] = []
+    for f in primitives.model_fields:
+        if f.type in ("rating", "enum", "int", "str"):
+            order.append(f.key)
+    for f in primitives.model_fields:
+        if f.type == "list_of_objects":
+            order.append(f.key)
+
+    return {
+        "model_fields": model_fields,
+        # 字母区外层套 key 顺序，评价类放前面、对象列表放后面
+        "field_order": order,
+        "meta_fields": primitives.meta_fields,
+        "version": primitives.version,
+    }
+
+
+def annotator_chapters(paths: Paths, name: str) -> dict[str, Any]:
+    """标注台左栏：全部章节 + 标注状态，一次拉全（标注台是键盘高频操作，不该分页跳动）。"""
+    from workshop.annotate import load_annotation
+
+    manifest_path = paths.ingest_dir(name) / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"作品「{name}」还没有章节数据")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    annotations_dir = paths.annotations_dir(name)
+    chapters = manifest.get("chapters") or []
+    items = []
+    for c in chapters:
+        cid = str(c.get("id"))
+        record = load_annotation(annotations_dir / f"{cid}.json") if annotations_dir.exists() else None
+        items.append(
+            {
+                "id": cid,
+                "chapter_no": c.get("chapter_no"),
+                "title": c.get("title") or "",
+                "vol_no": c.get("vol_no") or 1,
+                "status": (record or {}).get("status"),
+                "review_action": (record or {}).get("review_action"),
+                "confidence": ((record or {}).get("self_report") or {}).get("confidence"),
+                "issue_count": len((record or {}).get("issues") or []),
+            }
+        )
+    return {"total": len(items), "items": items}
+
+
+def annotator_chapter_detail(paths: Paths, name: str, chapter_id: str) -> dict[str, Any] | None:
+    """标注台用的单章明细：正文 + 当前标注字段。"""
+    detail = chapter_detail(paths, name, chapter_id)
+    if detail is None:
+        return None
+    record = detail.get("annotation")
+    fields = detail.get("fields") or {}
+    self_report = (record or {}).get("self_report") or {}
+    return {
+        "id": detail["id"],
+        "chapter_no": detail["chapter_no"],
+        "vol_no": detail["vol_no"],
+        "title": detail["title"],
+        "text": detail["text"],
+        "status": (record or {}).get("status") or "unannotated",
+        "review_action": (record or {}).get("review_action"),
+        "fields": fields,
+        "self_report": self_report,
+        "issues": (record or {}).get("issues") or [],
+        "prev": detail["prev"],
+        "next": detail["next"],
+        "index": detail["index"],
+        "total": detail["total"],
+    }
+
+
+def save_annotation_review(
+    paths: Paths, name: str, chapter_id: str, *, fields: dict[str, Any] | None,
+    status: str | None, reason: str = "",
+) -> dict[str, Any]:
+    """标注台保存人工修正：更新字段与复核状态，写回标注文件。
+
+    纪律：
+      · 只接受标注文件里已有字段的修正，不新增字段（跨作品一致性靠字段集固定）
+      · 改了字段就把 status 扭回 needs_review（人改过的东西在复核之前不算「正常」）
+      · 未标注章节不落盘——标注台是「修正」不是「create」，没有标注就明说
+    """
+    from workshop.annotate import annotation_path, load_annotation, save_annotation
+    from workshop.secrets import SecretStore, setup_logging
+
+    store = SecretStore(paths.root / "config")
+    setup_logging(store.known_values)
+
+    ann_dir = paths.annotations_dir(name)
+    path = annotation_path(ann_dir, chapter_id)
+    record = load_annotation(path)
+    if record is None:
+        raise ValueError(f"章节 {chapter_id} 还没有标注记录，标注台只能修正已有标注")
+
+    if fields is not None:
+        existing = record.get("fields") or {}
+        # 原语字段集 = 落盘记录里的现有字段。人工修正只在这些字段上做 merge。
+        merged = dict(existing)
+        changed = False
+        for key, value in fields.items():
+            if key in existing and existing.get(key) != value:
+                merged[key] = value
+                changed = True
+        if changed:
+            record["fields"] = merged
+        # 人改过字段 → 自动转待复核（改过的东西在复核之前不算「正常」）
+        if changed and status not in ("ok",):
+            record["status"] = "needs_review"
+
+    if status in ("ok", "needs_review"):
+        record["status"] = status
+
+    issues = record.get("issues")
+    if not isinstance(issues, list):
+        issues = []
+    if reason:
+        issues.append(f"人工修正：{reason}")
+    record["issues"] = issues
+
+    prov = record.get("provenance")
+    if not isinstance(prov, dict):
+        prov = {}
+    prov["reviewed_at"] = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    prov["reviewed_by"] = "ui-annotator"
+    record["provenance"] = prov
+
+    saved = save_annotation(record, ann_dir, secrets=store.known_values)
+    return {
+        "ok": True,
+        "chapter_id": chapter_id,
+        "status": record["status"],
+        "path": str(saved),
+    }
+
+
+# ── 知识库 ────────────────────────────────────────────────
+#
+# K1 实体卡片 / K2 四类台账 / K3 作品指纹。纯脚本聚合，不调模型。
+# 「知识库查看」随时可看；「重新构建」只在你改过标注之后需要点。
+
+def kb_latest(paths: Paths, name: str) -> dict[str, Any] | None:
+    out_dir = paths.work_dir(name) / "20-kb"
+    path = out_dir / "index.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+
+
+def build_kb(paths: Paths, name: str) -> dict[str, Any]:
+    from workshop.kb import build_kb as _do_build
+
+    out_dir = paths.work_dir(name) / "20-kb"
+    entities_path = paths.work_dir(name) / "50-entities" / "latest.json"
+    return _do_build(
+        work_name=name,
+        ingest_dir=paths.ingest_dir(name),
+        annotations_dir=paths.annotations_dir(name),
+        entities_path=entities_path,
+        out_dir=out_dir,
+    )
+
+
+# ── 重写工坊 ──────────────────────────────────────────────
+#
+# M3 重写 + M4 六类校验 + G2 输出闸门。改写是新版本，原稿永远保留。
+# 计划免费；执行会调模型（花钱）；接受是写新版本文件（不覆盖原稿）。
+
+DIRECTIVES = ["改视角", "扩写", "精简", "调节奏", "强化动机"]
+
+
+def rewrite_plan(paths: Paths, name: str, provider_id: str | None = None, model_id: str | None = None) -> dict[str, Any]:
+    """改写台计划：列出可选指令类型与章节（免费，不调模型）。"""
+    from workshop.batch import load_chapter_tasks
+    from workshop.config import load_config
+    from workshop.primitives import load_work
+
+    cfg = load_config(paths.root / "providers.yaml")
+    provider, model_id = _resolve_provider_and_model(cfg, provider_id, model_id)
+    tasks = load_chapter_tasks(paths.ingest_dir(name))
+    if not tasks:
+        raise FileNotFoundError(f"作品「{name}」还没有章节数据")
+
+    work = load_work(paths.work_config(name)) if paths.work_config(name).exists() else None
+    return {
+        "directives": DIRECTIVES,
+        "provider": provider.id,
+        "provider_name": provider.name,
+        "model": model_id,
+        "model_available": [m.get("id") for m in provider.models],
+        "has_api_key": bool(_read_api_key(cfg, provider)),
+        "chapters": [
+            {
+                "id": t.chapter_id,
+                "chapter_no": t.chapter_no,
+                "title": t.title,
+                "chars": t.char_count,
+            }
+            for t in tasks
+        ],
+        "has_rewrites": rewrite_latest(paths, name) is not None,
+        "core_motive": work.core_motive if work else "",
+    }
+
+
+def rewrite_latest(paths: Paths, name: str) -> dict[str, Any] | None:
+    """最近一次改写记录（任一章）。"""
+    out = paths.work_dir(name) / "30-rewrite"
+    if not out.exists():
+        return None
+    latest_path = out / "latest.json"
+    if latest_path.exists():
+        try:
+            return json.loads(latest_path.read_text(encoding="utf-8-sig"))
+        except (ValueError, OSError):
+            pass
+    return None
+
+
+def rewrite_chapter_record(paths: Paths, name: str, chapter_id: str) -> dict[str, Any] | None:
+    out = paths.work_dir(name) / "30-rewrite"
+    path = out / f"{chapter_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+
+
+def start_rewrite(
+    paths: Paths,
+    name: str,
+    *,
+    chapter_id: str,
+    directive: str,
+    instruction: str = "",
+    provider_id: str | None = None,
+    model_id: str | None = None,
+) -> dict[str, Any]:
+    """执行一章的重写（会花钱）。原稿不动，改写稿 + 校验一起落盘。"""
+    from workshop.batch import load_chapter_tasks
+    from workshop.config import load_config
+    from workshop.kb import build_k1
+    from workshop.primitives import WorkConfig, load_work
+    from workshop.llm import OpenAICompatProvider
+    from workshop.rewrite import (
+        RewriteOptions,
+        pack_validation,
+        rewrite_chapter,
+        save_rewrite,
+        validate_rewrite,
+    )
+    from workshop.secrets import SecretStore, setup_logging
+
+    cfg = load_config(paths.root / "providers.yaml")
+    provider, model_id = _resolve_provider_and_model(cfg, provider_id, model_id)
+    if provider.api_key_ref and not _read_api_key(cfg, provider):
+        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+
+    tasks = load_chapter_tasks(paths.ingest_dir(name))
+    task = next((t for t in tasks if t.chapter_id == chapter_id), None)
+    if task is None:
+        raise ValueError(f"找不到章节 {chapter_id}")
+
+    body = task.path.read_text(encoding="utf-8")
+    from workshop.annotate import strip_front_matter
+
+    _meta, body = strip_front_matter(body)
+
+    work = load_work(paths.work_config(name)) if paths.work_config(name).exists() else WorkConfig({})
+    store = SecretStore(paths.root / "config")
+    setup_logging(store.known_values)
+    api_key = _read_api_key(cfg, provider)
+
+    client = OpenAICompatProvider(
+        base_url=provider.base_url,
+        api_key=api_key,
+        timeout_sec=90,
+        auth_scheme=provider.auth_scheme,
+        secrets=store.known_values,
+        rate_limit=provider.rate_limit,
+    )
+
+    result = rewrite_chapter(
+        client=client,
+        model_id=model_id,
+        chapter_id=task.chapter_id,
+        chapter_no=task.chapter_no,
+        title=task.title,
+        original=body,
+        directive=directive,
+        instruction=instruction,
+        opts=RewriteOptions(),
+        system_theme=f"当前作品：{work.name}\n主角：{work.protagonist or '（未设置）'}\n"
+        f"核心动机：{work.core_motive or '（未设置）'}",
+    )
+
+    # 六类校验
+    annotation = load_annotation(paths.annotations_dir(name) / f"{chapter_id}.json") if (
+        paths.annotations_dir(name) / f"{chapter_id}.json"
+    ).exists() else None
+    annotation_fields = (annotation or {}).get("fields") or {}
+    k1 = build_k1(name, _latest_entities(paths, name))
+    issues = validate_rewrite(
+        original=body,
+        rewritten=result.record["rewritten"],
+        work=work,
+        annotation_fields=annotation_fields,
+        k1=k1,
+        directive=directive,
+    )
+    result.record["validation"] = pack_validation(issues)
+    result.record["k1_available"] = k1.get("available", False)
+
+    saved = save_rewrite(paths.work_dir(name), result.record)
+    # 留一份 latest 便于改写台直接读
+    out = paths.work_dir(name) / "30-rewrite"
+    (out / "latest.json").write_text(json.dumps(result.record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {"ok": True, "chapter_id": chapter_id, "path": str(saved), **result.record["validation"]}
+
+
+def accept_rewrite_record(paths: Paths, name: str, chapter_id: str, *, force: bool = False) -> dict[str, Any]:
+    """接受改写（G2 闸门）。force 用于明确选择「改坏也认」。"""
+    from workshop.rewrite import accept_rewrite as _accept
+    from workshop.secrets import SecretStore
+
+    if force:
+        out = paths.work_dir(name) / "30-rewrite"
+        path = out / f"{chapter_id}.json"
+        if path.exists():
+            rec = json.loads(path.read_text(encoding="utf-8-sig"))
+            rec["force_accept"] = True
+            path.write_text(json.dumps(rec, ensure_ascii=False, indent=2), encoding="utf-8")
+    store = SecretStore(paths.root / "config")
+    return _accept(paths.work_dir(name), chapter_id, secrets=store.known_values)
+
+
+def _latest_entities(paths: Paths, name: str) -> dict[str, Any] | None:
+    path = paths.work_dir(name) / "50-entities" / "latest.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+
+
+# ── 题材库 / 对比 / 融合 ────────────────────────────────
+#
+# L2 题材库（M6）、M8 对比分析、M5 融合器。
+# 全部纯脚本聚合，不调模型；文件系统是唯一真相源。
+
+def genres_root(paths: Paths) -> Path:
+    return paths.root / "genres"
+
+
+def compare_root(paths: Paths) -> Path:
+    return paths.root / "compare"
+
+
+def fusion_root(paths: Paths) -> Path:
+    return paths.root / "workspaces" / "_fusion"
+
+
+def genre_index(paths: Paths) -> dict[str, Any]:
+    from workshop.genres import list_genres, load_index
+
+    return {
+        "mapping": load_index(genres_root(paths)),
+        "genres": list_genres(genres_root(paths)),
+    }
+
+
+def set_work_genre(paths: Paths, work: str, genre: str) -> dict[str, Any]:
+    from workshop.genres import set_genre
+
+    return set_genre(genres_root(paths), work, genre)
+
+
+def genre_rules(paths: Paths, genre: str) -> dict[str, Any] | None:
+    path = genres_root(paths) / genre / "rules.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+
+
+def aggregate_genre_rules(paths: Paths, genre: str) -> dict[str, Any]:
+    from workshop.genres import aggregate_genre, save_genre_rules
+
+    result = aggregate_genre(genres_root(paths), paths.workspaces, genre)
+    saved = save_genre_rules(genres_root(paths), result)
+    payload = result.to_dict()
+    payload["saved"] = str(saved)
+    return payload
+
+
+def build_compare_report(paths: Paths, work: str, genre: str) -> dict[str, Any]:
+    from workshop.compare import build_compare, save_compare
+
+    result = build_compare(paths.workspaces, genres_root(paths), work, genre)
+    saved = save_compare(compare_root(paths), result)
+    payload = result.to_dict()
+    payload["saved"] = str(saved)
+    return payload
+
+
+def compare_latest(paths: Paths) -> dict[str, Any] | None:
+    path = compare_root(paths) / "latest.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
+
+
+def generate_fusion(paths: Paths, source_works: list[str] | None = None, seed: int | None = None) -> dict[str, Any]:
+    from workshop.fusion import generate_skeleton, save_skeleton
+
+    skeleton = generate_skeleton(paths.workspaces, source_works or [], seed=seed)
+    saved = save_skeleton(fusion_root(paths), skeleton)
+    payload = skeleton.to_dict()
+    payload["saved"] = str(saved)
+    return payload
+
+
+def fusion_latest(paths: Paths) -> dict[str, Any] | None:
+    path = fusion_root(paths) / "latest.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError):
+        return None
 
 
 # ── 实体统计 ────────────────────────────────────────────────

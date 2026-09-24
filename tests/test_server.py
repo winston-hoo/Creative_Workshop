@@ -294,6 +294,54 @@ def test_archive_unknown_work_404() -> None:
     check(client.post("/api/works/根本没有这部/archive", json={}).status_code == 404, "返回 404")
 
 
+def test_archive_restore_via_api() -> None:
+    """归档恢复走 API：列出 → 恢复，数据原样回来；同名时拒绝覆盖。"""
+    print("归档区列出一键恢复（API）")
+    out = import_test_work()
+    check(out["ok"] is True, "先导入一部")
+
+    work_dir = WS / TEST_WORK
+    marker = work_dir / "10-annotations" / "v001-c0001.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{"chapter_id":"v001-c0001"}', encoding="utf-8")
+
+    # 移出
+    r = client.post(f"/api/works/{TEST_WORK}/archive", json={})
+    check(r.status_code == 200, "移出成功")
+
+    # 归档列表里能看到，带标注数
+    archived = client.get("/api/archive").json()
+    names = [a["name"] for a in archived["items"]]
+    check(TEST_WORK in names, "归档列表里有它")
+    entry = next(a for a in archived["items"] if a["name"] == TEST_WORK)
+    check(entry["chapters"] == 8, f"列出章数（{entry['chapters']}）")
+    check(entry["annotated"] == 1, "列出标注数")
+
+    # 恢复
+    r = client.post("/api/archive/restore", json={"name": TEST_WORK})
+    check(r.status_code == 200 and r.json()["ok"], "恢复成功")
+    check(work_dir.exists(), "搬回了原位置")
+    check((work_dir / "10-annotations" / "v001-c0001.json").exists(), "标注原样回来")
+    names = {w["name"] for w in client.get("/api/works").json()}
+    check(TEST_WORK in names, "书架重新出现")
+    archived = client.get("/api/archive").json()
+    check(TEST_WORK not in [a["name"] for a in archived["items"]], "归档区已清走")
+
+    # 同名时拒绝覆盖
+    r2 = client.post("/api/archive/restore", json={"name": TEST_WORK})
+    check(r2.status_code == 404, "归档区已没有它，恢复给 404")
+
+    # 造一个同名的归档副本，验证「书架上已有同名」时拒绝。
+    # 归档区重名副本是「作品名.时间戳」形态（数字后缀），恢复会还原成基础名。
+    shutil.rmtree(WS / "_archive", ignore_errors=True)
+    (WS / "_archive").mkdir(parents=True, exist_ok=True)
+    shutil.copytree(work_dir, WS / "_archive" / f"{TEST_WORK}.20260924T151222")
+    r3 = client.post("/api/archive/restore", json={"name": f"{TEST_WORK}.20260924T151222"})
+    check(r3.status_code == 400, "书架上已有同名时拒绝恢复（400）")
+    check("不会覆盖" in json.dumps(r3.json(), ensure_ascii=False), "拒绝理由说明不覆盖")
+    cleanup()
+
+
 # ── 导入向导 ────────────────────────────────────────────────
 
 
@@ -580,6 +628,7 @@ def main() -> int:
         test_path_traversal_blocked,
         test_archive_moves_not_deletes,
         test_archive_unknown_work_404,
+        test_archive_restore_via_api,
         test_import_preview_does_not_write,
         test_import_commit_writes,
         test_upload_token_single_use,

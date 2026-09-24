@@ -4,6 +4,13 @@
 config/.env
 config/secrets.json
 
+# 设置页维护的自定义服务商配置：含你接入的中转站/服务商与默认模型绑定
+custom-providers.yaml
+
+# 题材库运行时数据：作品 → 题材 映射随真实作品累积，属本地数据
+genres/
+compare/
+
 # 作品数据：原文、标注、报告都带真实作品内容与作者本机绝对路径
 workspaces/
 config/annotations/

@@ -43,6 +43,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -201,6 +202,30 @@ def api_archive_work(name: str) -> dict:
         raise HTTPException(404, str(exc)) from exc
     except OSError as exc:
         raise HTTPException(500, f"移动失败：{exc}") from exc
+
+
+@app.get("/api/archive")
+def api_list_archived() -> dict:
+    """归档区里的作品列表（含章节数/标注数），供恢复入口使用。"""
+    items = services.list_archived(PATHS)
+    return {"items": items, "total": len(items)}
+
+
+class RestoreRequest(BaseModel):
+    name: str = Field(..., description="归档条目名（可能是 作品名 或 作品名.时间戳）")
+
+
+@app.post("/api/archive/restore")
+def api_restore_work(req: RestoreRequest) -> dict:
+    """把归档作品搬回书架。书架上已有同名时拒绝覆盖。"""
+    try:
+        return services.restore_work(PATHS, req.name)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"恢复失败：{exc}") from exc
 
 
 # ── 模型任务：批量标注 ──────────────────────────────────────
@@ -424,6 +449,227 @@ def api_annotations(
 ) -> dict:
     """已标注章节的一览表。每行是「这一章标成了什么样」，不是原文。"""
     return services.list_annotations(PATHS, safe_name(name), offset=offset, limit=limit, only=only)
+
+
+# ── 标注台 ────────────────────────────────────────────────
+#
+# UI-P3：模型先跑，人只修正低置信度章节。三栏布局的全部接口。
+
+@app.get("/api/works/{name}/annotator/fields")
+def api_annotator_fields(name: str) -> dict:
+    """标注右栏的字段定义。"""
+    return services.annotator_fields(PATHS)
+
+
+@app.get("/api/works/{name}/annotator/chapters")
+def api_annotator_chapters(name: str) -> dict:
+    """标注左栏：全部章节 + 状态。"""
+    try:
+        return services.annotator_chapters(PATHS, safe_name(name))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/annotator/chapters/{chapter_id}")
+def api_annotator_chapter(name: str, chapter_id: str) -> dict:
+    """标注中栏：单章正文 + 当前字段。"""
+    detail = services.annotator_chapter_detail(PATHS, safe_name(name), chapter_id)
+    if detail is None:
+        raise HTTPException(404, f"找不到章节「{chapter_id}」")
+    return detail
+
+
+class ReviewSaveRequest(BaseModel):
+    fields: dict[str, Any] | None = Field(None, description="人工修正后的字段（只接受已有字段）")
+    status: str | None = Field(None, pattern="^(ok|needs_review)?$")
+    reason: str = Field("", description="修正说明，会记入 issues")
+
+
+@app.put("/api/works/{name}/annotator/chapters/{chapter_id}")
+def api_annotator_save(name: str, chapter_id: str, req: ReviewSaveRequest) -> dict:
+    """标注台保存人工修正。"""
+    try:
+        return services.save_annotation_review(
+            PATHS, safe_name(name), chapter_id, fields=req.fields, status=req.status, reason=req.reason
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ── 知识库 ────────────────────────────────────────────────
+
+
+@app.get("/api/works/{name}/kb")
+def api_kb(name: str) -> dict:
+    """最近一次知识库。还没构建过用 exists:false，正常状态不是错误。"""
+    latest = services.kb_latest(PATHS, safe_name(name))
+    if latest is None:
+        return {"exists": False}
+    latest["exists"] = True
+    return latest
+
+
+@app.post("/api/works/{name}/kb/build")
+def api_kb_build(name: str) -> dict:
+    """构建知识库（K1/K2/K3）。纯脚本，不调模型，随时可点。"""
+    try:
+        return services.build_kb(PATHS, safe_name(name))
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ── 重写工坊 ────────────────────────────────────────────────
+
+
+@app.get("/api/works/{name}/rewrite/plan")
+def api_rewrite_plan(
+    name: str,
+    provider: str | None = Query(None),
+    model: str | None = Query(None),
+) -> dict:
+    """改写台计划：指令类型与章节列表。免费，不调模型。"""
+    try:
+        return services.rewrite_plan(PATHS, safe_name(name), provider_id=provider, model_id=model)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class RewriteStartRequest(BaseModel):
+    chapter_id: str = Field(..., description="要改写的章节 id")
+    directive: str = Field("调节奏", description="指令类型：改视角/扩写/精简/调节奏/强化动机")
+    instruction: str = Field("", description="补充说明")
+    model: str | None = None
+
+
+@app.post("/api/works/{name}/rewrite/start")
+def api_rewrite_start(name: str, req: RewriteStartRequest) -> dict:
+    """执行一章重写（会调模型、产生费用）。"""
+    try:
+        return services.start_rewrite(
+            PATHS, safe_name(name),
+            chapter_id=req.chapter_id,
+            directive=req.directive,
+            instruction=req.instruction,
+            model_id=req.model,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/rewrite/{chapter_id}")
+def api_rewrite_record(name: str, chapter_id: str) -> dict:
+    """某一章的改写记录。没有就 404。"""
+    record = services.rewrite_chapter_record(PATHS, safe_name(name), chapter_id)
+    if record is None:
+        raise HTTPException(404, f"章节「{chapter_id}」还没有改写记录")
+    return record
+
+
+class RewriteAcceptRequest(BaseModel):
+    force: bool = False
+
+
+@app.post("/api/works/{name}/rewrite/{chapter_id}/accept")
+def api_rewrite_accept(name: str, chapter_id: str, req: RewriteAcceptRequest) -> dict:
+    """接受改写：写入新版本文件（原稿保留）。G2 闸门：有阻断问题先拒绝。"""
+    try:
+        return services.accept_rewrite_record(
+            PATHS, safe_name(name), chapter_id, force=req.force
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ── 题材库 / 对比 / 融合 ────────────────────────────────────
+
+
+@app.get("/api/genres")
+def api_genres() -> dict:
+    """题材库总览：作品 → 题材 映射 + 各题材规则状态。"""
+    return services.genre_index(PATHS)
+
+
+class GenreRequest(BaseModel):
+    work: str = Field(..., description="作品名")
+    genre: str = Field("", description="题材名，空串移除")
+
+
+@app.put("/api/genres/assign")
+def api_genre_assign(req: GenreRequest) -> dict:
+    """把作品登记到某题材。"""
+    try:
+        return services.set_work_genre(PATHS, safe_name(req.work), req.genre)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/genres/{genre}")
+def api_genre_get(genre: str) -> dict:
+    """某题材的已聚合规则。没有则 404。"""
+    try:
+        rules = services.genre_rules(PATHS, safe_name(genre))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if rules is None:
+        raise HTTPException(404, f"题材「{genre}」还没有聚合规则")
+    return rules
+
+
+@app.post("/api/genres/{genre}/aggregate")
+def api_genre_aggregate(genre: str) -> dict:
+    """聚合某题材的规则（M6）。纯脚本，不调模型。"""
+    try:
+        return services.aggregate_genre_rules(PATHS, safe_name(genre))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/compare")
+def api_compare() -> dict:
+    """最近一次对比分析。没跑过用 exists:false。"""
+    latest = services.compare_latest(PATHS)
+    if latest is None:
+        return {"exists": False}
+    latest["exists"] = True
+    return latest
+
+
+class CompareRequest(BaseModel):
+    work: str = Field(..., description="基准作品名")
+    genre: str = Field(..., description="题材名")
+
+
+@app.post("/api/compare/build")
+def api_compare_build(req: CompareRequest) -> dict:
+    """构建三份对比报告（M8）。"""
+    try:
+        return services.build_compare_report(PATHS, safe_name(req.work), req.genre)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/fusion")
+def api_fusion() -> dict:
+    """最近一次融合骨架。没生成过用 exists:false。"""
+    latest = services.fusion_latest(PATHS)
+    if latest is None:
+        return {"exists": False}
+    latest["exists"] = True
+    return latest
+
+
+class FusionRequest(BaseModel):
+    source_works: list[str] | None = None
+    seed: int | None = None
+
+
+@app.post("/api/fusion/generate")
+def api_fusion_generate(req: FusionRequest) -> dict:
+    """生成一个新故事骨架（M5）。纯脚本，不调模型。"""
+    try:
+        return services.generate_fusion(PATHS, req.source_works or None, req.seed)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ── 实体统计 ────────────────────────────────────────────────
