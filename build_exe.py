@@ -17,6 +17,12 @@ ROOT = Path(__file__).resolve().parent
 NAME = "创作工坊"
 SEEDS = ("providers.yaml", "primitives.yaml", "work.yaml")
 
+# 输出被重定向（CI、写日志文件）时 stdout 不再是控制台，Python 会退回 ANSI 代码页
+# （英文 Windows 上是 cp1252），中文 print 会直接抛 UnicodeEncodeError 把构建打挂。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def build_args() -> list[str]:
     args = [

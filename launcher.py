@@ -27,6 +27,12 @@ DEFAULT_PORT = 8765
 HOST = "127.0.0.1"  # 不是可调参数：作品原文不出本机
 SEEDS = ("providers.yaml", "primitives.yaml", "work.yaml")
 
+# 输出被重定向（`创作工坊.exe > log.txt`）时 stdout 不是控制台，Python 会退回 ANSI
+# 代码页（英文 Windows 上是 cp1252），下面几句中文提示会让程序直接崩在启动阶段。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
