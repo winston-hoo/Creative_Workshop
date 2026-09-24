@@ -43,6 +43,10 @@ jobs:
           python -m pip install -r requirements.txt pyinstaller
 
       - name: 打包
+        env:
+          # 中文名在 runner 上会丢：bash→gh 传非 ASCII 文件名时 GitHub 只收到空名，
+          # 附件就变成了 default.exe。CI 一律用 ASCII 名，本地构建仍是 创作工坊.exe。
+          WORKSHOP_EXE_NAME: CreativeWorkshop
         run: python build_exe.py
 
       - name: 核对产物
@@ -55,7 +59,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.release.tag_name || inputs.tag || github.ref_name }}"
-          ASSET="dist/创作工坊.exe"
+          ASSET="dist/CreativeWorkshop.exe"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，上传附件（覆盖同名）"
             gh release upload "$TAG" "$ASSET" --clobber
