@@ -21,7 +21,8 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# 打包产物
+# 打包产物：一律不进库。exe 走 Release 附件（.github/workflows/release-exe.yml），
+# 二进制进了 git 就永久留在历史里，仓库会随版本膨胀。
 build/
 dist/
 *.spec

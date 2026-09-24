@@ -1,0 +1,67 @@
+name: 打包 exe 并附到 Release
+
+# 三种触发方式：
+#   · 发布 Release 时自动跟一发（最省事，推荐）
+#   · 推任意标签时自动建 Release 并把 exe 附上（标签已存在 Release 就更新它的附件）
+#   · 手动运行，指定要附加到哪个已存在的 Release 标签
+#
+# 为什么不在主分支里放 exe：二进制进了 git 就永久留在历史里，
+# 每重打一版仓库就涨一份体积。挂 Release 附件不占仓库体积，用户照样一键下载。
+
+on:
+  release:
+    types: [published]
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要附加 exe 的 Release 标签（例如 story）
+        required: true
+
+permissions:
+  contents: write
+
+# 同一个标签并发跑两次会互相抢同一个附件，串起来
+concurrency:
+  group: release-exe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: 打包
+        run: python build_exe.py
+
+      - name: 核对产物
+        shell: bash
+        run: ls -lh dist/
+
+      - name: 附到 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag || github.ref_name }}"
+          ASSET="dist/创作工坊.exe"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，上传附件（覆盖同名）"
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            echo "Release $TAG 不存在，直接创建并附上 exe"
+            # 并发时可能已被另一次运行创建，失败就退回上传
+            gh release create "$TAG" "$ASSET" --title "$TAG" --generate-notes \
+              || gh release upload "$TAG" "$ASSET" --clobber
+          fi

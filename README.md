@@ -62,6 +62,13 @@ python -m venv .venv
 
 ## 打包成 exe（给不装 Python 的人用）
 
+**不装 Python 的机器不用自己打包**：到仓库的 `Releases` 页下载 `创作工坊.exe`，双击即用。
+exe **不进主分支**——二进制进了 git 就永久留在历史里，每重打一版仓库就涨一份体积。
+它由 CI 在发版时自动构建并挂到 Release 附件上，工作流见 `.github/workflows/release-exe.yml`
+（发布 Release 自动触发；也可以在 Actions 里手动运行并指定要附加到哪个标签）。
+
+要自己打一份、或改过代码之后重打：
+
 ```bash
 python -m pip install --user pyinstaller
 python build_exe.py
