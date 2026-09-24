@@ -14,8 +14,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-# CI 里用 ASCII 名：runner 上 bash 把非 ASCII 文件名交给 gh 时会丢，
-# GitHub 收到空文件名后存成 default.exe（2026-09-24 实测）。本地构建不受影响。
+# CI 里用 ASCII 名：实测（2026-09-24）非 ASCII 文件名上传到 Release 后会被存成
+# default.exe —— 文件名在中途某处丢了（bash、gh、GitHub 三者谁丢的没再深究）。
+# 换成纯 ASCII 就正常。本地构建不受影响，仍是 创作工坊.exe。
 NAME = os.environ.get("WORKSHOP_EXE_NAME") or "创作工坊"
 SEEDS = ("providers.yaml", "primitives.yaml", "work.yaml")
 
