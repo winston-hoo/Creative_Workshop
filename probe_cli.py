@@ -327,6 +327,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
         timeout_sec=opts.timeout_sec,
         auth_scheme=provider.auth_scheme,
         secrets=secrets.known_values,
+        rate_limit=provider.rate_limit,
     )
 
     report = run_probe(

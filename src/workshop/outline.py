@@ -37,6 +37,7 @@ from typing import Any, Callable
 
 from .annotate import load_annotation
 from .batch import ChapterTask, load_chapter_tasks
+from .errors import ErrorKind  # noqa: F401
 from .llm import ApiError, ChatResult, OpenAICompatProvider, build_thinking_extra, extract_json_object
 from .secrets import redact
 
@@ -273,6 +274,9 @@ def _call(
     extra = build_thinking_extra(opts.thinking, None)
     last_error = ""
     usage_total: dict[str, int] = {}
+    # 部分中转站不认 response_format=json_object，撞上 BAD_REQUEST 就降级为
+    # 提示词约束 + 解析（extract_json_object 仍能抠出 JSON）。
+    json_mode = True
     for _attempt in range(1, max(1, opts.max_attempts) + 1):
         try:
             result: ChatResult = client.chat(
@@ -283,11 +287,14 @@ def _call(
                 ],
                 max_tokens=opts.max_tokens,
                 temperature=opts.temperature,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"} if json_mode else None,
                 extra=extra,
             )
         except ApiError as exc:
             last_error = f"{exc.kind.value}：{exc.safe_body(client.secrets)}"
+            if json_mode and exc.kind in (ErrorKind.BAD_REQUEST, ErrorKind.RESPONSE_UNPARSABLE):
+                json_mode = False
+                continue
             continue
         if result.usage:
             for key, value in result.usage.to_dict().items():

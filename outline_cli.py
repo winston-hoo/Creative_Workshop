@@ -213,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout_sec=args.timeout,
         auth_scheme=provider.auth_scheme,
         secrets=store.known_values,
+        rate_limit=provider.rate_limit,
     )
     opts = OutlineOptions(
         block_size=args.block_size,

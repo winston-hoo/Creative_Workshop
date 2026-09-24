@@ -283,6 +283,7 @@ def cmd_annotate(args) -> int:
         timeout_sec=opts.timeout_sec,
         auth_scheme=provider.auth_scheme,
         secrets=secrets.known_values,
+        rate_limit=provider.rate_limit,
     )
 
     result = annotate_chapter(

@@ -978,13 +978,16 @@ function modelSelector(plan, id) {
   </select>`;
 }
 
-async function loadEntitiesInfo() {
+async function loadEntitiesInfo(modelOverride) {
   const box = document.getElementById('entity-info');
   if (!box) return;
   box.innerHTML = '<p class="muted">读取中…</p>';
   let plan;
   try {
-    plan = await getJSON(`/api/works/${encodeURIComponent(taskState.name)}/entities/plan`);
+    const q = modelOverride ? `model=${encodeURIComponent(modelOverride)}` : '';
+    plan = await getJSON(
+      `/api/works/${encodeURIComponent(taskState.name)}/entities/plan${q ? '?' + q : ''}`
+    );
   } catch (e) {
     box.innerHTML = notice('bad', `读不到实体统计计划：${esc(e.message)}`);
     return;
@@ -995,6 +998,7 @@ async function loadEntitiesInfo() {
   if (link && plan.has_result) link.style.display = '';
 
   const rows = [
+    ['模型', modelSelector(plan, 'entity-model')],
     ['分块', `${num(plan.blocks)} 块（每块 ${num(plan.block_size)} 章）`],
     ['正文', `${wan(plan.body_chars)} 字`],
     ['预估 token', `${num(plan.est_input_tokens)} 进 / ${num(plan.est_output_tokens)} 出`],
@@ -1007,6 +1011,10 @@ async function loadEntitiesInfo() {
       plan.est_cost_cny == null ? esc(plan.price_note) : `预估费用：<strong>≈ ¥${plan.est_cost_cny}</strong>`
     }</p>
   `;
+  const entityModel = document.getElementById('entity-model');
+  if (entityModel) {
+    entityModel.onchange = () => loadEntitiesInfo(entityModel.value);
+  }
 }
 
 async function startEntitiesGen(button) {
@@ -2012,11 +2020,42 @@ function drawSettings() {
   const d = settingsState.data;
   view.innerHTML = `
     <h1>设置</h1>
-    <p class="lead">模型服务商与密钥。改完即刻生效，不需要重启服务。</p>
+    <p class="lead">模型服务商、密钥与限速。改完即刻生效，不需要重启服务。</p>
 
     ${notice('info', d.notes.map((n) => esc(n)).join('<br>'))}
 
-    ${d.providers.map((p) => providerCard(p, d)).join('')}
+    <div class="card">
+      <div class="spread" style="margin-bottom:10px">
+        <h3 style="margin:0">默认模型</h3>
+        <button id="save-binding" class="primary">保存默认</button>
+      </div>
+      <p class="muted" style="margin:0 0 10px">
+        没单独指定模型的任务（逐章标注 / 大纲 / 实体统计）都回退到这个服务商 + 模型。
+      </p>
+      <div class="row wrap">
+        <select id="binding-provider" style="font:inherit;font-size:13px;padding:6px 10px;border-radius:10px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text)">
+          ${d.providers.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}
+        </select>
+        <select id="binding-model" style="font:inherit;font-size:13px;padding:6px 10px;border-radius:10px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text)">
+          ${modelOptions(d.providers.find((p) => p.id === (d.binding && d.binding.provider)) || d.providers[0], d.binding && d.binding.model)}
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:10px">
+        <h3 style="margin:0">服务商列表</h3>
+        <button id="add-provider" class="primary">+ 添加服务商</button>
+      </div>
+      <p class="muted" style="margin:0 0 12px">
+        兼容任何 OpenAI 格式的服务商：中转站、官方云、本地端点都可以。
+        密钥只存本机；限速按分钟在客户端排队放行，上游报 429 时会明确提示。
+      </p>
+      <div id="provider-form"></div>
+      <div id="provider-list">
+        ${d.providers.map((p) => providerCard(p, d)).join('')}
+      </div>
+    </div>
 
     <div class="card">
       <h3>预算闸门</h3>
@@ -2032,6 +2071,14 @@ function drawSettings() {
       </p>
     </div>
   `;
+
+  wireBindingSelects();
+  document.getElementById('save-binding').onclick = saveDefaultBinding;
+  document.getElementById('add-provider').onclick = () => {
+    const box = document.getElementById('provider-form');
+    box.innerHTML = providerFormHtml(null, d);
+    wireProviderForm(null, d);
+  };
 
   view.querySelectorAll('[data-save-key]').forEach((btn) => {
     btn.onclick = () => saveKey(btn.dataset.saveKey);
@@ -2051,6 +2098,194 @@ function drawSettings() {
       box.style.display = box.style.display === 'none' ? '' : 'none';
     };
   });
+  view.querySelectorAll('[data-edit-provider]').forEach((btn) => {
+    btn.onclick = () => {
+      const p = d.providers.find((x) => x.id === btn.dataset.editProvider);
+      const box = document.getElementById('provider-form');
+      box.innerHTML = providerFormHtml(p, d);
+      wireProviderForm(p, d);
+      box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+  });
+  view.querySelectorAll('[data-del-provider]').forEach((btn) => {
+    btn.onclick = () => deleteProvider(btn.dataset.delProvider);
+  });
+}
+
+function modelOptions(provider, selectedId) {
+  const models = (provider && provider.models) || [];
+  if (!models.length) {
+    return `<option value="">（未配置模型）</option>`;
+  }
+  return models
+    .map(
+      (m) =>
+        `<option value="${esc(m.id)}" ${m.id === selectedId ? 'selected' : ''}>${esc(
+          m.alias || m.id
+        )}${m.role && m.role !== 'main' ? '（' + esc(m.role) + '）' : ''}</option>`
+    )
+    .join('');
+}
+
+function wireBindingSelects() {
+  const prov = document.getElementById('binding-provider');
+  const model = document.getElementById('binding-model');
+  if (!prov || !model) return;
+  const all = settingsState.data.providers;
+  const fill = () => {
+    const p = all.find((x) => x.id === prov.value);
+    const current = settingsState.data.binding;
+    model.innerHTML = modelOptions(p, p && p.id === (current && current.provider) ? current.model : null);
+  };
+  prov.onchange = fill;
+  fill();
+}
+
+async function saveDefaultBinding() {
+  const prov = document.getElementById('binding-provider');
+  const model = document.getElementById('binding-model');
+  if (!prov) return;
+  const btn = document.getElementById('save-binding');
+  try {
+    await api('/api/settings/binding', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: prov.value, model: model.value || null }),
+    });
+    btn.textContent = '已保存 ✓';
+    btn.disabled = true;
+    setTimeout(() => {
+      btn.textContent = '保存默认';
+      btn.disabled = false;
+    }, 1500);
+  } catch (e) {
+    await tellUser('保存失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+async function deleteProvider(providerId) {
+  const ok = await askConfirm({
+    title: '删除服务商？',
+    html: `<p style="margin:0">将从 <code>custom-providers.yaml</code> 里移除服务商
+      <strong>${esc(providerId)}</strong>。密钥不会删除，删除的是配置本身。</p>`,
+    confirmLabel: '删除',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/settings/providers/${encodeURIComponent(providerId)}`, {
+      method: 'DELETE',
+    });
+    settingsState.data = await getJSON('/api/settings');
+    drawSettings();
+  } catch (e) {
+    await tellUser('删除失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+function providerFormHtml(p, d) {
+  const modelsText = p
+    ? (p.models || []).map((m) => `${esc(m.alias || m.id)} | ${esc(m.id)}`).join('\n')
+    : '';
+  const rl = (p && p.rate_limit) || {};
+  return `
+    <div class="card" style="background:var(--surface);border:1px dashed var(--border-strong)">
+      <h3>${p ? '编辑服务商' : '添加服务商'}</h3>
+      <div class="form-grid" style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">
+        <label>名称
+          <input id="pf-name" value="${esc(p ? p.name : '')}" placeholder="如：我的中转站" style="width:100%">
+        </label>
+        <label>Base URL
+          <input id="pf-url" value="${esc(p ? p.base_url : '')}" placeholder="https://api.example.com/v1" style="width:100%">
+        </label>
+        <label>每分钟请求数上限（留空不限）
+          <input id="pf-rpm" type="number" min="0" value="${rl.requests_per_minute != null ? esc(rl.requests_per_minute) : ''}" placeholder="如：60" style="width:100%">
+        </label>
+        <label>每分钟 token 上限（留空不限）
+          <input id="pf-tpm" type="number" min="0" value="${rl.tokens_per_minute != null ? esc(rl.tokens_per_minute) : ''}" placeholder="如：200000" style="width:100%">
+        </label>
+      </div>
+      <label style="display:block;margin-top:12px">模型列表（每行一个，格式：<code>别名 | 模型id</code>，或只填模型id）
+        <textarea id="pf-models" rows="4" style="width:100%;font-family:ui-monospace,monospace">${modelsText}</textarea>
+      </label>
+      ${
+        p
+          ? `<p class="muted" style="margin:8px 0 0">密钥在下方卡片里单独管理（界面不回显明文）。</p>`
+          : `<label style="display:block;margin-top:12px">API Key（可选，建议创建后立即点「测试连接」）
+              <input id="pf-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…" style="width:100%">
+            </label>`
+      }
+      <label class="check" style="margin-top:12px">
+        <input type="checkbox" id="pf-enabled" ${p ? (p.enabled ? 'checked' : '') : 'checked'}>
+        <span>启用（不启用也能保存，但任务不会默认用它）</span>
+      </label>
+      <div class="row" style="margin-top:14px">
+        <button class="primary" id="pf-save">保存</button>
+        <button id="pf-cancel" class="ghost">取消</button>
+      </div>
+      <div id="pf-result"></div>
+    </div>`;
+}
+
+async function wireProviderForm(p, d) {
+  const save = document.getElementById('pf-save');
+  const cancel = document.getElementById('pf-cancel');
+  if (!save) return;
+  cancel.onclick = () => {
+    document.getElementById('provider-form').innerHTML = '';
+  };
+  save.onclick = async () => {
+    const name = document.getElementById('pf-name').value.trim();
+    const url = document.getElementById('pf-url').value.trim();
+    const models = document.getElementById('pf-models').value.split('\n');
+    const rpm = document.getElementById('pf-rpm').value;
+    const tpm = document.getElementById('pf-tpm').value;
+    const key = document.getElementById('pf-key') ? document.getElementById('pf-key').value : '';
+    const enabled = document.getElementById('pf-enabled').checked;
+    const result = document.getElementById('pf-result');
+    if (!name) {
+      result.innerHTML = notice('warn', '请填写服务商名称。');
+      return;
+    }
+    if (!url) {
+      result.innerHTML = notice('warn', '请填写 Base URL。');
+      return;
+    }
+    await withBusy(save, '<span class="spinner"></span>保存中…', async () => {
+      try {
+        const body = {
+          name,
+          base_url: url,
+          models,
+          api_key: key,
+          requests_per_minute: rpm === '' ? null : Number(rpm),
+          tokens_per_minute: tpm === '' ? null : Number(tpm),
+          enabled,
+        };
+        await api(
+          p
+            ? `/api/settings/providers/${encodeURIComponent(p.id)}`
+            : '/api/settings/providers',
+          {
+            method: p ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          }
+        );
+        settingsState.data = await getJSON('/api/settings');
+        drawSettings();
+        const box = document.getElementById('provider-form');
+        if (box) {
+          box.innerHTML = notice(
+            'ok',
+            `${p ? '已更新' : '已添加'}服务商。建议点一次「测试连接」确认真的能用。`
+          );
+        }
+      } catch (e) {
+        result.innerHTML = notice('bad', `保存失败：${esc(e.message)}`);
+      }
+    });
+  };
 }
 
 function providerCard(p, d) {
@@ -2084,7 +2319,10 @@ function providerCard(p, d) {
           <h2 style="margin:0 0 2px">${esc(p.name)}</h2>
           <div class="muted">${esc(p.base_url || '（未填写 base_url）')}</div>
         </div>
-        <div class="row wrap">${keyState}</div>
+        <div class="row wrap">
+          ${keyState}
+          ${p.custom ? `<span class="chip info">设置页管理</span>` : ''}
+        </div>
       </div>
 
       <p class="muted" style="margin:0 0 12px">
@@ -2097,6 +2335,19 @@ function providerCard(p, d) {
           <code>enabled</code>，或直接点下面的「测试连接」确认能不能用。</span>
       </p>
 
+      ${
+        p.rate_limit &&
+        (p.rate_limit.requests_per_minute != null || p.rate_limit.tokens_per_minute != null)
+          ? `<p class="muted" style="margin:0 0 12px">
+              限速：
+              ${p.rate_limit.requests_per_minute != null ? `每分钟 <strong>${num(p.rate_limit.requests_per_minute)}</strong> 次请求` : ''}
+              ${p.rate_limit.requests_per_minute != null && p.rate_limit.tokens_per_minute != null ? ' · ' : ''}
+              ${p.rate_limit.tokens_per_minute != null ? `每分钟 <strong>${num(p.rate_limit.tokens_per_minute)}</strong> tokens` : ''}
+              <span class="muted">（客户端排队放行，超时明确报错）</span>
+            </p>`
+          : '<p class="muted" style="margin:0 0 12px">限速：未配置（不限制请求频率）</p>'
+      }
+
       <div class="row wrap" style="margin-bottom:12px">
         <button id="key-btn-${esc(p.id)}" data-toggle-key="${esc(p.id)}" class="primary">
           ${p.key.configured ? '更换密钥' : '填写密钥'}
@@ -2104,6 +2355,8 @@ function providerCard(p, d) {
         <button data-test="${esc(p.id)}">测试连接</button>
         <button data-probe="${esc(p.id)}">完整探测</button>
         ${p.key.configured ? `<button class="ghost" data-clear-key="${esc(p.id)}">清除密钥</button>` : ''}
+        ${p.custom ? `<button class="ghost" data-edit-provider="${esc(p.id)}">编辑</button>` : ''}
+        ${p.custom ? `<button class="ghost" data-del-provider="${esc(p.id)}" style="color:var(--danger,#c0392b)">删除</button>` : ''}
       </div>
 
       <div id="key-input-${esc(p.id)}" style="display:none;margin-bottom:12px">
@@ -2137,6 +2390,7 @@ function providerCard(p, d) {
           单位：元 / 百万 tokens。来源：${esc(p.pricing_source || '未登记')}
           ${p.pricing_date ? `（${esc(p.pricing_date)}）` : ''}。
           <strong>系统不内置任何默认单价</strong>，这些数字只是快照，请以控制台为准。
+          ${p.custom ? '自定义服务商的单价默认未登记，费用估算会显示「未填」。' : ''}
         </p>
       </details>
     </div>`;
@@ -2757,6 +3011,20 @@ async function renderEntities(name) {
           .join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`
       : '<p class="muted">无数据</p>';
 
+  const failedDetail = failed.length
+    ? `<details style="margin:10px 0 0">
+        <summary>失败详情（${failed.length} 块）</summary>
+        <ul class="list">${failed
+          .map(
+            (b) =>
+              `<li><strong>${esc(b.range)}</strong><div class="muted" style="white-space:pre-wrap">${esc(
+                b.error || '未知错误'
+              )}</div></li>`
+          )
+          .join('')}</ul>
+      </details>`
+    : '';
+
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
       <a href="#/work/${encodeURIComponent(name)}">← ${esc(name)}</a>
@@ -2771,9 +3039,10 @@ async function renderEntities(name) {
       <span class="chip">地点 ${num(counts.locations)}</span>
       <span class="chip">关系 ${num(counts.relations)}</span>
       ${failed.length ? `<span class="chip bad">失败 ${num(failed.length)} 块</span>` : ''}
+      ${failed.length ? `<button id="retry-entities" class="ghost">重试失败的块</button>` : ''}
     </div>
 
-    ${failed.length ? notice('bad', `有 ${failed.length} 块抽取失败，这些段里的实体不在下面的表里：${esc(failed.map((b) => b.range).join('、'))}`) : ''}
+    ${failed.length ? notice('bad', `有 ${failed.length} 块抽取失败，这些段里的实体不在下面的表里：${esc(failed.map((b) => b.range).join('、'))}`) + failedDetail : ''}
 
     <div class="card">
       <h2>人物（${num(counts.characters)}）</h2>
@@ -2833,6 +3102,57 @@ async function renderEntities(name) {
 
     <p class="muted">实体由模型从正文抽取，名字与关系可能有遗漏或归并错误，重要设定请以原文为准。</p>
   `;
+
+  const retryBtn = document.getElementById('retry-entities');
+  if (retryBtn) retryBtn.onclick = () => retryFailedEntities(name, latest);
+}
+
+/* 重试失败的实体块。失败块的错误原因已在页面上方展示；
+   重试流程直接复用「生成实体统计」，_state.json 会让成功的块跳过，
+   只把失败的块重新抽一遍。 */
+async function retryFailedEntities(name, latest) {
+  if (!latest) return;
+  let plan;
+  try {
+    plan = await getJSON(`/api/works/${encodeURIComponent(name)}/entities/plan`);
+  } catch (e) {
+    await tellUser('读不到实体统计计划', `<p style="margin:0">${esc(e.message)}</p>`);
+    return;
+  }
+  const ok = await askConfirm({
+    title: '重试失败的块',
+    html:
+      `<p style="margin:0">只重新抽取失败的块，已成功的不动。</p>` +
+      `<p class="muted" style="margin:8px 0 0">会发起模型调用、产生费用。预估与首次生成相同。</p>`,
+    confirmLabel: '开始重试',
+  });
+  if (!ok) return;
+  try {
+    await postJSON(
+      `/api/works/${encodeURIComponent(name)}/entities/start?block_size=${plan.block_size}` +
+        `&model=${encodeURIComponent(plan.model)}`,
+      {}
+    );
+    await pollEntitiesDone(name);
+  } catch (e) {
+    await tellUser('启动失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+async function pollEntitiesDone(name) {
+  for (let i = 0; i < 600; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    let st;
+    try {
+      st = await getJSON(`/api/works/${encodeURIComponent(name)}/entities/status`);
+    } catch {
+      continue;
+    }
+    if (!st.running) {
+      renderEntities(name);
+      return;
+    }
+  }
 }
 
 /* ── 路由 ──────────────────────────────────────────────── */

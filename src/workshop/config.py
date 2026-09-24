@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 
 DEFAULT_CONFIG_NAME = "providers.yaml"
+CUSTOM_CONFIG_NAME = "custom-providers.yaml"  # 设置页维护的服务商，加载时合并进 providers
 
 
 @dataclass
@@ -69,6 +70,31 @@ class ProviderConfig:
     @property
     def manual(self) -> dict[str, Any]:
         return dict(self.raw.get("manual") or {})
+
+    @property
+    def rate_limit(self) -> dict[str, Any]:
+        """限速配置。兼容两种写法：
+
+            rate_limit:                       # 顶层字段（设置页新增服务商用这个）
+              requests_per_minute: 60
+              tokens_per_minute: 200000
+            manual:
+              rate_limit:                     # 跟随模板里的 manual 段
+                requests_per_minute: 60
+        """
+        block = self.raw.get("rate_limit")
+        if not isinstance(block, dict) and isinstance(self.raw.get("manual"), dict):
+            block = self.raw["manual"].get("rate_limit")
+        return dict(block) if isinstance(block, dict) else {}
+
+    @property
+    def max_concurrency(self) -> int | None:
+        """配置里手填的并发上限，未填时由调度器自己决定。"""
+        value = self.manual.get("max_concurrency")
+        try:
+            return int(value) if value else None
+        except (TypeError, ValueError):
+            return None
 
     def model(self, model_id: str) -> dict[str, Any] | None:
         for item in self.models:
@@ -153,7 +179,77 @@ def load_config(path: str | Path = DEFAULT_CONFIG_NAME) -> WorkshopConfig:
     data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError(f"配置文件格式异常，顶层应为映射：{p}")
+    data = _merge_custom_config(p.parent, data)
     return WorkshopConfig(path=p.resolve(), raw=data)
+
+
+def custom_config_path(config_path: str | Path) -> Path:
+    """设置页维护的服务商文件路径。与 providers.yaml 同目录。"""
+    return Path(config_path).resolve().parent / CUSTOM_CONFIG_NAME
+
+
+def _merge_custom_config(config_dir: Path, base: dict[str, Any]) -> dict[str, Any]:
+    """把 custom-providers.yaml 合并进主配置。
+
+    设置页新增/编辑的服务商写在单独的文件里，因为 providers.yaml 里
+    有大量手写注释，程序全量重写会把这些注释冲掉。合并规则：
+
+      · providers：同 id 覆盖，新 id 追加
+      · task_bindings：同任务覆盖，新任务追加
+
+    没有 custom 文件就等于没加过任何服务商，主配置原样返回。
+    """
+    custom_path = Path(config_dir) / CUSTOM_CONFIG_NAME
+    if not custom_path.exists():
+        return base
+    try:
+        custom = yaml.safe_load(custom_path.read_text(encoding="utf-8-sig")) or {}
+    except (OSError, yaml.YAMLError):
+        # 文件坏了不回滚主配置——宁可让设置页下次保存时重写。
+        return base
+    if not isinstance(custom, dict):
+        return base
+
+    merged = dict(base)
+
+    # 服务商：同 id 覆盖
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in merged.get("providers") or []:
+        if isinstance(item, dict) and item.get("id"):
+            by_id[str(item["id"])] = dict(item)
+    for item in custom.get("providers") or []:
+        if isinstance(item, dict) and item.get("id"):
+            by_id[str(item["id"])] = dict(item)
+    merged["providers"] = list(by_id.values())
+
+    # 任务绑定：同任务覆盖
+    bindings: dict[str, Any] = dict(merged.get("task_bindings") or {})
+    for key, value in (custom.get("task_bindings") or {}).items():
+        bindings[key] = value
+    merged["task_bindings"] = bindings
+
+    return merged
+
+
+def save_custom_config(config_path: str | Path, custom: dict[str, Any]) -> Path:
+    """把设置页编辑过的内容写回 custom-providers.yaml。
+
+    先写临时文件再原子替换——中途断电/报错都不会留下半个文件。
+    """
+    path = custom_config_path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        k: custom.get(k)
+        for k in ("providers", "task_bindings")
+        if custom.get(k) not in (None, [], {})
+    }
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+    return path
 
 
 def resolve_default_model(cfg: WorkshopConfig, provider: ProviderConfig) -> str:

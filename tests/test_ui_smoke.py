@@ -408,13 +408,15 @@ def test_ui() -> None:
 
         print("\n设置页")
         page.click('a[href="#/settings"]')
-        page.wait_for_selector("text=模型服务商与密钥", timeout=20000)
+        page.wait_for_selector("text=模型服务商", timeout=20000)
         page.wait_for_selector("[data-test]", timeout=20000)
         st = page.inner_text("#view")
         check("DeepSeek" in st, "列出了服务商")
         check("测试连接" in st, "有测试连接按钮")
         check("预算闸门" in st, "显示了预算闸门")
         check("定价与实测" in st, "显示了定价区")
+        check("添加服务商" in st, "有添加服务商入口")
+        check("默认模型" in st, "有默认模型选择")
 
         # 密钥输入默认收起，展开后必须是 password 且永远是空的——绝不回显已存的密钥
         page.click('[data-toggle-key="deepseek"]')

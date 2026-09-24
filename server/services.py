@@ -805,6 +805,7 @@ def start_annotation(
         timeout_sec=opts.timeout_sec,
         auth_scheme=provider.auth_scheme,
         secrets=secrets_store.known_values,
+        rate_limit=provider.rate_limit,
     )
 
     ledger = None
@@ -928,9 +929,24 @@ def _secret_store(paths: Paths):
 
 
 def settings_overview(paths: Paths) -> dict[str, Any]:
-    from workshop.config import load_config
+    from workshop.config import load_config, custom_config_path
 
     cfg = load_config(paths.root / "providers.yaml")
+    custom_file = custom_config_path(paths.root / "providers.yaml")
+    custom_ids: set[str] = set()
+    if custom_file.exists():
+        import yaml
+
+        try:
+            custom = yaml.safe_load(custom_file.read_text(encoding="utf-8-sig")) or {}
+            custom_ids = {
+                str(item.get("id"))
+                for item in (custom.get("providers") or [])
+                if isinstance(item, dict) and item.get("id")
+            }
+        except (OSError, yaml.YAMLError):
+            custom_ids = set()
+
     store = _secret_store(paths)
     items = []
     for provider in cfg.providers:
@@ -963,6 +979,8 @@ def settings_overview(paths: Paths) -> dict[str, Any]:
                 "type": provider.type,
                 "base_url": provider.base_url,
                 "api_key_env": ref,
+                "custom": provider.id in custom_ids,  # 设置页可编辑的服务商
+                "rate_limit": provider.rate_limit or None,
                 "key": {
                     "configured": bool(store.get(ref)),
                     "source": store.source_of(ref),
@@ -986,8 +1004,245 @@ def settings_overview(paths: Paths) -> dict[str, Any]:
         "notes": [
             "密钥只存在本机文件里，服务也只绑 127.0.0.1，不会外传。",
             "读取优先级：环境变量 > .env > secrets.json。保存时会写回当前生效的那一个来源，避免「改了不生效」。",
+            "限速按服务商配置的「每分钟请求数 / token 数」在客户端排队放行；上游仍返回 429 时会明确报错并提示等待时间。",
         ],
     }
+
+
+def create_provider(paths: Paths, *, name: str, base_url: str, models: list[str],
+                    api_key: str = "", requests_per_minute: int | None = None,
+                    tokens_per_minute: int | None = None, enabled: bool = True) -> dict[str, Any]:
+    """设置页新增服务商（本地自有/中转站等任何 OpenAI 兼容端点）。
+
+    写进 custom-providers.yaml，密码走 SecretStore——providers.yaml 的
+    手写注释不能被程序重写冲掉，所以程序负责的配置都放单独文件。
+
+    模型列表按行解析，兼容两种写法：
+      deepseek-flash                     # 只有 id
+      DeepSeek 主力 | deepseek-flash     # alias | id
+    """
+    import re
+
+    from workshop.config import load_config, custom_config_path, save_custom_config
+
+    cfg = load_config(paths.root / "providers.yaml")
+    name = (name or "").strip()
+    base_url = (base_url or "").strip().rstrip("/")
+    if not name:
+        raise ValueError("服务商名称不能为空")
+    if not base_url:
+        raise ValueError("Base URL 不能为空")
+    if not (base_url.startswith("http://") or base_url.startswith("https://")):
+        raise ValueError("Base URL 必须以 http:// 或 https:// 开头")
+    if requests_per_minute is not None and (requests_per_minute < 0 or requests_per_minute > 10**7):
+        raise ValueError("每分钟请求数要在 0 到 1000 万之间")
+
+    parsed_models = _parse_models_text(models)
+    if not parsed_models:
+        raise ValueError("请至少填写一个模型（每行一个，格式：别名 | 模型id）")
+
+    # 生成稳定的 id：小写 + 连字符。中文名转拼音会失真，拼音/英文更合适；
+    # 全中文名退化为 provider-序号，避免两个中文名都叫 provider。
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    custom_existing = _load_custom(paths).get("providers") or []
+    if not base:
+        pid = f"provider-{len(custom_existing) + 1}"
+    else:
+        pid = base
+    n = 2
+    while cfg.get_provider(pid) is not None:
+        pid = f"{base or 'provider'}-{n}"
+        n += 1
+
+    ref = f"{re.sub(r'[^A-Z0-9]+', '_', pid.upper()).strip('_')}_API_KEY"
+
+    provider_entry: dict[str, Any] = {
+        "id": pid,
+        "name": name,
+        "type": "cloud",
+        "protocol": "openai_compatible",
+        "enabled": enabled,
+        "base_url": base_url,
+        "auth": {
+            "scheme": "bearer",
+            "header_name": "Authorization",
+            "api_key_ref": ref,
+        },
+        "rate_limit": {
+            "requests_per_minute": requests_per_minute,
+            "tokens_per_minute": tokens_per_minute,
+        } if (requests_per_minute is not None or tokens_per_minute is not None) else {},
+        "models": parsed_models,
+    }
+
+    custom = _load_custom(paths)
+    custom.setdefault("providers", []).append(provider_entry)
+    save_custom_config(paths.root / "providers.yaml", custom)
+
+    if api_key:
+        outcome = _secret_store(paths).set(ref, api_key)
+        if not outcome.get("ok"):
+            raise ValueError(outcome.get("message") or "密钥保存失败")
+
+    return {"ok": True, "provider": pid, "name": name, "api_key_ref": ref}
+
+
+def update_provider(paths: Paths, provider_id: str, *, name: str | None = None,
+                    base_url: str | None = None, models: list[str] | None = None,
+                    api_key: str = "", requests_per_minute: int | None = None,
+                    tokens_per_minute: int | None = None,
+                    enabled: bool | None = None) -> dict[str, Any]:
+    """设置页更新自定义服务商。只有 custom 文件里的服务商可以改。"""
+    from workshop.config import load_config, save_custom_config
+
+    cfg = load_config(paths.root / "providers.yaml")
+    provider = cfg.get_provider(provider_id)
+    if provider is None:
+        raise ValueError(f"配置里找不到服务商 {provider_id}")
+
+    custom = _load_custom(paths)
+    entries = [e for e in (custom.get("providers") or []) if isinstance(e, dict) and e.get("id") == provider_id]
+    if not entries:
+        raise ValueError(f"服务商 {provider_id} 不是设置页管理的服务商（custom-providers.yaml 里没有它）")
+
+    entry = dict(entries[0])
+
+    if name is not None:
+        entry["name"] = (name or "").strip() or entry.get("name") or provider_id
+    if base_url is not None:
+        cleaned = (base_url or "").strip().rstrip("/")
+        if not (cleaned.startswith("http://") or cleaned.startswith("https://")):
+            raise ValueError("Base URL 必须以 http:// 或 https:// 开头")
+        entry["base_url"] = cleaned
+    if models is not None:
+        parsed = _parse_models_text(models)
+        if not parsed:
+            raise ValueError("模型列表为空")
+        entry["models"] = parsed
+    if enabled is not None:
+        entry["enabled"] = bool(enabled)
+    if requests_per_minute is not None or tokens_per_minute is not None:
+        rate = dict(entry.get("rate_limit") or {})
+        if requests_per_minute is not None:
+            rate["requests_per_minute"] = int(requests_per_minute)
+        if tokens_per_minute is not None:
+            rate["tokens_per_minute"] = int(tokens_per_minute)
+        entry["rate_limit"] = rate
+
+    custom["providers"] = [
+        entry if (isinstance(e, dict) and e.get("id") == provider_id) else e
+        for e in (custom.get("providers") or [])
+    ]
+    save_custom_config(paths.root / "providers.yaml", custom)
+
+    if api_key:
+        ref = entry.get("auth") and entry["auth"].get("api_key_ref")
+        if ref:
+            outcome = _secret_store(paths).set(str(ref), api_key)
+            if not outcome.get("ok"):
+                raise ValueError(outcome.get("message") or "密钥保存失败")
+
+    return {"ok": True, "provider": provider_id}
+
+
+def delete_provider(paths: Paths, provider_id: str) -> dict[str, Any]:
+    """从设置页删除自定义服务商。
+
+    被任务绑定引用的服务商不能删——删了下一个任务会找不到 provider，
+    那属于「静默失效」。拒绝并说明比删除更友好。
+    """
+    from workshop.config import load_config, save_custom_config
+
+    cfg = load_config(paths.root / "providers.yaml")
+    bindings = cfg.task_bindings or {}
+    for task, binding in bindings.items():
+        if isinstance(binding, dict) and str(binding.get("provider") or "") == provider_id:
+            raise ValueError(
+                f"任务绑定「{task}」正在使用 {provider_id}，"
+                "请先在设置页把默认模型换到别的服务商再删除"
+            )
+
+    custom = _load_custom(paths)
+    before = len(custom.get("providers") or [])
+    custom["providers"] = [
+        e for e in (custom.get("providers") or [])
+        if not (isinstance(e, dict) and e.get("id") == provider_id)
+    ]
+    if len(custom["providers"]) == before:
+        raise ValueError(f"custom-providers.yaml 里没有服务商 {provider_id}，无需删除")
+    save_custom_config(paths.root / "providers.yaml", custom)
+    return {"ok": True, "provider": provider_id}
+
+
+def save_default_binding(paths: Paths, *, provider: str, model: str | None = None) -> dict[str, Any]:
+    """设置「默认模型」：把逐章标注绑定的 provider/model 写进 custom 配置。
+
+    界面上显示成「默认模型」——所有任务（标注/大纲/实体）没单独指定时
+    都回退到它。这决定了「用户自己选择使用哪个模型」落在哪里。
+    """
+    from workshop.config import load_config, save_custom_config
+
+    cfg = load_config(paths.root / "providers.yaml")
+    provider_obj = cfg.get_provider(provider)
+    if provider_obj is None:
+        raise ValueError(f"配置里找不到服务商 {provider}")
+    if model:
+        if provider_obj.model(model) is None:
+            available = "、".join(provider_obj.model_ids[:10]) or "（无）"
+            raise ValueError(f"{provider} 下没有模型 {model}，可用：{available}")
+    else:
+        try:
+            from workshop.config import resolve_default_model
+
+            model = resolve_default_model(cfg, provider_obj)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+
+    custom = _load_custom(paths)
+    bindings = dict(custom.get("task_bindings") or {})
+    bindings["chapter_annotation"] = {"provider": provider, "model": model}
+    custom["task_bindings"] = bindings
+    save_custom_config(paths.root / "providers.yaml", custom)
+    return {"ok": True, "provider": provider, "model": model}
+
+
+def _load_custom(paths: Paths) -> dict[str, Any]:
+    """读 custom-providers.yaml 的原始内容（不会走合并逻辑）。"""
+    from workshop.config import custom_config_path
+
+    path = custom_config_path(paths.root / "providers.yaml")
+    if not path.exists():
+        return {}
+    import yaml
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_models_text(lines: list[str]) -> list[dict[str, Any]]:
+    """把文本行解析成 models 条目。每行：「别名 | 模型id」或只有 id。"""
+    out: list[dict[str, Any]] = []
+    for raw in lines or []:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if "|" in line:
+            alias, _, mid = line.partition("|")
+            alias, mid = alias.strip(), mid.strip()
+        else:
+            mid, alias = line.strip(), line.strip()
+        if not mid:
+            continue
+        out.append({
+            "id": mid,
+            "alias": alias or mid,
+            "role": "main" if not out else "trial",
+            "capabilities": {"structured_output": True},
+        })
+    return out
 
 
 def save_provider_key(paths: Paths, provider_id: str, value: str) -> dict[str, Any]:
@@ -1055,6 +1310,7 @@ def test_provider(paths: Paths, provider_id: str, *, model_id: str | None = None
         timeout_sec=30,
         auth_scheme=provider.auth_scheme,
         secrets=store.known_values,
+        rate_limit=provider.rate_limit,
     )
 
     # ① 端点与鉴权
@@ -1157,6 +1413,7 @@ def probe_provider(paths: Paths, provider_id: str, *, model_id: str | None = Non
         timeout_sec=opts.timeout_sec,
         auth_scheme=provider.auth_scheme,
         secrets=store.known_values,
+        rate_limit=provider.rate_limit,
     )
     report = run_probe(
         client=client,
@@ -1355,6 +1612,7 @@ def start_entities(
         timeout_sec=180,
         auth_scheme=provider.auth_scheme,
         secrets=store.known_values,
+        rate_limit=provider.rate_limit,
     )
     out_dir = paths.work_dir(name) / "50-entities"
     state: dict[str, Any] = {"running": True, "done": 0, "total": plan.blocks, "label": "", "error": ""}
@@ -1512,6 +1770,7 @@ def start_outline(
         timeout_sec=120,
         auth_scheme=provider.auth_scheme,
         secrets=store.known_values,
+        rate_limit=provider.rate_limit,
     )
     out_dir = paths.work_dir(name) / "40-outline"
 

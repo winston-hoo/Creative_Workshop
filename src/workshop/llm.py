@@ -176,6 +176,7 @@ class OpenAICompatProvider:
         auth_scheme: str = "bearer",
         session: requests.Session | None = None,
         secrets: Iterable[str] | None = None,
+        rate_limit: dict | None = None,
     ) -> None:
         if not base_url:
             raise ValueError("base_url 为空，无法建立调用")
@@ -185,6 +186,11 @@ class OpenAICompatProvider:
         self.auth_scheme = (auth_scheme or "bearer").lower()
         self.secrets = list(secrets or [])
         self.session = session or requests.Session()
+        # 客户端限速器：腾讯云这类服务商在控制台明示每分钟请求上限，
+        # 超了直接 429。所以在这里按配置排队放行，而不是等上游报错再猜。
+        from .ratelimit import build_rate_limiter
+
+        self.rate_limiter = build_rate_limiter(rate_limit)
 
     # ── 基础设施 ────────────────────────────────────────────
 
@@ -203,6 +209,13 @@ class OpenAICompatProvider:
         return (min(10.0, self.timeout_sec), self.timeout_sec)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        # 客户端限速：在发起请求前排队拿额度。超时（等不到放行）会抛
+        # RateLimitExceeded，这里转成 ApiError(RATE_LIMITED) 统一错误形状。
+        if self.rate_limiter is not None:
+            try:
+                self.rate_limiter.acquire()
+            except Exception as exc:  # noqa: BLE001
+                raise ApiError(ErrorKind.RATE_LIMITED, message=str(exc)) from exc
         url = f"{self.base_url}{path}"
         try:
             resp = self.session.request(
@@ -222,7 +235,15 @@ class OpenAICompatProvider:
             return
         raw = resp.text or ""
         kind = classify_http_status(resp.status_code, raw)
-        raise ApiError(kind, status=resp.status_code, body=raw)
+        # 429 时上游通常会带 Retry-After：服务商自己给出的等待秒数。
+        # 带上它，错误信息与重试策略都更准确，而不是只给一句「触发限流」。
+        retry_after: str | None = None
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+        message = ""
+        if kind == ErrorKind.RATE_LIMITED and retry_after:
+            message = f"上游限流，建议等待 {retry_after} 秒后重试"
+        raise ApiError(kind, status=resp.status_code, body=raw, message=message)
 
     # ── 能力 ────────────────────────────────────────────────
 

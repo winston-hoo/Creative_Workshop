@@ -305,6 +305,74 @@ def api_settings() -> dict:
     return services.settings_overview(PATHS)
 
 
+class ProviderRequest(BaseModel):
+    name: str = Field("", description="自定义名称，如「我的中转站」")
+    base_url: str = Field("", description="OpenAI 兼容端点地址")
+    models: list[str] = Field(default_factory=list, description="模型列表，每行「别名 | 模型id」")
+    api_key: str = Field("", description="密钥明文，只写入不回显")
+    requests_per_minute: int | None = Field(None, ge=0, description="每分钟请求上限，0/None 表示不限制")
+    tokens_per_minute: int | None = Field(None, ge=0, description="每分钟 token 上限，0/None 表示不限制")
+    enabled: bool = True
+
+
+@app.post("/api/settings/providers")
+def api_create_provider(req: ProviderRequest) -> dict:
+    """设置页新增服务商（中转站、本地兼容端点等）。"""
+    try:
+        return services.create_provider(
+            PATHS,
+            name=req.name,
+            base_url=req.base_url,
+            models=req.models,
+            api_key=req.api_key,
+            requests_per_minute=req.requests_per_minute,
+            tokens_per_minute=req.tokens_per_minute,
+            enabled=req.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/settings/providers/{provider_id}")
+def api_update_provider(provider_id: str, req: ProviderRequest) -> dict:
+    try:
+        return services.update_provider(
+            PATHS,
+            safe_name(provider_id),
+            name=req.name,
+            base_url=req.base_url,
+            models=req.models,
+            api_key=req.api_key,
+            requests_per_minute=req.requests_per_minute,
+            tokens_per_minute=req.tokens_per_minute,
+            enabled=req.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/settings/providers/{provider_id}")
+def api_delete_provider(provider_id: str) -> dict:
+    try:
+        return services.delete_provider(PATHS, safe_name(provider_id))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class BindingRequest(BaseModel):
+    provider: str = Field(..., description="默认服务商 id")
+    model: str | None = Field(None, description="默认模型 id，缺省时按服务商默认规则选")
+
+
+@app.put("/api/settings/binding")
+def api_save_binding(req: BindingRequest) -> dict:
+    """设置「默认模型」：没单独指定模型的任务都用它。"""
+    try:
+        return services.save_default_binding(PATHS, provider=req.provider, model=req.model)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.put("/api/settings/providers/{provider_id}/key")
 def api_save_key(provider_id: str, req: KeyRequest) -> dict:
     try:
@@ -381,9 +449,13 @@ def api_entities_plan(
 def api_entities_start(
     name: str,
     block_size: int = Query(DEFAULT_BLOCK_SIZE, ge=5, le=200),
+    provider: str | None = Query(None),
+    model: str | None = Query(None),
 ) -> dict:
     try:
-        return services.start_entities(PATHS, safe_name(name), block_size=block_size)
+        return services.start_entities(
+            PATHS, safe_name(name), block_size=block_size, provider_id=provider, model_id=model
+        )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
 

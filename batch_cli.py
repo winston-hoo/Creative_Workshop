@@ -343,6 +343,7 @@ def _execute(args, dirs, cfg, provider, model_id, primitives, work, plan) -> int
         timeout_sec=opts.timeout_sec,
         auth_scheme=provider.auth_scheme,
         secrets=secrets_store.known_values,
+        rate_limit=provider.rate_limit,
     )
 
     ledger = None

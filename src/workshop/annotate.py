@@ -157,6 +157,9 @@ def annotate_chapter(
     latency_ms = 0.0
     raw_response = ""
     last_error: dict[str, Any] | None = None
+    # 中转站等自称 OpenAI 兼容但不认 json_object 的服务商：首调用 json 模式，
+    # 撞上 BAD_REQUEST 就把 response_format 去掉重试（提示词仍然要求 JSON）。
+    json_mode = True
 
     for attempt in range(1, max(1, opts.max_attempts) + 1):
         attempts = attempt
@@ -166,7 +169,7 @@ def annotate_chapter(
                 messages,
                 max_tokens=opts.max_tokens,
                 temperature=opts.temperature,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"} if json_mode else None,
                 extra=extra_body,
             )
         except ApiError as exc:
@@ -178,6 +181,8 @@ def annotate_chapter(
                 "hint": hint_for(exc.kind),
                 "detail": exc.safe_body(client.secrets),
             }
+            if json_mode and exc.kind in (ErrorKind.BAD_REQUEST, ErrorKind.RESPONSE_UNPARSABLE):
+                json_mode = False
             continue
 
         latency_ms = result.total_ms

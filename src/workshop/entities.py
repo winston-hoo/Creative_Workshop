@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .batch import ChapterTask
+from .errors import ErrorKind  # noqa: F401
 from .llm import ApiError, ChatResult, OpenAICompatProvider, build_thinking_extra, extract_json_object
 from .secrets import redact
 
@@ -177,8 +178,13 @@ def _call(
     extra = build_thinking_extra(opts.thinking, None)
     last_error = ""
     usage_total: dict[str, int] = {}
-    for _attempt in range(1, max(1, opts.max_attempts) + 1):
+    # 中转站等部分服务商虽然自称 OpenAI 兼容，却不认 response_format=json_object，
+    # 首调用它会在 BAD_REQUEST 上直接失败。第一次撞上就记住，本块后续重试
+    # 改用「提示词约束 + 解析」的降级路径再试（extract_json_object 仍能抠 JSON）。
+    json_mode = True
+    for attempt in range(1, max(1, opts.max_attempts) + 1):
         try:
+            fmt = {"type": "json_object"} if json_mode else None
             result: ChatResult = client.chat(
                 model_id,
                 [
@@ -187,11 +193,21 @@ def _call(
                 ],
                 max_tokens=opts.max_tokens,
                 temperature=opts.temperature,
-                response_format={"type": "json_object"},
+                response_format=fmt,
                 extra=extra,
             )
         except ApiError as exc:
             last_error = f"{exc.kind.value}：{exc.safe_body(client.secrets)}"
+            if json_mode and exc.kind in (ErrorKind.BAD_REQUEST, ErrorKind.RESPONSE_UNPARSABLE):
+                # json_object 不认 → 降级为提示词约束
+                json_mode = False
+                continue
+            if exc.kind == ErrorKind.RATE_LIMITED:
+                # 429：等一小段再试（客户端限速器已处理大部分，这里是兜底）
+                import time
+
+                time.sleep(min(2.0 * attempt, 15.0))
+                continue
             continue
         if result.usage:
             for key, value in result.usage.to_dict().items():
