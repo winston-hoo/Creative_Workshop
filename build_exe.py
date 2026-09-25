@@ -37,6 +37,8 @@ def build_args() -> list[str]:
         "--add-data", f"{ROOT / 'server' / 'static'}{os.pathsep}server/static",
         # 上传接口靠它，FastAPI 里是延迟导入，静态分析抓不到
         "--hidden-import", "multipart",
+        # 内置技法库：craft.py 按 <模块目录>/craft 找它，是 .md 不是 .py，抓不到
+        "--add-data", f"{ROOT / 'src' / 'workshop' / 'craft'}{os.pathsep}workshop/craft",
     ]
     # 配置模板：首次启动由 launcher.py 铺到用户数据目录
     for name in SEEDS:

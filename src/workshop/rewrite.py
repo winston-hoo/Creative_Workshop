@@ -51,7 +51,7 @@ DIRECTIVES = ["改视角", "扩写", "精简", "调节奏", "强化动机"]
 _LEN_LO, _LEN_HI = 0.5, 2.5
 _DIRECTIVE_LEN_LO, _DIRECTIVE_LEN_HI = 0.2, 5.0
 
-_STYLE_WEIGHTS = {1: "low", 2: "medium", 3: "high"}  # 风格违规 1 处=low，2-4=medium，5+=high
+_STYLE_WEIGHTS = {1: "low", 2: "medium", 3: "high"}  # 1 处=low，2 处=medium，3 处及以上=high（见下方 min(n, 3)）
 _SEV_RANK = {"low": 0, "medium": 1, "high": 2}
 
 

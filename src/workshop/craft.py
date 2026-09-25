@@ -2,20 +2,19 @@
 
 ## 为什么不整包塞进提示词
 
-技法库 83 KB（13 篇）。全塞进去的话，光技法就比设定集 + 卷表 + 本章指令加起来还大好几倍——
-输入预算被技法吃掉，模型反而看不清"这一章到底要写什么"。所以这里做的是**按需检索**：
+技法库 12 篇，全塞进去仍然比设定集 + 卷表 + 本章指令加起来大——输入预算被技法吃掉，
+模型反而看不清"这一章到底要写什么"。所以这里做的是**按需检索**：
 开篇章给黄金开篇，有对话给对话规范，章末永远给悬念钩子。
 
-## 这些内容不是本项目原创
+## 篇目从哪来
 
-`craft/` 里是从外部技能包原样收录的写作技法参考，来源与版权说明见 `craft/SOURCES.md`。
-本模块只负责**检索与预算控制**，不改写原文——改写了就没法跟原出处对照，
-将来要换、要删、要核许可都无从下手。
+- **内置**：`craft/*.md`，本项目自己写的，随仓库与 exe 一起走。
+- **外部**：数据根下的 `craft/`（源码方式是项目根目录，exe 是
+  `%LOCALAPPDATA%\\创作工坊\\craft`）。放在这里的同名篇目**覆盖内置**——
+  想接别处的技法库，把文件放进去就行，不用改代码。外部包不进 git，也不进 exe。
 
-⚠️ 因此这些文件**不入库**（`.gitignore` 里的 `src/workshop/craft/*`）：那份技能声明
-内容版权归原作者所有，本项目只在本机自用范围内参考。公开仓库里只有
-`craft/README.md`，说明怎么自己补一份。文件不在时 `pick()` / `read()` 全部返回空，
-生成与审稿少一段技法参考，其余功能不受影响。
+两处都没有这份篇目时 `pick()` / `read()` 返回空，生成与审稿少一段技法参考，
+其余功能不受影响。
 
 ## 为什么预算超了要点名
 
@@ -25,6 +24,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +72,8 @@ CATALOG: dict[str, dict[str, Any]] = {
     "content-expansion": {
         "label": "内容扩充技巧",
         "when": "目标字数写不够的时候",
+        # ponytail: pick() 还没读 on_short / on_new_character（要字数缺口与「新人物」信号），
+        # 这两篇目前只在 available() 里有份，谁也选不到。接上信号时补这两条分支。
         "on_short": True,
         "order": 40,
     },
@@ -92,20 +94,38 @@ CATALOG: dict[str, dict[str, Any]] = {
     "review-dimensions": {"label": "章节审查维度", "when": "审稿时（不给生成用）", "review_only": True, "order": 96},
 }
 
-# 技法库不能喧宾夺主：它最多占输入的这个量级。设定集与本章指令加起来才几百到几千字，
-# 技法给到 6000 字已经能覆盖几篇；再多就是拿技法压住了"这一章要写什么"。
-DEFAULT_CRAFT_BUDGET = 6000
+# 预算是「别让技法压住这一章要写什么」的闸门，但也不该把该给的篇目砍掉：
+# 一章最多会选到 4 篇 always + 黄金开篇 + 对话规范 + 承接，加起来约 9200 字。
+# 上限取 10000 —— 最长的一次选择装得下，其余情况照旧按预算裁。
+# `tests/test_craft.py` 有断言兜住这条：哪天加篇目把最长选择顶出去，测试会红。
+DEFAULT_CRAFT_BUDGET = 10000
+
+
+def _external_dir() -> Path | None:
+    """外部技法包目录：数据根下的 `craft/`，与 `server.main` 认的根同一个来源。"""
+    root = Path(os.environ.get("WORKSHOP_ROOT") or Path(__file__).resolve().parent.parent.parent)
+    path = (root / "craft").resolve()
+    return None if path == CRAFT_DIR else path
+
+
+def _path(name: str) -> Path | None:
+    """这份篇目实际该读哪个文件：外部包优先，内置兜底。"""
+    external = _external_dir()
+    for candidate in ((external / f"{name}.md") if external else None, CRAFT_DIR / f"{name}.md"):
+        if candidate is not None and candidate.exists():
+            return candidate
+    return None
 
 
 def available() -> list[str]:
-    """仓库里实际有的技法篇目（按 CATALOG 排序）。"""
-    return [name for name in sorted(CATALOG, key=lambda k: CATALOG[k]["order"])
-            if (CRAFT_DIR / f"{name}.md").exists()]
+    """实际有的技法篇目（按 CATALOG 排序）。"""
+    return sorted((name for name in CATALOG if _path(name)),
+                  key=lambda k: CATALOG[k]["order"])
 
 
 def read(name: str) -> str:
-    path = CRAFT_DIR / f"{name}.md"
-    return path.read_text(encoding="utf-8") if path.exists() else ""
+    path = _path(name)
+    return path.read_text(encoding="utf-8") if path else ""
 
 
 def pick(
