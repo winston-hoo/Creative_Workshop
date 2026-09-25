@@ -1,0 +1,19 @@
+# 全仓库统一：按 LF 存，也按 LF 检出。
+#
+# 起因（2026-09-25 实测）：Git for Windows 默认 core.autocrlf=true，
+# CI 在 windows runner 上从零 clone 时把 .md 的 LF 转成 CRLF。
+# 于是同一个 tag 打出来的 exe 和本地不是同一份：技法库 12 篇每行多一个 CR
+# （chapter-guide.md 4034 → 4097 字节），craft.py 按字符数算的技法预算也跟着涨。
+# 定死 eol=lf 之后，本地与 CI 的打包输入逐字节一致。
+* text=auto eol=lf
+
+# 二进制：别让 git 去猜，也免得多一层转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.zip binary
+*.woff binary
+*.woff2 binary
