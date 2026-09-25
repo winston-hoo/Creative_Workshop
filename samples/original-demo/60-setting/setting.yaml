@@ -1,0 +1,74 @@
+# 设定集 · 关山灯（M9 手填样板 · 6 章完整版）
+#
+# 这不是任何真实作品，只是给 --new 出来的骨架填一版，用来验证三层链路能跑通。
+# 真写书时把 60-setting/setting.yaml 照这个形状填自己的。
+
+schema_version: setting-v1
+
+work: original-demo
+genre: 玄幻
+
+logline: "一个能看到别人修为数值的零层废柴，靠这点眼力在修真界先活下来再说。"
+core_motive: "活着回去"
+
+target:
+  chapters: 6
+  chars_per_chapter: [2800, 4000]
+
+style:
+  perspective: 第三限知
+  tone: 冷幽默，克制，不煽情
+  taboo: ["不用破折号", "不写李默的第一人称内心独白"]
+
+world:
+  era: 天元三百年
+  places:
+    - {name: 青云宗, note: 修真界第一大宗，外门比内门还挤}
+    - {name: 柴房, note: 外门最末等的住处，冬天冻死人}
+  rules:
+    - "修为数值只能看，不能改"
+    - "零层的人碰不到任何灵气，但也不会被灵气反噬"
+
+power:
+  system: 修为
+  tiers: [炼气, 筑基, 金丹, 元婴]
+
+factions:
+  - name: 青云宗
+    stance: 表面中立，内部按修为分层
+    leader: 玄阳真人
+
+characters:
+  - name: 李默
+    role: 主角
+    identity: 穿越者，青云宗外门柴房杂役
+    personality: 嘴上认怂，心里算账
+    motive: 活着回去
+    arc: 从只想自保到愿意为别人出头
+    abilities: [数值之眼]
+    faction: 青云宗
+    relations:
+      - {to: 苏清月, type: 师姐}
+      - {to: 玄阳真人, type: 被暗中观察}
+  - name: 苏清月
+    role: 重要配角
+    identity: 青云宗内门大师姐
+    personality: 表面冷淡，见不得人欺负弱小
+    motive: 守住宗门
+    faction: 青云宗
+    relations:
+      - {to: 李默, type: 师姐}
+  - name: 玄阳真人
+    role: 导师
+    identity: 青云宗宗主
+    personality: 不爱说话，看人极准
+    motive: 渡劫
+    faction: 青云宗
+    relations:
+      - {to: 李默, type: 暗中观察}
+
+terms:
+  - {term: 数值之眼, meaning: 能看到目标的修为数值，看不到别的}
+  - {term: 零层, meaning: 一点修为都没有的人}
+
+themes: [活着本身就是本事]

@@ -130,10 +130,14 @@ def build_k2(
     person_rows: list[dict[str, Any]] = []
     for c in characters:
         name = str(c.get("name") or "")
+        # 别名也算出场。只认正名的话，「出场章数」量的是名字拼写而不是人——
+        # 张老师一个人 164 章，加上张老鳖/张教授才是他真正的在场长度。
+        also = [str(a) for a in (c.get("aliases") or []) if str(a).strip()]
+        needles = [n for n in [name, *also] if len(n) >= MIN_NAME_LEN]
         appearance_chapters: list[int] = []
         for cid in order:
             body = corpus.get(cid, "")
-            if name and len(name) >= MIN_NAME_LEN and name in body:
+            if needles and any(n in body for n in needles):
                 no = chap_no_of.get(cid)
                 if no is not None:
                     appearance_chapters.append(no)
@@ -143,6 +147,7 @@ def build_k2(
         person_rows.append(
             {
                 "name": name,
+                "aliases": also,
                 "role": c.get("role"),
                 "identity": c.get("identity"),
                 "first_chapter": c.get("first_chapter"),
@@ -217,7 +222,7 @@ def build_k2(
 
     return {
         "person": {
-            "note": "出场章来自实体词表与正文的包含匹配（纯脚本）。名字过短或太泛的不会列出。",
+            "note": "出场章来自实体词表与正文的包含匹配（纯脚本），别名一并计入。名字过短或太泛的不会列出。",
             "count": len(person_rows),
             "rows": person_rows[:400],
         },
@@ -469,11 +474,12 @@ def render_markdown(result: dict[str, Any]) -> str:
     person = k2.get("person") or {}
     if person.get("rows"):
         lines.append("## 人物出场")
-        lines.append("| 人物 | 定位 | 出场章数 | 首次 | 最后 |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| 人物 | 别名 | 定位 | 出场章数 | 首次 | 最后 |")
+        lines.append("|---|---|---|---|---|---|")
         for r in person["rows"][:60]:
+            also = "、".join(r.get("aliases") or []) or "—"
             lines.append(
-                f"| {r['name']} | {r.get('identity') or r.get('role') or '—'} | "
+                f"| {r['name']} | {also} | {r.get('identity') or r.get('role') or '—'} | "
                 f"{r['appearance_count']} | 第{r['first_seen']}章 | 第{r['last_seen']}章 |"
             )
     else:

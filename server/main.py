@@ -806,6 +806,264 @@ def api_report(
         raise HTTPException(400, str(exc)) from exc
 
 
+# ── M9 创作台 ───────────────────────────────────────────────
+#
+# 只有读、写、校验三类接口。**故意没有"一键生成三层"**：创作要一步步调，
+# 一次吐一大堆，改起来等于全废。将来接模型时也只做单份生成 + 计划预览 + 显式确认。
+
+
+class CreationNewBody(BaseModel):
+    name: str
+    genre: str = ""
+    logline: str = ""
+    protagonist: str = ""
+    core_motive: str = ""
+
+
+class CreationWriteBody(BaseModel):
+    text: str | None = None
+    # 表单保存走结构化：界面给对象，服务端写 YAML。
+    # 和 text 二选一——text 保留手写注释，data 是机器生成（会丢注释，文件头有说明）。
+    data: dict | None = None
+
+
+class AssistBody(BaseModel):
+    message: str = ""
+    history: list[dict] = Field(default_factory=list)
+    refs: list[str] = Field(default_factory=list)
+    # none 不注入 / k3 只结构指纹 / full 全素材（默认）
+    level: str = "full"
+    # setting / volume / brief —— 三层共用同一个提案引擎
+    layer: str = "setting"
+    key: str = ""
+    provider: str | None = None
+    model: str | None = None
+    max_tokens: int = 2000
+    # 空 = 起草；writeback = 回填（拿这一章的正文提事实，message 会被忽略）
+    task: str = ""
+
+
+class AssistApplyBody(BaseModel):
+    document: dict
+    proposals: list[dict] = Field(default_factory=list)
+    accepted: list[int] = Field(default_factory=list)
+    layer: str = "setting"
+
+
+@app.post("/api/creation/new")
+def api_creation_new(body: CreationNewBody) -> dict:
+    """新建原创工作区。已存在则拒绝——里面可能已经有几十万字稿子。"""
+    try:
+        return services.creation_new(
+            PATHS,
+            safe_name(body.name),
+            genre=body.genre,
+            logline=body.logline,
+            protagonist=body.protagonist,
+            core_motive=body.core_motive,
+        )
+    except FileExistsError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation")
+def api_creation_overview(name: str) -> dict:
+    """创作台首页：三层完成度 + 逐卷逐章清单。纯脚本。"""
+    try:
+        return services.creation_overview(PATHS, safe_name(name))
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/assist/plan")
+def api_assist_plan(
+    name: str,
+    refs: str = Query("", description="逗号分隔的参照作品名"),
+    level: str = Query("full", description="none / k3 / full"),
+    layer: str = Query("setting", description="setting / volume / brief"),
+    key: str = Query("", description="volume 的卷号或 brief 的章节号"),
+    provider: str | None = Query(None),
+    model: str | None = Query(None),
+) -> dict:
+    """助手的免费计划：多少 token、多少钱、注入了多少素材。**不调模型。**"""
+    try:
+        return services.setting_assist_plan(
+            PATHS, safe_name(name), refs=[r for r in refs.split(",") if r], level=level,
+            layer=layer, key=key, provider_id=provider, model_id=model,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/assist")
+def api_assist(name: str, body: AssistBody) -> dict:
+    """问一次助手（**会花钱**）。只返回提案，不写任何文件。
+
+    `task="writeback"` 时不看 message：拿 key（章节号）那一章的正文去回填设定集。
+    """
+    try:
+        return services.run_setting_assist(
+            PATHS, safe_name(name), message=body.message, history=body.history,
+            refs=body.refs, level=body.level, layer=body.layer, key=body.key,
+            provider_id=body.provider, model_id=body.model, max_tokens=body.max_tokens,
+            task=body.task,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/assist/apply")
+def api_assist_apply(name: str, body: AssistApplyBody) -> dict:
+    """把勾中的提案并进草稿。纯脚本，不落盘——落盘是作者点保存之后的事。"""
+    try:
+        services._creation_work_dir(PATHS, safe_name(name))
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return services.apply_setting_proposals(
+        document=body.document, proposals=body.proposals,
+        accepted=body.accepted, layer=body.layer,
+    )
+
+
+class DraftGenerateBody(BaseModel):
+    refs: list[str] = Field(default_factory=list)
+    level: str = "k3"
+    provider: str | None = None
+    model: str | None = None
+    max_tokens: int = 8000
+    temperature: float = 0.8
+
+
+class DraftWriteBody(BaseModel):
+    text: str
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/plan")
+def api_draft_plan(
+    name: str, chapter_id: str,
+    refs: str = Query(""),
+    level: str = Query("k3"),
+    provider: str | None = Query(None),
+    model: str | None = Query(None),
+) -> dict:
+    """写这一章的免费计划。**不调模型。** 设定集或指令有阻断时 ready=False。"""
+    try:
+        return services.draft_plan(
+            PATHS, safe_name(name), chapter_id,
+            refs=[r for r in refs.split(",") if r], level=level,
+            provider_id=provider, model_id=model,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}")
+def api_draft_generate(name: str, chapter_id: str, body: DraftGenerateBody) -> dict:
+    """写这一章（**会花钱**）。只出一章，跑完落盘并自检，不往下串。"""
+    try:
+        return services.run_draft(
+            PATHS, safe_name(name), chapter_id, refs=body.refs, level=body.level,
+            provider_id=body.provider, model_id=body.model,
+            max_tokens=body.max_tokens, temperature=body.temperature,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}")
+def api_draft_read(name: str, chapter_id: str) -> dict:
+    """读已写的正文，并**按当前指令重跑一次自检**（指令改过，结论要跟着变）。"""
+    try:
+        return services.read_draft(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/works/{name}/creation/draft/{chapter_id}")
+def api_draft_write(name: str, chapter_id: str, body: DraftWriteBody) -> dict:
+    """作者手改过的正文存回去。空文本不许覆盖有内容的文件。"""
+    try:
+        return services.write_draft_text(PATHS, safe_name(name), chapter_id, body.text)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class KbImportBody(BaseModel):
+    ref: str
+    section: str
+    keys: list[str] = Field(default_factory=list)
+    document: dict
+    layer: str = "setting"
+    subject: str = ""
+
+
+@app.get("/api/works/{name}/creation/foreshadows")
+def api_foreshadows(name: str) -> dict:
+    """伏笔账本：埋了哪些、推到哪一步、哪些该收还没收。纯脚本，零成本。"""
+    try:
+        return {"ledger": services.foreshadow_ledger(PATHS, safe_name(name))}
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/kb/{ref}")
+def api_kb_browse(name: str, ref: str, section: str = Query("characters"),
+                  q: str = Query("")) -> dict:
+    """翻某一本已入库作品的知识库（人物/势力/能力/地点/术语/关系）。纯读，零成本。"""
+    try:
+        services._creation_work_dir(PATHS, safe_name(name))
+        return services.kb_browse(PATHS, ref, section, q)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/kb-import")
+def api_kb_import(name: str, body: KbImportBody) -> dict:
+    """把勾中的知识库条目转成提案并进草稿。**不调模型，不落盘。**"""
+    try:
+        services._creation_work_dir(PATHS, safe_name(name))
+        return services.kb_import(
+            PATHS, safe_name(name), body.ref, body.section,
+            keys=body.keys, document=body.document, layer=body.layer, subject=body.subject,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/{kind}")
+def api_creation_read(name: str, kind: str, key: str = Query("")) -> dict:
+    """读一份原文 + 校验。kind = setting / volume / brief。"""
+    try:
+        return services.creation_read(PATHS, safe_name(name), kind, key)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/works/{name}/creation/{kind}")
+def api_creation_write(name: str, kind: str, body: CreationWriteBody, key: str = Query("")) -> dict:
+    """保存一份原文。解析不了就不落盘，把错误回给界面。"""
+    try:
+        work = safe_name(name)
+        if body.data is not None:
+            if kind not in services.CREATION_KINDS:
+                raise ValueError(f"不认识的层：{kind}")
+            return services.creation_write_setting_data(PATHS, work, body.data, kind=kind, key=key)
+        if body.text is None:
+            raise ValueError("要么给 text（原文），要么给 data（结构化）")
+        return services.creation_write(PATHS, work, kind, key, body.text)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/seed-briefs")
+def api_creation_seed_briefs(name: str, vol: int | None = Query(None, ge=1, le=9999)) -> dict:
+    """按卷表播种**空白**逐章指令骨架。不调模型，不覆盖已存在的文件。"""
+    try:
+        return services.creation_seed_briefs(PATHS, safe_name(name), vol)
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 # ── 导入向导 ────────────────────────────────────────────────
 
 

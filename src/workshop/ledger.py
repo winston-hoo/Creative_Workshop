@@ -42,6 +42,11 @@ ACTION_RECOVER = "回收"
 # 而真正不同的两条伏笔通常落在 0.4 以下。
 PLANT_MATCH_THRESHOLD = 0.6
 
+# 给模型的未回收清单里，每 CONTEXT_STALE_SHARE 条留 1 条给「最久没动过」的伏笔。
+# 清单必须两段取样：只给最近的，早埋的线永远等不到「回收」；只给最早的（原实现），
+# 新埋的线模型根本看不见 —— 见 context_for_prompt 的说明。
+CONTEXT_STALE_SHARE = 4
+
 _PUNCT_RE = re.compile(r"[\s\W_]+", re.UNICODE)
 
 
@@ -155,10 +160,19 @@ class ApplyReport:
 class Ledger:
     """伏笔台账。使用方式：load → context_for_prompt → apply → save。"""
 
-    def __init__(self, work: str = "", next_seq: int = 1, items: list[ForeshadowItem] | None = None):
+    def __init__(
+        self,
+        work: str = "",
+        next_seq: int = 1,
+        items: list[ForeshadowItem] | None = None,
+        last_chapter_no: int | None = None,
+    ):
         self.work = work
         self.next_seq = next_seq
         self.items: list[ForeshadowItem] = items or []
+        # 跑到过的最大的章号。断点判定需要一个「现在到哪了」的基准，
+        # 没有它 stale_items 只能返回空——那会变成一个静默的假绿灯。
+        self.last_chapter_no = last_chapter_no
 
     # ── 持久化 ──────────────────────────────────────────
 
@@ -177,17 +191,21 @@ class Ledger:
             work=str(data.get("work") or ""),
             next_seq=int(data.get("next_seq") or 1),
             items=[ForeshadowItem.from_dict(i) for i in (data.get("items") or []) if isinstance(i, dict)],
+            last_chapter_no=data.get("last_chapter_no"),
         )
 
     def save(self, path: str | Path, *, stale_threshold: int = DEFAULT_STALE_THRESHOLD) -> Path:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        stale = self.stale_items(threshold=stale_threshold)
+        # 基准必须传进去。不传的话 stale_items 恒为空、疑似断点永远报 0，
+        # 而体检报告自己算出的却是几百条——同一个量在两处给出相反的答案。
+        stale = self.stale_items(current_chapter_no=self.last_chapter_no, threshold=stale_threshold)
         payload = {
             "schema_version": LEDGER_SCHEMA_VERSION,
             "work": self.work,
             "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "next_seq": self.next_seq,
+            "last_chapter_no": self.last_chapter_no,
             "statistics": {
                 "total": len(self.items),
                 "open": sum(1 for i in self.items if i.is_open),
@@ -217,9 +235,28 @@ class Ledger:
         """给模型的未回收伏笔清单。
 
         这属于**变量部分**，不是固定前缀——它每章都在变，放前缀里会让缓存全失效。
+
+        取样是「最近动过的」+「最久没动的」两段，**不能按创建顺序截前 limit 条**：
+        未回收条数是几百上千，截前面那一小撮等于让模型从此看不见新埋的线，
+        它只能把每条线索都当新伏笔重新登记。实测一本 545 章的书跑下来
+        797 条里 776 条只被埋设过一次，而进过清单的只有前 21 条——
+        多事件条目的下标恰好是 0..20，一个不多一个不少。
         """
+        open_items = self.open_items
+        if len(open_items) <= limit:
+            picked = list(open_items)
+        else:
+            # ponytail: 只按「动过的时间」粗排，不做语义相关性检索——
+            # 那要先有向量索引；等实测还出现明显的漏回收再上。
+            stale_slots = max(1, limit // CONTEXT_STALE_SHARE)
+            by_age = sorted(open_items, key=lambda i: (i.last_touched_chapter_no or 0, i.id))
+            recent = by_age[::-1][: limit - stale_slots]
+            seen = {i.id for i in recent}
+            stale = [i for i in by_age if i.id not in seen][:stale_slots]
+            picked = recent + stale
+
         out: list[dict[str, Any]] = []
-        for item in self.open_items[:limit]:
+        for item in picked:
             gap = None
             if chapter_no is not None and item.last_touched_chapter_no is not None:
                 gap = chapter_no - item.last_touched_chapter_no
@@ -367,6 +404,9 @@ class Ledger:
         只在明确知道这一章从未跑过时才该关。
         """
         report = ApplyReport()
+        if chapter_no is not None:
+            # 取最大值而不是直接赋值：重跑旧章不该让进度基准倒退。
+            self.last_chapter_no = max(self.last_chapter_no or 0, chapter_no)
         if replace_chapter:
             self.revert_chapter(chapter_id)
         claimed: set[str] = set()
@@ -447,7 +487,7 @@ class Ledger:
     # ── 视图 ────────────────────────────────────────────
 
     def summary(self) -> str:
-        stale = self.stale_items()
+        stale = self.stale_items(current_chapter_no=self.last_chapter_no)
         lines = [
             f"伏笔台账  {self.work or '(未命名)'}",
             f"  总数 {len(self.items)}   未回收 {len(self.open_items)}   "

@@ -1,0 +1,31 @@
+# 第 3 章创作任务指令 · v001-c0003
+
+schema_version: brief-v1
+work: original-demo
+chapter_id: v001-c0003
+vol: 1
+chapter_no: 3
+title: "柴房的规矩"
+one_line: "他摸清外门柴房的吃穿用度，发现没用的人活不过冬天。"
+core_plot:
+  - 柴房十七个人，按谁挑得动多少水排座次
+  - 李默零层，挑得最少，被排在最后一个打饭
+  - 他盯着每个人的头顶看数值，把管事的虚报记在心里
+  - 夜里同屋的老人咳嗽不止，没人管——他明白了这里的规矩
+timeline: "接第2章，当夜到次日。"
+word_target: [2800, 4000]
+narrative:
+  perspective: "第三限知"
+  tone: "冷幽默，克制，不煽情"
+  focus: ["柴房的等级秩序", "他忍住的那些话"]
+settings:
+  characters: [李默]
+  factions: [青云宗]
+  terms: [零层, 数值之眼]
+foreshadow:
+  - action: 埋设
+    id: F-002
+    desc: 管事虚报修为
+carry_over: []
+must_not:
+  - 不要写他出手救人（这一章他只能看）

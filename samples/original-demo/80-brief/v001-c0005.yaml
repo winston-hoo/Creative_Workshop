@@ -1,0 +1,31 @@
+# 第 5 章创作任务指令 · v001-c0005
+
+schema_version: brief-v1
+work: original-demo
+chapter_id: v001-c0005
+vol: 1
+chapter_no: 5
+title: "举手"
+one_line: "外门比试缺人，李默主动顶上，条件是换一床厚被。"
+core_plot:
+  - 外门月度比试缺一个人凑数，管事在柴房喊了半天没人应
+  - 李默举手，条件是换一床厚被，管事笑得直不起腰，答应了
+  - 他上场前把每个人的数值又看了一遍，包括对手的
+  - 他发现自己打不过任何一个，但对手的数值在出招时会掉
+timeline: "接第4章，隔五天，入冬第一场雪。"
+word_target: [2800, 4000]
+narrative:
+  perspective: "第三限知"
+  tone: "冷幽默，克制，不煽情"
+  focus: ["举手的那个瞬间", "他看出数值波动的那一眼"]
+settings:
+  characters: [李默]
+  factions: [青云宗]
+  terms: [数值之眼, 零层]
+foreshadow:
+  - action: 推进
+    id: F-002
+    desc: 他确认管事报的数比实际高
+carry_over: []
+must_not:
+  - 不要写他赢（这一章只是发现打法）

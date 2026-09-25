@@ -645,6 +645,116 @@ def test_entities_stop_without_job() -> None:
     cleanup()
 
 
+# ── M9 创作台 ───────────────────────────────────────────────
+
+CREATION_WORK = "创作台自检"
+
+
+def test_creation_desk_endpoints() -> None:
+    """创作台接口：能读、能改、解析不了不落盘、key 不能穿目录。
+
+    这一页是唯一一处「作者自己写的东西直接落盘」的入口，所以两条最要命：
+      · 解析不了的文本**绝不能**写进去——那会留下一份读不回来的文件，
+        而且要到生成阶段才发现；
+      · kind/key 直接来自 URL，必须先过白名单再拼路径。
+    """
+    print("创作台接口")
+
+    # 对非原创作品要明确拒绝，而不是给一页空状态让人猜
+    r = client.get(f"/api/works/{TEST_WORK}/creation")
+    check(r.status_code == 400, f"非原创作品被拒（{r.status_code}）")
+    check(bool(r.json().get("detail")), f"并且给了原因（{r.json().get('detail')}）")
+    check("原创" in r.json().get("detail", "") or "不存在" in r.json().get("detail", ""),
+          "原因指向「不是原创工作区」或「目录不存在」")
+
+    r = client.post("/api/creation/new", json={
+        "name": CREATION_WORK, "genre": "玄幻",
+        "logline": "一句话", "protagonist": "李默", "core_motive": "活着回去",
+    })
+    check(r.status_code == 200, f"新建原创工作区（{r.status_code}）")
+    work_dir = WS / CREATION_WORK
+    check((work_dir / "60-setting" / "setting.yaml").exists(), "设定集骨架落盘")
+    check((work_dir / "70-volume" / "volume-001.yaml").exists(), "第一卷骨架落盘")
+
+    again = client.post("/api/creation/new", json={"name": CREATION_WORK})
+    check(again.status_code == 400, "重复新建被拒（不覆盖已有稿件）")
+
+    # 空骨架应当是「有阻断」的状态，而不是假装正常
+    ov = client.get(f"/api/works/{CREATION_WORK}/creation").json()
+    check(ov["ok"] is False, "空工作区链路不通")
+    check(ov["setting"]["exists"] is True, "认出设定集已存在")
+    check(any("分卷目录" in e or "卷" in e for e in ov["errors"]), "报出了卷表的问题")
+
+    # 读原文
+    read = client.get(f"/api/works/{CREATION_WORK}/creation/setting").json()
+    check(read["exists"] and "schema_version" in read["text"], "读回设定集原文")
+    # 建工作区时把书名/题材/前提/主角/动机都给了，所以骨架本身是能开工的：
+    # 剩下的（篇幅/术语/主题）以**提示**形式列出来，不当阻断。
+    check(not read["errors"], f"给了基本字段的骨架没有阻断项（实际 {read['errors']}）")
+    check(read["warnings"], "剩下的待填项以提示形式列出")
+
+    # 写一段合法的设定集
+    good = (
+        "schema_version: setting-v1\nwork: " + CREATION_WORK + "\ngenre: 玄幻\n"
+        "logline: 一句话\ncore_motive: 活着回去\n"
+        "style: {perspective: 第三限知}\n"
+        "characters:\n  - {name: 李默, role: 主角, motive: 活着回去}\n"
+    )
+    w = client.put(f"/api/works/{CREATION_WORK}/creation/setting", json={"text": good}).json()
+    check(w["saved"] is True, "合法文本保存成功")
+    check(not w["errors"], f"保存后没有阻断项（实际 {w['errors']}）")
+
+    # 解析不了的文本绝不能落盘
+    before = (work_dir / "60-setting" / "setting.yaml").read_text(encoding="utf-8")
+    bad = client.put(
+        f"/api/works/{CREATION_WORK}/creation/setting", json={"text": "work: [没闭合\n"}
+    ).json()
+    check(bad["saved"] is False, "解析不了时不保存")
+    check(any("解析不了" in e for e in bad["errors"]), "并把解析错误回给界面")
+    after = (work_dir / "60-setting" / "setting.yaml").read_text(encoding="utf-8")
+    check(before == after, "磁盘上的原文一个字没动")
+
+    # key 是信任边界：卷号必须数字，章节 id 必须合约定
+    for kind, key in (("volume", "../../etc"), ("brief", "../../secret"), ("brief", "not-an-id"),
+                      ("setting", "x"), ("元数据", "")):
+        rr = client.get(f"/api/works/{CREATION_WORK}/creation/{kind}?key={key}")
+        check(rr.status_code == 400, f"{kind}/{key} 被拒（{rr.status_code}）")
+
+    # 播种逐章指令：只建空白骨架，且不覆盖已有文件
+    vol = (
+        "schema_version: volume-v1\nwork: " + CREATION_WORK + "\nvol:\n  vol: 1\n  title: 第一卷\n"
+        "  start_chapter: 1\n  end_chapter: 2\n"
+        "  parts:\n    - {title: 开场, start_chapter: 1, end_chapter: 2, gist: 开个头}\n"
+        "  chapters:\n"
+        "    - {chapter_no: 1, title: 第一章, gist: 发生了什么}\n"
+        "    - {chapter_no: 2, title: 第二章, gist: 又发生了什么}\n"
+    )
+    wv = client.put(f"/api/works/{CREATION_WORK}/creation/volume?key=1", json={"text": vol}).json()
+    check(wv["saved"] is True and not wv["errors"], f"卷表保存并校验通过（{wv['errors']}）")
+
+    seeded = client.post(f"/api/works/{CREATION_WORK}/creation/seed-briefs").json()
+    check(len(seeded["created"]) == 2, f"播下 2 份空白指令（实际 {seeded['created']}）")
+    # 填一份真的进去，再播一次：改过的不该被骨架覆盖
+    filled = (
+        "schema_version: brief-v1\nwork: " + CREATION_WORK + "\n"
+        "chapter_id: v001-c0001\nvol: 1\nchapter_no: 1\ntitle: 第一章\n"
+        "core_plot:\n  - 发生了一件事\nword_target: [2800, 4000]\n"
+    )
+    (work_dir / "80-brief" / "v001-c0001.yaml").write_text(filled, encoding="utf-8")
+    seeded2 = client.post(f"/api/works/{CREATION_WORK}/creation/seed-briefs").json()
+    check(not seeded2["created"], "第二次播种不新建（不覆盖改过的）")
+    kept = client.get(f"/api/works/{CREATION_WORK}/creation/brief?key=v001-c0001").json()
+    check("发生了一件事" in kept["text"], "改过的指令原文还在")
+
+    ov = client.get(f"/api/works/{CREATION_WORK}/creation").json()
+    check(ov["counts"]["chapters"] == 2 and ov["counts"]["briefs"] == 2, "逐章清单对齐卷表")
+    check(any(c["chapter_id"] == "v001-c0002" for c in ov["chapters"]), "清单里有第二章")
+
+    # 收尾：把自检工作区移出书架，不留在用户的列表里
+    client.post(f"/api/works/{CREATION_WORK}/archive", json={})
+    check(not work_dir.exists(), "自检工作区已移出书架")
+
+
 def main() -> int:
     print("=" * 58)
     print("工作台接口自检")
@@ -674,6 +784,7 @@ def main() -> int:
         test_annotate_plan_limit,
         test_annotate_status_before_run,
         test_report_without_annotations,
+        test_creation_desk_endpoints,
         test_chapter_detail_reads_text,
         test_chapter_raw_variant,
         test_chapter_unknown_id_404,

@@ -1,0 +1,38 @@
+# 第 2 章创作任务指令 · v001-c0002
+
+schema_version: brief-v1
+work: original-demo
+chapter_id: v001-c0002
+vol: 1
+chapter_no: 2
+title: "零层"
+
+one_line: "入门测试上被测出零修为，被分到最末等的柴房。"
+
+core_plot:
+  - 外门执事例行三年一次的入门测试，所有人排成一列
+  - 轮到李默时测灵石不亮，执事当众报出「零层」
+  - 满场哄笑，他被当场划去名册，改派柴房
+  - 他低头领了牌子，心里却在算：柴房没人看，正好
+
+timeline: "接第1章，隔三天。"
+
+word_target: [2800, 4000]
+
+narrative:
+  perspective: "第三限知"
+  tone: "冷幽默，克制，不煽情"
+  focus: ["当众受辱那一场不要写惨", "李默的算盘"]
+
+settings:
+  characters: [李默]
+  factions: [青云宗]
+  terms: [零层, 数值之眼]
+
+foreshadow: []
+
+carry_over:
+  - 第1章说数值之眼能看见修为，这一章要交代它看不见什么
+
+must_not:
+  - 不要写他当场反击（他这时候没有还手的本钱）

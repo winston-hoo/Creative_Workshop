@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -352,3 +353,13 @@ _WS_RE = re.compile(r"\s+")
 def normalize_text(text: str) -> str:
     """把换行统一，便于按段落切分。不改动任何标点。"""
     return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def yaml_scalar(value: Any) -> str:
+    """把一个值渲染成能安全嵌进 YAML 的标量。
+
+    手拼带注释的骨架时必须走它：值里出现引号、冒号、`#`、开头是 `{`，都会让整份
+    文件解析不了——而报错落在「哪里错了」上，人只会以为模板坏了。
+    用 JSON 的字符串形式：它天然是合法的 YAML 双引号标量，转义规则也够用。
+    """
+    return json.dumps(str(value or ""), ensure_ascii=False)

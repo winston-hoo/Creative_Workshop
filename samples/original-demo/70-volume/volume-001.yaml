@@ -1,0 +1,60 @@
+# 分卷目录 · 第 1 卷（M9 手填样板 · 6 章完整版）
+#
+# 这是给 --new 出来的骨架填的一版，用来验证三层链路能从头跑到尾。
+# 不是任何真实作品，数值和地名都是编的。
+# 校验：python create_cli.py --root samples --check-volume original-demo
+
+schema_version: volume-v1
+work: original-demo
+
+vol:
+  vol: 1
+  title: 灯下黑
+  start_chapter: 1
+  end_chapter: 6
+  era: 天元三百年秋（约两个月）
+  core_conflict: 想活着回去 vs 一开口就被人当成棋子
+  goal: 李默在青云宗外门站稳，并拿到第一块能换命的灵石
+  closing: 他站住了，但也第一次被人盯上——那块石头的来路不对。
+
+  parts:
+    - title: 觉醒
+      start_chapter: 1
+      end_chapter: 3
+      gist: 认清处境，定下"先活下去"这个唯一目标
+    - title: 入局
+      start_chapter: 4
+      end_chapter: 6
+      gist: 被卷进外门的内斗，用数值之眼换到第一份筹码
+
+  chapters:
+    - chapter_no: 1
+      title: 数值
+      gist: 李默醒来发现自己能看到别人头顶的修为数值，而他自己是零。
+      characters: [李默]
+      foreshadow: 埋设
+    - chapter_no: 2
+      title: 零层
+      gist: 入门测试上被测出零修为，被分到最末等的柴房。
+      characters: [李默]
+      foreshadow: ""
+    - chapter_no: 3
+      title: 柴房的规矩
+      gist: 他摸清外门柴房的吃穿用度，发现没用的人活不过冬天。
+      characters: [李默]
+      foreshadow: 埋设
+    - chapter_no: 4
+      title: 苏清月
+      gist: 大师姐路过柴房替一个被打的杂役说了句话，李默记住了她。
+      characters: [李默, 苏清月]
+      foreshadow: 埋设
+    - chapter_no: 5
+      title: 举手
+      gist: 外门比试缺人，李默主动顶上，条件是换一床厚被。
+      characters: [李默]
+      foreshadow: 推进
+    - chapter_no: 6
+      title: 盯着他的人
+      gist: 他靠看数值拖垮对手拿到灵石，暗处有人记下了他的名字。
+      characters: [李默, 玄阳真人]
+      foreshadow: 埋设

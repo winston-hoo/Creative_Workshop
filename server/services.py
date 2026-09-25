@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from workshop.annotate import load_annotation
 from workshop.ingest import Chapter, ingest, save_ingest
 from workshop.outline import DEFAULT_BLOCK_SIZE
@@ -89,15 +91,43 @@ def list_works(paths: Paths) -> list[dict[str, Any]]:
             continue
         manifest_path = entry / "00-ingest" / "manifest.json"
         if not manifest_path.exists():
+            # 没有录入清单有两种：正在导入的，和「原创」工作区（从零写，不走录入）。
+            # 后者要有自己的入口，否则它只会显示成一部空作品，点进去还 404。
+            from workshop.creation import SETTING_BASENAME, SETTING_DIR
+
+            is_original = (entry / SETTING_DIR / SETTING_BASENAME).exists()
+            counts: dict[str, Any] = {"volumes": 0, "chapters": 0, "briefs": 0}
+            if is_original:
+                try:
+                    from workshop import chapter_brief as _cb
+                    from workshop import volume as _vo
+
+                    vols, _b = _vo.load_all_volumes(entry / "70-volume")
+                    briefs, _bb = _cb.load_all_briefs(entry / "80-brief")
+                    counts = {
+                        "volumes": len(vols),
+                        "chapters": sum(
+                            len((v.get("vol") or {}).get("chapters") or []) for v in vols.values()
+                        ),
+                        "briefs": len(briefs),
+                    }
+                except (ValueError, OSError):
+                    pass
             out.append(
                 {
                     "name": entry.name,
+                    "dir_name": entry.name,
+                    "kind": "original" if is_original else "ingesting",
                     "imported": False,
-                    "chapters": 0,
+                    "chapters": counts["chapters"],
                     "chars": 0,
-                    "segments": 0,
+                    "segments": counts["volumes"],
                     "anomalies": 0,
                     "annotated": 0,
+                    "creation": counts,
+                    "updated_at": _mtime(entry / "60-setting" / "setting.yaml")
+                    if is_original
+                    else _mtime(entry),
                 }
             )
             continue
@@ -141,6 +171,21 @@ def list_works(paths: Paths) -> list[dict[str, Any]]:
 def work_detail(paths: Paths, name: str) -> dict[str, Any] | None:
     manifest_path = paths.ingest_dir(name) / "manifest.json"
     if not manifest_path.exists():
+        # 原创作品没有录入清单——它的概览页就是创作台。返回一个最小可用的详情，
+        # 免得「点进作品就 404」，而 404 页面又不会告诉你为什么。
+        from workshop.creation import SETTING_BASENAME, SETTING_DIR
+
+        if (paths.work_dir(name) / SETTING_DIR / SETTING_BASENAME).exists():
+            return {
+                "name": name,
+                "dir_name": name,
+                "kind": "original",
+                "imported": False,
+                "statistics": {},
+                "source": {},
+                "integrity": {},
+                "volumes": [],
+            }
         return None
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
@@ -2197,7 +2242,14 @@ def start_entities(
 ) -> dict[str, Any]:
     from workshop.batch import _pick_price, load_chapter_tasks, price_bucket
     from workshop.config import load_config
-    from workshop.entities import EntitiesOptions, build_entities_plan, generate_entities, save_entities
+    from workshop.entities import (
+        ALIASES_BASENAME,
+        EntitiesOptions,
+        build_entities_plan,
+        generate_entities,
+        load_aliases,
+        save_entities,
+    )
     from workshop.llm import OpenAICompatProvider
     from workshop.secrets import SecretStore, setup_logging
 
@@ -2253,6 +2305,7 @@ def start_entities(
                 secrets=store.known_values,
                 on_progress=lambda i, t, l: state.update({"done": i, "total": t, "label": l}),
                 state_path=out_dir / "_state.json",
+                aliases=load_aliases(paths.work_dir(name) / ALIASES_BASENAME),
                 limit=limit,
                 should_stop=stop_event.is_set,
             )
@@ -2542,3 +2595,908 @@ def _mtime(path: Path) -> str:
         )
     except OSError:
         return ""
+
+
+# ── M9 创作台 ────────────────────────────────────────────────
+#
+# 三层都是人写的真源（设定集 / 分卷目录 / 逐章创作任务指令），界面只做两件事：
+# 把原文给他改，把校验结果回给他。**没有任何"一键全生成"**——创作要一步步调，
+# 一次吐一大堆只会在返工时全变成无用功。
+
+
+CREATION_KINDS = ("setting", "volume", "brief")
+
+
+def _creation_modules():
+    from workshop import chapter_brief as cb
+    from workshop import volume as vo
+    from workshop.creation import BRIEF_DIR, SETTING_DIR, VOLUME_DIR
+
+    return cb, vo, SETTING_DIR, VOLUME_DIR, BRIEF_DIR
+
+
+def _creation_work_dir(paths: Paths, name: str) -> Path:
+    wd = paths.work_dir(name)
+    if not wd.exists():
+        raise FileNotFoundError(f"作品目录不存在：{wd}")
+    from workshop.creation import SETTING_DIR
+
+    if not (wd / SETTING_DIR).exists():
+        raise FileNotFoundError(
+            f"「{name}」不是原创工作区（没有 {SETTING_DIR}/）。创作台只处理原创作品。"
+        )
+    return wd
+
+
+def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
+    """创作台首页：三层各自的完成度 + 逐卷逐章清单。"""
+    cb, vo, SETTING_DIR, VOLUME_DIR, BRIEF_DIR = _creation_modules()
+    from workshop.creation import load_work_setting, setting_path_of, validate_setting
+
+    wd = _creation_work_dir(paths, name)
+    setting_path = setting_path_of(wd)
+    setting = None
+    setting_view: dict[str, Any] = {"exists": setting_path.exists(), "path": str(setting_path)}
+    if setting_view["exists"]:
+        try:
+            setting = load_work_setting(wd)
+            s_errors, s_warnings = validate_setting(setting)
+        except (ValueError, OSError) as exc:
+            s_errors, s_warnings = [f"设定集读不了：{exc}"], []
+        setting_view.update(
+            {
+                "characters": len(setting.get("characters") or []),
+                "errors": s_errors,
+                "warnings": s_warnings,
+                "done": not s_errors,
+            }
+        )
+
+    volumes, broken_volumes = vo.load_all_volumes(wd / VOLUME_DIR)
+    volume_rows: list[dict[str, Any]] = []
+    errors: list[str] = [f"分卷目录：{b}" for b in broken_volumes]
+    warnings: list[str] = [f"设定集：{w}" for w in setting_view.get("warnings") or []]
+    errors += [f"设定集：{e}" for e in setting_view.get("errors") or []]
+
+    for no in sorted(volumes):
+        vol = volumes[no].get("vol") or {}
+        v_errors, v_warnings = vo.validate_volume(volumes[no], setting=setting, file_vol_no=no)
+        errors += [f"第{no}卷：{e}" for e in v_errors]
+        warnings += [f"第{no}卷：{w}" for w in v_warnings]
+        volume_rows.append(
+            {
+                "vol": no,
+                "file": volumes[no].get("_file"),
+                "title": vol.get("title") or "",
+                "start_chapter": vol.get("start_chapter"),
+                "end_chapter": vol.get("end_chapter"),
+                "chapters": len(vol.get("chapters") or []),
+                "errors": len(v_errors),
+                "warnings": len(v_warnings),
+            }
+        )
+    chain_errors, chain_warnings = (
+        vo.validate_chain(volumes, setting=setting) if volumes else ([], [])
+    )
+    errors += chain_errors
+    warnings += chain_warnings
+
+    briefs, broken_briefs = cb.load_all_briefs(wd / BRIEF_DIR)
+    errors += [f"创作任务指令：{b}" for b in broken_briefs]
+    brief_errors: dict[str, list[str]] = {}
+    brief_warnings: dict[str, list[str]] = {}
+    for cid in sorted(briefs):
+        parsed = cb.parse_chapter_id(cid)
+        e, w = cb.validate_brief(
+            briefs[cid], setting=setting,
+            volume=volumes.get(parsed[0]) if parsed else None,
+        )
+        brief_errors[cid] = e
+        brief_warnings[cid] = w
+        errors += [f"{cid}：{x}" for x in e]
+        warnings += [f"{cid}：{x}" for x in w]
+    for item in cb.validate_brief_chain(briefs)[0] if briefs else []:
+        errors.append(f"创作任务指令：{item}")
+
+    chapters: list[dict[str, Any]] = []
+    for no in sorted(volumes):
+        vol = volumes[no].get("vol") or {}
+        for row in vol.get("chapters") or []:
+            if not isinstance(row, dict) or not isinstance(row.get("chapter_no"), int):
+                continue
+            cid = cb.chapter_id_of(no, row["chapter_no"])
+            chapters.append(
+                {
+                    "chapter_id": cid,
+                    "vol": no,
+                    "chapter_no": row["chapter_no"],
+                    "title": row.get("title") or "",
+                    "has_brief": cid in briefs,
+                    "errors": len(brief_errors.get(cid, [])),
+                    "warnings": len(brief_warnings.get(cid, [])),
+                }
+            )
+    missing = [c for c in chapters if not c["has_brief"]]
+    if missing:
+        errors.append(
+            f"逐章指令只填了 {len(chapters) - len(missing)}/{len(chapters)} 章，"
+            f"还缺 {len(missing)} 章"
+        )
+
+    # 全书级硬闸：主角缺席、卷间接不上。闸要并进 errors 才算真的拦住。
+    _gates = creation_story_gates(paths, name)
+    errors = list(errors) + list(_gates["errors"])
+    warnings = list(warnings) + list(_gates["warnings"])
+    return {
+        "foreshadows": foreshadow_ledger(paths, name),
+        "synopsis": creation_synopsis(paths, name),
+        "cast": creation_character_presence(paths, name),
+        "consistency": creation_consistency(paths, name),
+        "work": name,
+        "ok": not errors,
+        "setting": setting_view,
+        "volumes": volume_rows,
+        "chapters": chapters,
+        "counts": {
+            "volumes": len(volume_rows),
+            "chapters": len(chapters),
+            "briefs": len(briefs),
+            "missing_briefs": len(missing),
+        },
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def creation_read(paths: Paths, name: str, kind: str, key: str = "") -> dict[str, Any]:
+    """读一份原文 + 它的校验结果。"""
+    wd = _creation_work_dir(paths, name)
+    path = _creation_path(wd, kind, key)
+    if not path.exists():
+        return {"exists": False, "path": str(path), "text": "", "errors": [], "warnings": []}
+    text = path.read_text(encoding="utf-8")
+    errors, warnings = _creation_validate_text(wd, kind, key, text)
+    out = {"exists": True, "path": str(path), "text": text,
+           "errors": errors, "warnings": warnings}
+    # 表单要的是结构化的那份。三层都要给——只给 setting 那一层的话，卷层和指令层
+    # 的表单会拿到空对象，然后「保存」把磁盘上好好的文件清成 {}。
+    # 这个 bug 实测发生过一次，是数据丢失级别的，别再只给一层。
+    try:
+        parsed = yaml.safe_load(text)
+    except yaml.YAMLError:
+        parsed = None
+    out["data"] = parsed if isinstance(parsed, dict) else {}
+    return out
+
+def creation_write(paths: Paths, name: str, kind: str, key: str, text: str) -> dict[str, Any]:
+    """保存一份原文。
+
+    先解析再落盘：解析不了就**不写**，把错误原样回给用户。存进去一份读不回来的文件，
+    比拒收它坏得多——那份文件会一直躺在那里，直到生成阶段才发现。
+    落盘写的是**用户自己那段文本**，不是重新 dump 的 YAML，注释和排版都留着。
+    """
+    wd = _creation_work_dir(paths, name)
+    path = _creation_path(wd, kind, key)
+    errors, warnings = _creation_validate_text(wd, kind, key, text, allow_unparsable=False)
+    fatal = [e for e in errors if e.startswith("解析不了")]
+    if fatal:
+        return {"saved": False, "path": str(path), "errors": errors, "warnings": warnings}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return {"saved": True, "path": str(path), "errors": errors, "warnings": warnings}
+
+
+def creation_write_setting_data(
+    paths: Paths, name: str, data: dict[str, Any], *, kind: str = "setting", key: str = ""
+) -> dict[str, Any]:
+    """表单保存：把结构化文档写成 YAML。三层共用。
+
+    ⚠️ 写出来的是机器生成的 YAML，**手写注释会没有**。所以文件头会挂一句说明，
+    并告诉作者想保留注释就切回「原文编辑」。不写这句的话，作者只会发现注释莫名消失了。
+    """
+    wd = _creation_work_dir(paths, name)
+    path = _creation_path(wd, kind, key)
+
+    # ⚠️ 数据保护：拿到的草稿是空的，而磁盘上这份文件有内容 → 拒绝写入。
+    # 空草稿从来不是作者的本意（表单里删光所有字段 ≠ 要一个空文件），
+    # 它几乎总是读取环节出了问题。上一版没有这道闸，卷层和指令层被清成过 {}。
+    if path.exists():
+        try:
+            existing = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, OSError):
+            existing = None
+        if isinstance(existing, dict):
+            real_keys = [k for k in existing if k not in ("schema_version", "work")]
+            incoming_keys = [k for k in (data or {}) if k not in ("schema_version", "work")]
+            if real_keys and not incoming_keys:
+                raise ValueError(
+                    f"表单拿到的是空内容，但磁盘上这份 {kind} 文件是有东西的。"
+                    "这多半是读取出了问题，已拒绝写入，免得把内容清空。"
+                    "要真的清空，请切到「原文编辑」自己删。"
+                )
+
+    body = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, width=1000)
+    header = (
+        "# 这份文件由创作台「表单」保存生成；手写注释会被表单保存覆盖。\n"
+        "# 想保留自己写的注释，就切到「原文编辑」改。\n"
+    )
+    text = header + body
+    errors, warnings = _creation_validate_text(wd, kind, key, text)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return {"saved": True, "path": str(path), "errors": errors, "warnings": warnings, "text": text}
+
+
+def _creation_path(wd: Path, kind: str, key: str) -> Path:
+    """把 (kind, key) 映射成文件路径。
+
+    这里是一道信任边界：key 直接来自 URL，**必须**先过白名单再拼路径，
+    否则 `../` 能写到工作区外面去。
+    """
+    cb, vo, SETTING_DIR, VOLUME_DIR, BRIEF_DIR = _creation_modules()
+    if kind not in CREATION_KINDS:
+        raise ValueError(f"不认识的类型：{kind}")
+    if kind == "setting":
+        from workshop.creation import SETTING_BASENAME
+
+        if key:
+            # 设定集只有一份，没有 key 的概念。传了多半是客户端搞错了，直接说出来，
+            # 别默默忽略——被忽略的参数是 bug 的藏身处。
+            raise ValueError("setting 只有一份，不接受 key")
+        return wd / SETTING_DIR / SETTING_BASENAME
+    if kind == "volume":
+        if not key.isdigit() or not (1 <= int(key) <= 9999):
+            raise ValueError(f"卷号必须是 1-9999 的数字：{key!r}")
+        return vo.volume_path(wd / VOLUME_DIR, int(key))
+    if cb.parse_chapter_id(key) is None:
+        raise ValueError(f"章节 id 不合约定（应为 v001-c0001）：{key!r}")
+    return cb.brief_path(wd / BRIEF_DIR, key)
+
+
+def _creation_validate_text(
+    wd: Path, kind: str, key: str, text: str, *, allow_unparsable: bool = True
+) -> tuple[list[str], list[str]]:
+    cb, vo, _s, VOLUME_DIR, _b = _creation_modules()
+    from workshop.creation import load_work_setting, setting_path_of, validate_setting
+
+    try:
+        data = yaml.safe_load(text) or {}
+        if not isinstance(data, dict):
+            raise ValueError("顶层不是映射（要是一组 key: value）")
+    except (yaml.YAMLError, ValueError) as exc:
+        return [f"解析不了：{exc}"], []
+
+    setting = None
+    if setting_path_of(wd).exists():
+        try:
+            setting = load_work_setting(wd)
+        except (ValueError, OSError):
+            setting = None
+
+    if kind == "setting":
+        return validate_setting(data)
+    if kind == "volume":
+        volumes, _broken = vo.load_all_volumes(wd / VOLUME_DIR)
+        file_vol_no = int(key) if key.isdigit() else None
+        errors, warnings = vo.validate_volume(data, setting=setting, file_vol_no=file_vol_no)
+        # 把「只有跨卷才看得出来」的问题也一并回给这一份，编辑完就知道有没有把邻卷碰坏
+        merged = dict(volumes)
+        if file_vol_no is not None:
+            merged[file_vol_no] = data
+        chain_errors, chain_warnings = vo.validate_chain(merged, setting=setting) if merged else ([], [])
+        return errors + chain_errors, warnings + chain_warnings
+
+    volumes, _broken = vo.load_all_volumes(wd / VOLUME_DIR)
+    parsed = cb.parse_chapter_id(key)
+    errors, warnings = cb.validate_brief(
+        data, setting=setting, volume=volumes.get(parsed[0]) if parsed else None
+    )
+    return errors, warnings
+
+
+def creation_new(paths: Paths, name: str, **kwargs: Any) -> dict[str, Any]:
+    from workshop.creation import create_original_work
+
+    info = create_original_work(paths.workspaces, name, **kwargs)
+    return {
+        "work": name,
+        "work_dir": str(info["work_dir"]),
+        "setting": str(info["setting"]),
+        "first_volume": str(info["first_volume"]),
+    }
+
+
+def creation_seed_briefs(paths: Paths, name: str, vol: int | None = None) -> dict[str, Any]:
+    from workshop.creation import seed_briefs
+
+    wd = _creation_work_dir(paths, name)
+    return seed_briefs(wd, vol_no=vol)
+
+
+# ── M9 创作台 · 设定集助手 ──────────────────────────────────
+#
+# 形态是**提案制**：模型只提「建议新增/修改哪几条」，作者逐条勾选，
+# 勾中的进界面草稿，作者再点保存才落盘。这里不替作者做决定，也不整份重写。
+
+
+def _setting_refs_block(
+    paths: Paths, refs: list[str], level: str = "k3"
+) -> tuple[str, list[str]]:
+    """把作者选定的已入库作品拼成参照素材。
+
+    `level` 决定给多少：none 什么都不给 / k3 只给结构指纹 / full 再加人物势力能力等。
+    读不到或没建过知识库的会被跳过并说明——列出来点了却没反应的选项比没有更烦人。
+    """
+    from workshop.setting_assist import build_refs_block
+
+    picked: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for name in refs[:6]:
+        kb_dir = paths.work_dir(name) / "20-kb"
+        k1_path = kb_dir / "k1-entities.json"
+        if not k1_path.exists():
+            missing.append(f"{name}（还没建过知识库）")
+            continue
+        try:
+            k1 = json.loads(k1_path.read_text(encoding="utf-8-sig"))
+            k3_raw = json.loads((kb_dir / "k3-fingerprint.json").read_text(encoding="utf-8-sig"))
+        except (ValueError, OSError):
+            missing.append(f"{name}（知识库读不了）")
+            continue
+        if not k1.get("available"):
+            missing.append(f"{name}（知识库 K1 是空的，先重建）")
+            continue
+        k3_lines = [
+            f"{it.get('rule')}：{(it.get('statistic') or {}).get('mean') or (it.get('statistic') or {}).get('dominant') or ''}"
+            f"（{it.get('sample')} 章）"
+            for it in (k3_raw.get("items") or [])
+            if isinstance(it, dict)
+        ]
+        picked.append({"work": name, "k1": k1, "k3": k3_lines})
+    if level == "k3":
+        # 中间档不需要 K1：连读都不读，免得把几百条人物装进内存又丢掉
+        picked = [{"work": p["work"], "k3": p["k3"], "k1": {}} for p in picked]
+    return build_refs_block(picked, level=level), missing
+
+
+def assist_refs(paths: Paths) -> list[dict[str, Any]]:
+    """可选的参照作品。只列真的能用的——列出来点了报错的选项比没有更烦人。"""
+    out: list[dict[str, Any]] = []
+    for work in list_works(paths):
+        if not work.get("imported"):
+            continue
+        kb_dir = paths.work_dir(work["dir_name"]) / "20-kb"
+        k1_path = kb_dir / "k1-entities.json"
+        available = False
+        if k1_path.exists():
+            try:
+                available = bool(
+                    json.loads(k1_path.read_text(encoding="utf-8-sig")).get("available")
+                )
+            except (ValueError, OSError):
+                available = False
+        out.append(
+            {
+                "name": work["dir_name"],
+                "label": work.get("name") or work["dir_name"],
+                "kb_ready": available,
+                "chapters": work.get("chapters") or 0,
+            }
+        )
+    return out
+
+
+def setting_assist_plan(
+    paths: Paths, name: str, *, refs: list[str], level: str = "k3", layer: str = "setting",
+    key: str = "", provider_id: str | None, model_id: str | None
+) -> dict[str, Any]:
+    """免费计划：这次对话大概多少 token、多少钱。**不发起调用。**"""
+    from workshop.batch import _pick_price, price_bucket
+    from workshop.config import load_config
+    from workshop.setting_assist import build_assist_plan
+
+    document = creation_document(paths, name, layer, key)
+    cfg = load_config(paths.root / "providers.yaml")
+    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
+    block, missing = _setting_refs_block(paths, refs, level)
+    model_cfg = provider.model(model) or {}
+    bucket = price_bucket(provider)
+    plan = build_assist_plan(
+        work=name, setting=document, refs_block=block, refs=refs, level=level, layer=layer,
+        provider_id=provider.id, model_id=model,
+        price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
+        price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
+        bucket=bucket,
+    ).to_dict()
+    plan["refs_available"] = assist_refs(paths)
+    plan["refs_missing"] = missing
+    plan["model_id"] = model
+    return plan
+
+
+def creation_document(paths: Paths, name: str, layer: str, key: str = "") -> dict[str, Any]:
+    """读一层的**结构化**文档，给提案引擎用。
+
+    这里刻意不走各层自己的 load_* 函数：那些会补空默认值（vol=0、chapters=[]），
+    而给模型看的「现在已经有什么」必须是**文件里真实存在的东西**——
+    补一堆空壳进去，模型会以为作者已经定了章数或卷号。
+    """
+    wd = _creation_work_dir(paths, name)
+    path = _creation_path(wd, layer, key)
+    if not path.exists():
+        return {}
+    try:
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def apply_setting_proposals(
+    *, document: dict[str, Any], proposals: list[dict[str, Any]],
+    accepted: list[int], layer: str = "setting"
+) -> dict[str, Any]:
+    """把勾中的提案并进**草稿**。不落盘——落盘是作者点保存之后的事。"""
+    from workshop.setting_assist import apply_proposals
+
+    new_document, results = apply_proposals(document, proposals, accepted=accepted, layer=layer)
+    return {"document": new_document, "results": results}
+
+
+def run_setting_assist(
+    paths: Paths,
+    name: str,
+    *,
+    message: str,
+    history: list[dict[str, str]] | None = None,
+    refs: list[str] | None = None,
+    level: str = "k3",
+    layer: str = "setting",
+    key: str = "",
+    provider_id: str | None = None,
+    model_id: str | None = None,
+    max_tokens: int = 2000,
+    task: str = "",
+) -> dict[str, Any]:
+    """问一次助手。**只返回提案，不写任何文件。**
+
+    `max_tokens` 要能调大：「配齐」一次要提几十条势力/能力，2000 输出 token 只够十来条，
+    模型会在半路被截断，而作者看到的是一份「提了一半」的清单，还以为提完了。
+    """
+    from workshop.config import load_config
+    from workshop.llm import OpenAICompatProvider
+    from workshop.secrets import SecretStore, setup_logging
+    from workshop.setting_assist import LAYER_SPECS, describe_proposal, run_assist
+
+    if not str(message or "").strip() and task not in ("writeback", "review"):
+        raise ValueError("要说点什么才能问")
+
+    document = creation_document(paths, name, layer, key)
+    # 回填：把这一章的正文当事实来源。回填写回的是**设定集**（一份文档），
+    # 所以 layer 定死 setting——卷表和逐章指令要改，作者自己在对应那一层改。
+    task_prose = ""
+    volume_doc: dict[str, Any] = {}
+    brief_doc: dict[str, Any] = {}
+    if task in ("writeback", "review"):
+        from workshop.chapter_brief import parse_chapter_id
+        from workshop.draft import load_draft
+
+        task_prose = load_draft(_creation_work_dir(paths, name), key).get("text") or ""
+        if not task_prose.strip():
+            raise ValueError(f"{key or '这一章'} 还没有正文，没什么可回填的。先写这一章。")
+        parsed = parse_chapter_id(key)
+        if parsed:
+            volume_doc = creation_document(paths, name, "volume", f"{int(parsed[0]):03d}")
+        brief_doc = creation_document(paths, name, "brief", key)
+        layer = "setting"
+        document = creation_document(paths, name, "setting", "")
+        if task == "review":
+            # 审稿的修正落在**本章指令**上：正文改不了（改了等于重写，作者还得逐句对比），
+            # 指令能改——改完指令重写这一章，作者既看得见改了什么，也能否决。
+            layer = "brief"
+            document = brief_doc
+    cfg = load_config(paths.root / "providers.yaml")
+    # 写前必读：锚点 + 前情 + 角色动态 + 待回收伏笔 + 上一章末段。
+    # 起草卷表/指令时，模型原先只看得到那一层自己的文档——看不到设定集，也看不到前面各卷。
+    from workshop.creation import render_write_brief
+    _wd = _creation_work_dir(paths, name)
+    _cno = 0
+    if layer == "brief" and key:
+        _cno = int((creation_document(paths, name, "brief", key) or {}).get("chapter_no") or 0)
+    _ctx = render_write_brief(_wd, chapter_no=_cno, prev_chapter_no=max(0, _cno - 1))
+    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
+    if provider.api_key_ref and not _read_api_key(cfg, provider):
+        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+
+    store = SecretStore(paths.root / "config")
+    setup_logging(store.known_values)
+    client = OpenAICompatProvider(
+        base_url=provider.base_url,
+        api_key=_read_api_key(cfg, provider),
+        timeout_sec=90,
+        auth_scheme=provider.auth_scheme,
+        secrets=store.known_values,
+        rate_limit=provider.rate_limit,
+    )
+    block, missing = _setting_refs_block(paths, refs or [], level)
+    result = run_assist(
+        client=client, model_id=model, setting=document,
+        message=message, history=history or [], refs_block=block, layer=layer,
+        max_tokens=max_tokens, task=task, prose=task_prose,
+        context_block=_ctx,
+        volume=volume_doc, brief=brief_doc, title=(brief_doc or {}).get("title") or "",
+    )
+    proposals = []
+    # 上限 80：配齐一次可能提 20 势力 + 20 能力 + 20 规则，40 条会把后面的直接丢掉
+    for index, raw in enumerate(result.proposals[:80]):
+        row = raw if isinstance(raw, dict) else {}
+        # 回填会提「volume:chapters」这种带层前缀的小节名。拆开：层进 layer、裸名进 section，
+        # 这样每一层往下走的还是同一个 apply_proposals（白名单、主键去重、逐条原因都一样）。
+        # 前缀是必须的：title 在卷层和指令层都有、characters 在两层形状完全不同，裸名分不出。
+        section = str(row.get("section") or "")
+        target_layer = layer
+        if ":" in section:
+            head, _, tail = section.partition(":")
+            if head in LAYER_SPECS and tail:
+                target_layer, section = head, tail
+        spec = (LAYER_SPECS.get(target_layer) or {}).get(section) or {}
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else None
+        if entry is None:
+            # 模型有时把字段平铺在顶层（格式示例里原先没有 update 的样子可抄，它就自己猜——
+            # 实测三条 update/add 都栽在这上面）。平铺的收进来当 entry，
+            # **闸没有放松**：_clean_entry 的白名单会把不该有的字段全丢掉，
+            # 缺主键、重名、缺必填照样拒。
+            flat = {k: v for k, v in row.items()
+                    if k not in ("section", "op", "value", "entry")}
+            entry = flat or None
+        # 表格里那一个「内容」输入框绑到哪儿：条目表绑主键，其余绑 value。
+        # 改完的值会覆盖模型给的原值——批量生成最容易出问题的就是名字。
+        if spec.get("key"):
+            primary_field, primary = spec["key"], str((entry or {}).get(spec["key"]) or "")
+        else:
+            primary_field, primary = "value", str(row.get("value") or "")
+        proposals.append(
+            {
+                "index": index,
+                "section": section,
+                "layer": target_layer,
+                "section_label": spec.get("label") or f"未知小节「{section}」",
+                "op": str(row.get("op") or ""),
+                "label": describe_proposal(row, target_layer),
+                # 发**解析后**的 entry（含平铺兜底那份）。发 row 里的原始值的话，
+                # 模型平铺时客户端拿到 null，apply 照样拒——修正就白做了。
+                "entry": entry,
+                "value": row.get("value"),
+                "primary_field": primary_field,
+                "text": primary,
+                "keep": True,
+                "full": json.dumps(
+                    {"entry": entry, "value": row.get("value")}, ensure_ascii=False
+                ),
+            }
+        )
+    return {
+        "reply": result.reply,
+        "proposals": proposals,
+        "error": result.error,
+        "usage": result.usage,
+        "attempts": result.attempts,
+        "refs_missing": missing,
+        "layer": layer,
+    }
+
+
+# ── M9 创作台 · 写正文 ──────────────────────────────────────
+#
+# 三层真源拼成一个调用，**一次只出一章**。跑完就停，等作者读完再决定下一章。
+# 不做批量：一次吐十章，第一章不满意就九章全废。
+
+
+def _draft_inputs(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    """攒齐写这一章需要的东西：设定集、本卷、本章指令，各自的校验状态。"""
+    from workshop.chapter_brief import parse_chapter_id
+
+    wd = _creation_work_dir(paths, name)
+    parsed = parse_chapter_id(chapter_id)
+    if not parsed:
+        raise ValueError(f"章节编号「{chapter_id}」不合约定，应当是 v001-c0001 这种")
+
+    setting_read = creation_read(paths, name, "setting", "")
+    brief_read = creation_read(paths, name, "brief", chapter_id)
+
+    vol_no = parsed[0]   # parse_chapter_id 返回 (卷号, 章号)
+    volume_key = f"{int(vol_no):03d}"
+    volume_read = creation_read(paths, name, "volume", volume_key)
+
+    return {
+        "work_dir": wd,
+        "chapter_id": chapter_id,
+        "vol_no": int(vol_no),
+        "volume_key": volume_key,
+        "setting": setting_read.get("data") or {},
+        "setting_errors": setting_read.get("errors") or [],
+        "volume": volume_read.get("data") or {},
+        "brief": brief_read.get("data") or {},
+        "brief_errors": brief_read.get("errors") or [],
+        "brief_exists": bool(brief_read.get("exists")),
+        "title": (brief_read.get("data") or {}).get("title") or "",
+    }
+
+
+def draft_plan(
+    paths: Paths, name: str, chapter_id: str, *,
+    refs: list[str] | None = None, level: str = "k3",
+    provider_id: str | None = None, model_id: str | None = None,
+) -> dict[str, Any]:
+    """写这一章的免费计划：多少 token、多少钱、会喂进去什么。**不调模型。**"""
+    from workshop.batch import _pick_price, price_bucket
+    from workshop.config import load_config
+    from workshop.draft import build_draft_plan, load_draft
+
+    ctx = _draft_inputs(paths, name, chapter_id)
+    cfg = load_config(paths.root / "providers.yaml")
+    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
+    block, missing = _setting_refs_block(paths, refs or [], level)
+    model_cfg = provider.model(model) or {}
+    bucket = price_bucket(provider)
+
+    # 设定集有阻断就不该开写：人物对不上、主角不唯一，写出来必然歪
+    errors = list(ctx["brief_errors"])
+    if ctx["setting_errors"]:
+        errors = [f"设定集有 {len(ctx['setting_errors'])} 项阻断：{ctx['setting_errors'][0]}"] + errors
+
+    from workshop.creation import render_write_brief as _rwb
+    _cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
+    _ctx = _rwb(_creation_work_dir(paths, name), chapter_no=_cno,
+                 prev_chapter_no=max(0, _cno - 1))
+    plan = build_draft_plan(
+        chapter_id=chapter_id, title=ctx["title"], setting=ctx["setting"],
+        volume=ctx["volume"], brief=ctx["brief"], refs_block=block,
+        provider_id=provider.id, model_id=model,
+        price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
+        price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
+        bucket=bucket, brief_errors=errors, brief_exists=ctx["brief_exists"],
+        context_block=_ctx,
+    ).to_dict()
+
+    existing = load_draft(ctx["work_dir"], chapter_id)
+    plan["refs_missing"] = missing
+    plan["has_draft"] = bool(existing.get("exists"))
+    plan["existing_chars"] = len(existing.get("text") or "")
+    plan["refs_available"] = assist_refs(paths)
+    return plan
+
+
+def run_draft(
+    paths: Paths, name: str, chapter_id: str, *,
+    refs: list[str] | None = None, level: str = "k3",
+    provider_id: str | None = None, model_id: str | None = None,
+    max_tokens: int = 8000, temperature: float = 0.8,
+) -> dict[str, Any]:
+    """写这一章（**会花钱**）。跑完落盘并做机械自检。只出一章，不往下串。"""
+    from datetime import datetime, timezone
+
+    from workshop.config import load_config
+    from workshop.draft import (
+        build_draft_messages, check_draft, generate_draft, save_draft,
+    )
+    from workshop.llm import OpenAICompatProvider
+    from workshop.secrets import SecretStore, setup_logging
+
+    ctx = _draft_inputs(paths, name, chapter_id)
+    if not ctx["brief_exists"] or not ctx["brief"]:
+        raise ValueError(
+            f"还没有 {chapter_id} 的创作任务指令。没有指令就写正文，"
+            "等于让模型替你决定这一章要干什么。"
+        )
+    if ctx["brief_errors"]:
+        raise ValueError(f"这一章的指令有 {len(ctx['brief_errors'])} 项阻断没解决：{ctx['brief_errors'][0]}")
+    if ctx["setting_errors"]:
+        raise ValueError(f"设定集有 {len(ctx['setting_errors'])} 项阻断没解决：{ctx['setting_errors'][0]}")
+
+    cfg = load_config(paths.root / "providers.yaml")
+    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
+    if provider.api_key_ref and not _read_api_key(cfg, provider):
+        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+
+    store = SecretStore(paths.root / "config")
+    setup_logging(store.known_values)
+    client = OpenAICompatProvider(
+        base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
+        timeout_sec=300, auth_scheme=provider.auth_scheme,
+        secrets=store.known_values, rate_limit=provider.rate_limit,
+    )
+    block, _missing = _setting_refs_block(paths, refs or [], level)
+    from workshop.creation import render_write_brief as _rwb
+    _cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
+    _ctx = _rwb(_creation_work_dir(paths, name), chapter_no=_cno,
+                 prev_chapter_no=max(0, _cno - 1))
+    messages = build_draft_messages(
+        setting=ctx["setting"], volume=ctx["volume"], brief=ctx["brief"],
+        refs_block=block, title=ctx["title"], context_block=_ctx,
+    )
+    result = generate_draft(
+        client=client, model_id=model, messages=messages,
+        max_tokens=max_tokens, temperature=temperature,
+    )
+    if result.error or not result.text.strip():
+        return {"ok": False, "error": result.error or "模型没返回内容", "usage": result.usage}
+
+    errors, warnings, stats = check_draft(
+        result.text, brief=ctx["brief"], setting=ctx["setting"],
+    )
+    if result.truncated:
+        errors = ["模型是被 max_tokens 截断的，末尾是断的——这一章没写完"] + errors
+
+    saved = save_draft(
+        ctx["work_dir"], chapter_id, text=result.text,
+        meta={
+            "work": name, "model": model, "provider": provider.id,
+            "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "usage": result.usage, "finish_reason": result.finish_reason,
+            "truncated": result.truncated, "refs_level": level, "refs": refs or [],
+            "stats": stats, "errors": errors, "warnings": warnings,
+        },
+    )
+    return {
+        "ok": True, "chapter_id": chapter_id, "text": result.text,
+        "errors": errors, "warnings": warnings, "stats": stats,
+        "usage": result.usage, "truncated": result.truncated, **saved,
+    }
+
+
+def read_draft(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    """读已写的正文 + 重跑一次自检（指令可能改过了，结论要跟着变）。"""
+    from workshop.draft import check_draft, load_draft
+
+    ctx = _draft_inputs(paths, name, chapter_id)
+    loaded = load_draft(ctx["work_dir"], chapter_id)
+    if not loaded.get("exists"):
+        return {"exists": False, "chapter_id": chapter_id, "text": "", "meta": {},
+                "errors": [], "warnings": [], "stats": {}}
+    errors, warnings, stats = check_draft(
+        loaded["text"], brief=ctx["brief"], setting=ctx["setting"],
+    )
+    loaded.update({"errors": errors, "warnings": warnings, "stats": stats})
+    return loaded
+
+
+def write_draft_text(paths: Paths, name: str, chapter_id: str, text: str) -> dict[str, Any]:
+    """作者手改过的正文存回去。**空文本不许覆盖有内容的文件**。"""
+    from workshop.draft import count_chars, load_draft, save_draft
+
+    ctx = _draft_inputs(paths, name, chapter_id)
+    existing = load_draft(ctx["work_dir"], chapter_id)
+    if existing.get("exists") and not text.strip() and (existing.get("text") or "").strip():
+        raise ValueError(
+            "要保存的正文是空的，但磁盘上这一章已经有内容。已拒绝写入，免得把正文清空。"
+        )
+    saved = save_draft(ctx["work_dir"], chapter_id, text=text, meta={
+        **(existing.get("meta") or {}), "edited": True, "chars": count_chars(text),
+    })
+    return {"saved": True, **saved}
+
+
+# ── M9 创作台 · 从知识库导入 ────────────────────────────────
+#
+# 作者说知识库「可充当素材依据、可以用来参考、自己决定」——那就给他能翻的东西，
+# 每条由他点。不做「一键全收」：整批搬进自己书里，他既没看过也没法反悔。
+
+
+def kb_browse(paths: Paths, ref_work: str, section: str, q: str = "") -> dict[str, Any]:
+    """翻某一本已入库作品的知识库。纯读，零成本。"""
+    from workshop.setting_assist import KB_SECTION_MAP, LAYER_SPECS
+
+    if section != "relations" and section not in KB_SECTION_MAP:
+        raise ValueError(f"知识库里没有「{section}」这一类（可翻：{'、'.join(KB_SECTION_MAP)}、relations）")
+
+    kb_dir = paths.work_dir(ref_work) / "20-kb"
+    k1_path = kb_dir / "k1-entities.json"
+    if not k1_path.exists():
+        raise ValueError(f"「{ref_work}」还没有知识库（没标注过），先跑标注")
+    try:
+        k1 = json.loads(k1_path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"「{ref_work}」的知识库读不了：{exc}") from exc
+    if not k1.get("available"):
+        raise ValueError(f"「{ref_work}」的知识库 K1 是空的，需要重建")
+
+    key_field = "name"
+    if section in KB_SECTION_MAP:
+        key_field = LAYER_SPECS["setting"][KB_SECTION_MAP[section]]["key"]
+    elif section == "terms":
+        key_field = "term"
+
+    rows: list[dict[str, Any]] = []
+    for row in k1.get(section) or []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get(key_field) or row.get("name") or row.get("from") or "").strip()
+        if q and q not in name and q not in json.dumps(row, ensure_ascii=False):
+            continue
+        rows.append({"key": name, **{k: v for k, v in row.items() if not isinstance(v, (list, dict))}})
+
+    counts = {k: len(k1.get(k) or []) for k in ("characters", "factions", "abilities",
+                                               "locations", "terms", "relations")}
+    return {
+        "work": ref_work, "section": section, "counts": counts,
+        "total": len(k1.get(section) or []), "shown": len(rows), "rows": rows[:500],
+        "truncated": len(rows) > 500,
+    }
+
+
+def kb_import(
+    paths: Paths, name: str, ref_work: str, section: str, *,
+    keys: list[str] | None = None, document: dict[str, Any],
+    layer: str = "setting", subject: str = "",
+) -> dict[str, Any]:
+    """把作者勾中的知识库条目**转成提案**，走同一套白名单与去重，再并进草稿。
+
+    零成本：不调模型。这条路径做的判断和模型提案路径一样严——
+    只是提案不是模型生成的，是从 K1 实体表里读出来的。
+    """
+    from workshop.setting_assist import (
+        apply_proposals, kb_proposals, kb_relations_proposals,
+    )
+
+    kb_dir = paths.work_dir(ref_work) / "20-kb"
+    k1_path = kb_dir / "k1-entities.json"
+    if not k1_path.exists():
+        raise ValueError(f"「{ref_work}」还没有知识库")
+    k1 = json.loads(k1_path.read_text(encoding="utf-8-sig"))
+
+    if section == "relations":
+        if not subject:
+            raise ValueError("导入关系要指明是谁的关系（subject）")
+        proposals = kb_relations_proposals(k1, subject=subject)
+    else:
+        proposals = kb_proposals(k1, section=section, keys=keys)
+    if not proposals:
+        return {"document": document, "results": [], "proposal_count": 0,
+                "note": "没有可导入的条目（勾的都没匹配上，或者这个人没有关系记录）"}
+
+    new_document, results = apply_proposals(
+        document, proposals, accepted=None, layer=layer, allow_partial=True,
+    )
+    return {
+        "document": new_document, "results": results, "proposal_count": len(proposals),
+        "imported": sum(1 for r in results if r["ok"]),
+        "skipped": sum(1 for r in results if not r["ok"]),
+    }
+
+
+def foreshadow_ledger(paths: Paths, name: str) -> dict[str, Any]:
+    """一本伏笔账：埋了哪些、推到哪一步、哪些该收还没收。纯脚本，零成本。"""
+    from workshop.chapter_brief import foreshadow_ledger as _ledger
+
+    wd = _creation_work_dir(paths, name)
+    return _ledger(wd / "80-brief")
+
+
+def creation_character_presence(paths: Paths, name: str) -> dict[str, Any]:
+    """人物动向：谁在第几章出场、谁已经连着好几章没露面。纯脚本，零成本。"""
+    from workshop.creation import character_presence
+
+    return character_presence(_creation_work_dir(paths, name))
+
+
+def creation_consistency(paths: Paths, name: str) -> list[str]:
+    """卷表/指令里点过名、但设定集里没有的人与势力。纯脚本，零成本。"""
+    from workshop.creation import consistency_report
+
+    return consistency_report(_creation_work_dir(paths, name))
+
+
+def creation_synopsis(paths: Paths, name: str) -> str:
+    """全书梗概：从三层真源渲染，不新增字段。纯脚本，零成本。"""
+    from workshop.creation import render_synopsis
+
+    return render_synopsis(_creation_work_dir(paths, name))
+
+
+def creation_story_gates(paths: Paths, name: str) -> dict[str, Any]:
+    """全书级硬闸：主角缺席、卷间接不上。纯脚本，零成本。"""
+    from workshop.creation import story_gates
+
+    errors, warnings = story_gates(_creation_work_dir(paths, name))
+    return {"errors": errors, "warnings": warnings}

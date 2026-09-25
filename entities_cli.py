@@ -21,11 +21,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from workshop.batch import _pick_price, load_chapter_tasks, pick_model_id, price_bucket  # noqa: E402
 from workshop.config import load_config  # noqa: E402
 from workshop.entities import (  # noqa: E402
+    ALIASES_BASENAME,
     DEFAULT_BLOCK_SIZE,
     EntitiesOptions,
     EntitiesPlan,
     build_entities_plan,
     generate_entities,
+    load_aliases,
     save_entities,
 )
 from workshop.llm import MAX_TOKENS_CAP, OpenAICompatProvider, default_max_tokens  # noqa: E402
@@ -214,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             secrets=store.known_values,
             on_progress=lambda i, t, l: print(f"  [{i}/{t}] 抽取 {l}", flush=True),
             state_path=dirs["out"] / "_state.json",
+            aliases=load_aliases(dirs["work_dir"] / ALIASES_BASENAME),
             limit=args.limit,
         )
     finally:

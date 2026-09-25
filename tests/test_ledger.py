@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -523,6 +524,85 @@ def test_ledger_context_goes_to_variable_tail() -> None:
     check("没有未回收的伏笔" in tail_without, "空台账给出明确提示")
 
 
+def test_context_is_not_the_oldest_twenty() -> None:
+    """未回收清单不能按创建顺序截断。
+
+    回归：一部 545 章的连载真实踩到——797 条伏笔里只有 21 条进过清单，
+    多事件条目的下标恰好是 0..20，一个不多一个不少。原因是清单取的是
+    `open_items[:limit]`，而 items 是追加顺序，于是模型从第 22 章起就再也
+    看不见新埋的线，只能把每条线索都当新伏笔重新登记（776 条只被埋设过一次）。
+    """
+    print("未回收清单按「近期 + 最久没动」取样，不按创建顺序截断")
+
+    led = Ledger(work="窗")
+    for i in range(1, 31):
+        led.apply(
+            chapter_id=f"c{i}",
+            chapter_no=i,
+            foreshadows=[{"动作": "埋设", "编号": "", "描述": f"线索{i}"}],
+        )
+    check(len(led.open_items) == 30, f"30 条未回收（实际 {len(led.open_items)}）")
+
+    ctx = led.context_for_prompt(chapter_no=40, limit=10)
+    ids = [c["id"] for c in ctx]
+    check(len(ids) == 10, f"清单还是不超 limit（实际 {len(ids)}）")
+    check("F-030" in ids, f"最近动过的在清单里（实际 {ids}）")
+    check("F-001" in ids, f"最久没动过的也在清单里（实际 {ids}）")
+    check(
+        "F-010" not in ids,
+        f"中间那批不再占满窗口（实际 {ids}）",
+    )
+    check(
+        all(c["gap"] == 40 - int(c["id"].split("-")[1]) for c in ctx),
+        "gap 仍按 last_touched 算",
+    )
+
+    # 条数不超过 limit 时全都给，不做无意义的取样
+    small = Ledger(work="小")
+    small.apply(chapter_id="c1", chapter_no=1, foreshadows=[{"动作": "埋设", "编号": "", "描述": "甲"}])
+    check(len(small.context_for_prompt(chapter_no=5, limit=10)) == 1, "条数不足 limit 时全给")
+
+
+def test_save_records_real_stale_baseline() -> None:
+    """台账自己写出的断点清单不能恒为空。
+
+    回归：`save()` 调 `stale_items()` 时没传 current_chapter_no，而它在没有基准时
+    直接返回空——于是写盘里的 `stale_items` 与 `statistics.stale` 永远是 0，
+    而体检报告按自己的基准算出 757 条。同一个量在两处给出相反的答案。
+    """
+    print("台账写盘时带上进度基准，疑似断点不再是假绿灯")
+
+    led = Ledger(work="基准")
+    for i in range(1, 31):
+        led.apply(
+            chapter_id=f"c{i}",
+            chapter_no=i,
+            foreshadows=[{"动作": "埋设", "编号": "", "描述": f"线索{i}"}],
+        )
+    led.apply(chapter_id="c100", chapter_no=100, foreshadows=[])
+    check(led.last_chapter_no == 100, f"进度基准取最大值（实际 {led.last_chapter_no}）")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "foreshadow-ledger.json"
+        led.save(path, stale_threshold=30)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        check(raw["last_chapter_no"] == 100, "基准被持久化")
+        check(
+            raw["statistics"]["stale"] == len(raw["stale_items"]) > 0,
+            f"断点数不是 0（实际 {raw['statistics']['stale']}）",
+        )
+        back = Ledger.load(path)
+        check(back.last_chapter_no == 100, "读回基准")
+        check(
+            "疑似断点 0" not in back.summary(),
+            "summary 不再印出「疑似断点 0」",
+        )
+
+    # 重跑旧章不能让基准倒退
+    led.apply(chapter_id="c2", chapter_no=2, foreshadows=[])
+    check(led.last_chapter_no == 100, "重跑旧章后基准不倒退")
+
+
 def main() -> int:
     print("=" * 58)
     print("伏笔台账自检")
@@ -545,6 +625,8 @@ def main() -> int:
         test_roundtrip,
         test_missing_file_is_empty_ledger,
         test_ledger_context_goes_to_variable_tail,
+        test_context_is_not_the_oldest_twenty,
+        test_save_records_real_stale_baseline,
     ):
         fn()
         print()

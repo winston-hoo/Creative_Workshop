@@ -1,0 +1,31 @@
+# 第 4 章创作任务指令 · v001-c0004
+
+schema_version: brief-v1
+work: original-demo
+chapter_id: v001-c0004
+vol: 1
+chapter_no: 4
+title: "苏清月"
+one_line: "大师姐路过柴房替一个被打的杂役说了句话，李默记住了她。"
+core_plot:
+  - 管事在院子里打一个打翻饭桶的杂役
+  - 苏清月路过，只说了一句「他今天还没吃饭」，管事就收了手
+  - 李默看见她头顶的数值，比在场所有人都高出一大截
+  - 他没有上前道谢，只是把这个名字记下来了
+timeline: "接第3章，隔两天。"
+word_target: [2800, 4000]
+narrative:
+  perspective: "第三限知"
+  tone: "冷幽默，克制，不煽情"
+  focus: ["她那句话要写得平常，不要写成英雄救场", "李默的观察"]
+settings:
+  characters: [李默, 苏清月]
+  factions: [青云宗]
+  terms: [数值之眼]
+foreshadow:
+  - action: 埋设
+    id: F-003
+    desc: 苏清月为什么替杂役说话
+carry_over: []
+must_not:
+  - 不要让他们当场对话（还没有到那一步）

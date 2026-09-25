@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+
 from .batch import ChapterTask
 from .errors import ErrorKind  # noqa: F401
 from .llm import (
@@ -368,6 +370,7 @@ def generate_entities(
     secrets: list[str] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     state_path: Path | None = None,
+    aliases: dict[str, str] | None = None,
     limit: int | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -476,7 +479,7 @@ def generate_entities(
 
     result["pending"] = [str(b["range"]) for b in result["blocks"] if b.get("pending")]
     result["stopped"] = stopped
-    result["merged"] = _merge(result["blocks"])
+    result["merged"] = _merge(result["blocks"], aliases)
     _save_state(state_path, result, secrets)
     return result
 
@@ -502,6 +505,43 @@ def _norm(name: Any) -> str:
     return str(name or "").strip()
 
 
+ALIASES_BASENAME = "aliases.yaml"
+
+
+def load_aliases(path: str | Path | None) -> dict[str, str]:
+    """读别名归并表，返回 {别名: 正名}。
+
+    实体是分块抽取再归并的，而 `_merge` 只按「名字相同或互为子串」匹配，
+    改称呼、本名、化名这类差异它认不出来，同一个人会变成两张卡，
+    还会在关系表、势力成员、能力持有者里各算一份。
+
+    文件不存在返回空表——大多数作品不需要它，这不是错误。
+    """
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (yaml.YAMLError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for row in data.get("aliases") or []:
+        if not isinstance(row, dict):
+            continue
+        canonical = _norm(row.get("canonical"))
+        if not canonical:
+            continue
+        for alias in row.get("also") or []:
+            alias = _norm(alias)
+            if alias and alias != canonical and alias not in out:
+                out[alias] = canonical
+    return out
+
+
 def _first_int(*values: Any) -> int | None:
     for value in values:
         if isinstance(value, int) and not isinstance(value, bool):
@@ -509,12 +549,19 @@ def _first_int(*values: Any) -> int | None:
     return None
 
 
-def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+def _merge(blocks: list[dict[str, Any]], aliases: dict[str, str] | None = None) -> dict[str, Any]:
     characters: dict[str, dict[str, Any]] = {}
     factions: dict[str, dict[str, Any]] = {}
     abilities: dict[str, dict[str, Any]] = {}
     locations: dict[str, dict[str, Any]] = {}
     relations: list[dict[str, Any]] = []
+    aliases = aliases or {}
+
+    def canon(name: Any) -> str:
+        """把别名换成正名。掺在每个 _norm 之后，是为了让**所有**表都用同一个名字：
+        关系表的 from/to、势力成员、能力持有者只要有一处漏了，就会多算出一个人。"""
+        normalized = _norm(name)
+        return aliases.get(normalized, normalized)
 
     def key_of(name: str, table: dict) -> str:
         low = name.lower()
@@ -550,12 +597,12 @@ def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         for ch in block.get("characters") or []:
             if not isinstance(ch, dict):
                 continue
-            name = _norm(ch.get("name"))
+            name = canon(ch.get("name"))
             if not name:
                 continue
             merge_one(characters, name, ch, _first_int(ch.get("first_chapter")), ("role", "identity"))
             for ability in ch.get("abilities") or []:
-                ability = _norm(ability)
+                ability = canon(ability)
                 if not ability:
                     continue
                 merge_one(abilities, ability, {"holder": name}, None, ("effect",))
@@ -565,7 +612,7 @@ def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
                     holders.append(name)
                 entry["holder"] = "、".join(holders)
             for faction in ch.get("factions") or []:
-                faction = _norm(faction)
+                faction = canon(faction)
                 if not faction:
                     continue
                 merge_one(factions, faction, {}, None, ("stance",))
@@ -576,7 +623,7 @@ def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             for rel in ch.get("relations") or []:
                 if not isinstance(rel, dict):
                     continue
-                other = _norm(rel.get("to"))
+                other = canon(rel.get("to"))
                 if not other or other == name:
                     continue
                 row = {
@@ -590,15 +637,25 @@ def _merge(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         for fa in block.get("factions") or []:
             if not isinstance(fa, dict):
                 continue
-            merge_one(factions, fa.get("name"), fa, _first_int(fa.get("first_chapter")), ("stance",))
+            merge_one(factions, canon(fa.get("name")), fa, _first_int(fa.get("first_chapter")), ("stance",))
         for ab in block.get("abilities") or []:
             if not isinstance(ab, dict):
                 continue
-            merge_one(abilities, ab.get("name"), ab, _first_int(ab.get("first_chapter")), ("effect",))
+            merge_one(abilities, canon(ab.get("name")), ab, _first_int(ab.get("first_chapter")), ("effect",))
         for lo in block.get("locations") or []:
             if not isinstance(lo, dict):
                 continue
-            merge_one(locations, lo.get("name"), lo, _first_int(lo.get("first_chapter")), ("note",))
+            merge_one(locations, canon(lo.get("name")), lo, _first_int(lo.get("first_chapter")), ("note",))
+
+    # 别名要挂回卡片上：合并了却不写出来，读的人会以为那个名字凭空消失了，
+    # 也就没法核对「到底把谁并进了谁」。
+    alias_of: dict[str, list[str]] = {}
+    for alias, canonical in aliases.items():
+        alias_of.setdefault(canonical, []).append(alias)
+    for entry in characters.values():
+        extra = sorted(alias_of.get(entry["name"]) or [])
+        if extra:
+            entry["aliases"] = extra
 
     def sort_key(entry: dict[str, Any]) -> tuple:
         return (entry.get("first_chapter") or 10**9, entry["name"])
@@ -662,11 +719,12 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.append("## 人物")
     chars = merged.get("characters") or []
     if chars:
-        lines.append("| 人物 | 定位 | 身份 | 首次出现 |")
-        lines.append("|---|---|---|---|")
+        lines.append("| 人物 | 别名 | 定位 | 身份 | 首次出现 |")
+        lines.append("|---|---|---|---|---|")
         for c in chars:
+            also = "、".join(c.get("aliases") or []) or "—"
             lines.append(
-                f"| {c['name']} | {c.get('role') or '—'} | {c.get('identity') or '—'} | "
+                f"| {c['name']} | {also} | {c.get('role') or '—'} | {c.get('identity') or '—'} | "
                 f"第{c.get('first_chapter') or '—'}章 |"
             )
     else:

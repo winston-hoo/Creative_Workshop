@@ -25,6 +25,11 @@
   --radius-sm: 8px;
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 3px rgba(15, 23, 42, 0.06);
   --shadow-hover: 0 4px 12px rgba(15, 23, 42, 0.08), 0 2px 4px rgba(15, 23, 42, 0.05);
+  /* 页面宽度分两档。默认这一档是「读」：说明、设置、书架、正文，
+     行宽收在舒服的区间里。工作台型的页面（标注台、作品页、创作台）
+     在宽屏上不该跟着一起窄——三栏挤在 1120px 里，正文栏只剩 500 出头，
+     一行三十来个字，屏幕两边各空出三百多像素。见 main.wide。 */
+  --page-max: 1120px;
 }
 
 * { box-sizing: border-box; }
@@ -90,7 +95,14 @@ body {
 .conn.bad { color: var(--danger); }
 .conn.bad::before { background: var(--danger); }
 
-main { max-width: 1120px; margin: 0 auto; padding: 28px 24px 80px; }
+main { max-width: var(--page-max); margin: 0 auto; padding: 28px 24px 80px; }
+
+/* 工作台型页面：把宽度让给内容。窗口不够宽时自动退回归属宽度，
+   所以窄屏（笔记本分屏、单窗口）看到的效果和不加这个类时一样。 */
+main.wide { --page-max: min(1680px, 100%); padding-left: 32px; padding-right: 32px; }
+@media (max-width: 1240px) {
+  main.wide { padding-left: 20px; padding-right: 20px; }
+}
 
 /* ── 通用 ────────────────────────────────────────────── */
 
@@ -269,6 +281,9 @@ tbody tr { transition: background 0.1s; }
 tbody tr:hover { background: #f8fafe; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .table-wrap { max-height: 420px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+/* 表格能滚四百多像素，表头跟着滚走以后「这一列是什么」就没了。
+   th 本来就有不透明底色，直接钉在顶部即可。 */
+.table-wrap thead th { position: sticky; top: 0; z-index: 2; }
 
 .list { margin: 0; padding: 0; list-style: none; font-size: 13px; }
 .list li { padding: 7px 0; border-bottom: 1px solid var(--border); }
@@ -627,3 +642,165 @@ kbd {
   box-shadow: var(--shadow-hover);
 }
 #view > p:first-child > a[href^="#/"]:active { transform: translateY(1px); }
+
+/* ── 作品子导航 ────────────────────────────────────────
+   一部作品下面挂着八个页面（概览、标注台、标注数据、世界观与人物、
+   大纲、知识库、改写台、体检报告）。以前只有概览页上那一排按钮能进去，
+   进了子页就只剩一个「返回」，想看隔壁那一层得先退回去。
+   现在每层顶上都有同一排入口，当前页高亮。 */
+.worknav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 0 16px;
+  padding: 5px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+  scrollbar-width: none;
+  position: sticky;
+  /* 顶栏正好 54px 高。贴在它下面，中间不能留缝——留一条缝，
+     滚动的正文会从缝里穿过去，看起来像界面裂了。 */
+  top: 54px;
+  z-index: 30;
+}
+.worknav::-webkit-scrollbar { display: none; }
+.worknav .wn-sep { flex: 0 0 auto; width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+.worknav a {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.worknav a:hover { background: var(--surface-2); color: var(--text); }
+.worknav a.active { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+
+/* ── 页内锚点 ──────────────────────────────────────────
+   作品概览一页两千多像素，四五个块。给几个胶囊直接跳过去，
+   省掉「滚下去看一眼再滚回来」。 */
+.anchors { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.anchors a {
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 12.5px;
+  text-decoration: none;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.anchors a:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-bg); }
+/* 跳过去的时候别被吸顶的导航和子导航挡住 */
+[id^="sec-"], #task-card, #data-pipeline { scroll-margin-top: 118px; }
+
+/* ── 宽屏：三栏工作台按比例长开 ────────────────────────
+   两边是工具、中间是读。屏幕宽了该让工具栏更宽、正文保持舒服行宽，
+   而不是把正文拉成一行八十字。 */
+main.wide .annot-chlist { width: 250px; }
+main.wide .annot-panel { width: 344px; }
+main.wide .annot-main { padding: 22px 30px; }
+main.wide .annot-main > * { width: 100%; max-width: 46em; margin-left: auto; margin-right: auto; }
+main.wide .annot-main { display: flex; flex-direction: column; align-items: center; }
+
+/* 子导航占了四十来像素，标注台的三块栏要跟着让出来，
+   不然页面底部会再冒出一条多余的滚动条（栏内能滚、页面也能滚，很难看）。
+   254px = 顶栏 + 子导航 + 操作条 + main 上下内边距，实测值。 */
+body.has-subnav .annotator { min-height: calc(100vh - 204px); }
+body.has-subnav .annot-chlist,
+body.has-subnav .annot-main,
+body.has-subnav .annot-panel { max-height: calc(100vh - 254px); }
+/* 标注台整页不该滚：三栏各自滚。main 底部那 80px 留白是给长文章收尾的，
+   在这里只会让页面多出一条无意义的滚动条。 */
+main.annot-page { padding-bottom: 20px; }
+
+/* ── 创作台表单的字段网格 ────────────────────────────────
+   字段原来一律竖着排一行一个。窗口一宽，每个输入框就被拉成一米长，
+   一屏还看不完十几个字段——「书名」和「题材」这种短字段占满 1640px 是浪费。
+   按屏宽分 1 / 2 / 3 列，单列宽度始终在 500 上下，长字段（wide）整行通栏。
+   列表类字段（strlist / objlist，.fspan）要横着放表格，也通栏。 */
+.fgrid { display: grid; grid-template-columns: 1fr; gap: 2px 20px; align-items: start; }
+.cfield { display: block; min-width: 0; margin-bottom: 8px; }
+.cfield[data-wide="1"], .fgrid > .fspan { grid-column: 1 / -1; }
+@media (min-width: 980px) {
+  .fgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (min-width: 1440px) {
+  .fgrid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ── 创作台：引导、层卡、吸顶工具条、字段定位 ──────────────
+   这一页有 251 个输入框、九个字段分区、三层数据。原先进来只有三张只报数字的
+   卡片（「人物 2 / 1 项阻断」），不说做什么、去哪儿做。这几块补的就是这个。 */
+
+.cnext { border-left: 3px solid var(--accent); }
+.cnext-tag {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  background: var(--accent-bg); color: var(--accent);
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+}
+.cnext-title { font-size: 17px; font-weight: 600; margin: 8px 0 4px; }
+.cnext-why { font-size: 13px; line-height: 1.75; max-width: 68em; }
+.cnext-layer {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--border);
+  font-size: 12.5px;
+}
+
+.layer-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px; margin-bottom: 14px;
+}
+@media (max-width: 860px) { .layer-grid { grid-template-columns: 1fr; } }
+.lcard {
+  display: block; padding: 10px 13px; border-radius: var(--radius);
+  border: 1px solid var(--border); background: var(--surface);
+  box-shadow: var(--shadow); text-decoration: none; color: inherit;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+}
+.lcard:hover { border-color: var(--accent); box-shadow: var(--shadow-hover); transform: translateY(-1px); }
+.lcard[data-current] { border-color: var(--accent); background: var(--accent-bg); }
+.lcard-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.lcard-meta { font-size: 12px; margin-top: 3px; }
+.lcard-go { font-size: 12px; color: var(--accent); margin-top: 6px; }
+.lcard[data-current] .lcard-go { color: var(--text-2); }
+
+/* 保存按钮原来只长在表单最顶上，而表单有 3500px 高：
+   改完最后一个分区要滚回顶部才能保存。改成吸顶，一路跟着。 */
+.ctoolbar {
+  position: sticky; top: 54px; z-index: 20;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  padding: 8px 12px; margin-bottom: 12px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: 12px; box-shadow: var(--shadow);
+}
+.sec-card { scroll-margin-top: 126px; }
+
+/* 校验清单：阻断默认展开，提示默认收着 */
+.issues { border-radius: var(--radius-sm); padding: 10px 13px; margin-bottom: 8px; font-size: 13px; }
+.issues.bad { background: var(--danger-bg); border: 1px solid rgba(185, 28, 28, 0.2); }
+.issues.warn { background: var(--warn-bg); border: 1px solid rgba(180, 83, 9, 0.2); }
+.issues > summary { cursor: pointer; font-weight: 600; }
+.issues.bad > summary { color: #991b1b; }
+.issues.warn > summary { color: #92400e; }
+.issues li { line-height: 1.7; }
+
+/* 「去修」跳过去之后要闪一下。不闪的话，滚过去了也不知道该看哪个字段。 */
+@keyframes fieldflash {
+  0%, 100% { box-shadow: none; }
+  15%, 60% { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.35); }
+}
+.cfield.flash { border-radius: 8px; animation: fieldflash 1.9s ease-out; }
+
+/* ── 交互细节 ──────────────────────────────────────────
+   键盘走到哪要看得见；鼠标用户看不到焦点框，所以只在 :focus-visible 上画。 */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+.tab:focus-visible, .btn:focus-visible { outline-offset: 1px; }
+/* 可点但没写成 <button> 的行/块 */
+[data-anchor], .worknav a, .anchors a { -webkit-tap-highlight-color: transparent; }

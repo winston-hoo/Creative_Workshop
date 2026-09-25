@@ -26,8 +26,10 @@ from workshop.entities import (  # noqa: E402
     CallOutcome,
     EntitiesOptions,
     _call,
+    _merge,
     build_entities_plan,
     generate_entities,
+    load_aliases,
 )
 from workshop.llm import ChatResult, repair_truncated_json  # noqa: E402
 
@@ -271,6 +273,96 @@ def test_stop_midway_keeps_finished_blocks() -> None:
         check(result["merged"]["counts"]["characters"] == 3, "已完成的块照常归并")
 
 
+def test_alias_merge_reaches_every_table() -> None:
+    """别名归并要落到**每一张**表，漏一处就等于没并。
+
+    真实失败模式：一部 545 章的连载里，张老师 / 张老鳖 / 张教授 是同一个人
+    （正文第 1、28、303 章都写明了），却在人物表里是三张卡，
+    并且在人物关系、势力成员、能力持有者里各算一份。
+    """
+    print("别名归并：同一人物的多个叫法并成一张卡")
+
+    blocks = [
+        {
+            "range": "第 1-50 章",
+            "error": "",
+            "characters": [
+                {
+                    "name": "雷老师",
+                    "role": "重要配角",
+                    "identity": "星闪大学异能系教师",
+                    "first_chapter": 47,
+                    "factions": ["星闪大学"],
+                    "abilities": ["雷法"],
+                    "relations": [{"to": "雷正刚", "type": "同一人", "note": ""}],
+                }
+            ],
+        },
+        {
+            "range": "第 51-97 章",
+            "error": "",
+            "characters": [
+                {
+                    "name": "雷正刚",
+                    "role": "重要配角",
+                    "identity": "星闪大学异能系老师、辅导员",
+                    "first_chapter": 46,
+                    "factions": [],
+                    "abilities": ["雷法"],
+                    "relations": [],
+                },
+                {
+                    "name": "王铁柱",
+                    "role": "主角",
+                    "identity": "星闪大学学生",
+                    "first_chapter": 1,
+                    "factions": ["星闪大学"],
+                    "abilities": [],
+                    "relations": [],
+                },
+            ],
+        },
+    ]
+
+    merged = _merge(blocks, {"雷正刚": "雷老师"})
+    chars = {c["name"]: c for c in merged["characters"]}
+    check(set(chars) == {"雷老师", "王铁柱"}, f"两张卡并成一张（实际 {sorted(chars)}）")
+    check(chars["雷老师"]["aliases"] == ["雷正刚"], "别名挂回卡片上，可核对并进了谁")
+    check(chars["雷老师"]["identity"].endswith("辅导员"), "身份取更完整的那条")
+    check(
+        merged["factions"][0]["members"] == ["雷老师", "王铁柱"],
+        f"势力成员只用正名（实际 {merged['factions'][0]['members']}）",
+    )
+    check(
+        merged["abilities"][0]["holders"] == ["雷老师"],
+        f"能力持有者只用正名、且不重复（实际 {merged['abilities'][0]['holders']}）",
+    )
+    check(
+        not any("雷正刚" in (r["from"], r["to"]) for r in merged["relations"]),
+        f"关系表里不留别名（实际 {merged['relations']}）",
+    )
+
+    plain = _merge(blocks)
+    check(len(plain["characters"]) == 3, "不给别名表时行为不变（不猜、不并）")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        check(load_aliases(Path(tmp) / "aliases.yaml") == {}, "没有别名表就返回空表，不是错误")
+        path = Path(tmp) / "aliases.yaml"
+        path.write_text(
+            "aliases:\n"
+            "  - canonical: 雷老师\n"
+            "    also: [雷正刚, '  雷教官  ']\n"
+            "    origin: corpus\n"
+            "  - canonical: 空条目\n"
+            "  - canonical: 自己并自己\n"
+            "    also: [自己并自己]\n",
+            encoding="utf-8",
+        )
+        table = load_aliases(path)
+        check(table == {"雷正刚": "雷老师", "雷教官": "雷老师"}, f"别名表读对了（实际 {table}）")
+        check(load_aliases(Path(tmp) / "坏.yaml") == {}, "文件不存在时不抛异常")
+
+
 def main() -> int:
     print("=" * 58)
     print("实体统计链路自检")
@@ -283,6 +375,7 @@ def main() -> int:
         test_non_json_is_not_called_truncation,
         test_limit_marks_pending_then_resumes,
         test_stop_midway_keeps_finished_blocks,
+        test_alias_merge_reaches_every_table,
     ):
         fn()
         print()

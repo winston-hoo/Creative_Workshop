@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <title>小说创作工坊</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 内联图标：不写这一行，浏览器每次都会去要 /favicon.ico 然后拿 404。
+     控制台常年挂一条红字，人会开始忽略控制台——而验证界面时控制台是最有用的东西。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23c8651c'/%3E%3Ctext x='16' y='24' font-size='20' text-anchor='middle' fill='white'%3E%E4%B9%A6%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -21,7 +24,12 @@
   <div class="spacer"></div>
   <span class="conn" id="conn">连接中…</span>
 </header>
-<main id="view"></main>
+<main>
+  <!-- 作品子导航挂在这里，不放在 #view 里：视图重渲染会整块替换 #view 的内容，
+       导航放进去每换一页都要重新拼一遍，还容易被漏掉。 -->
+  <div id="subbar"></div>
+  <div id="view"></div>
+</main>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -144,31 +144,33 @@ def run(plan, *, responder=block_responder, max_attempts=1):
 
 # ── 输出被截断 ──────────────────────────────────────────────
 #
-# 一部 545 章连载的真实运行：11 块段梗概全部成功，最后一步「全书归约」
+# 一部数百章的连载，真实运行时：11 块段梗概全部成功，最后一步「全书归约」
 # 却报「返回内容不是 JSON」。真实原因是输出预算写死 1200，大纲正文还没写完
 # 就被砍断——截断的 JSON 必然不是合法 JSON，于是报错文案把病根盖住了。
 
 # 真实截断长得就是这样：写到 structure 的第二条，值还没写完就没了。
+# 用的样例是 samples/original-demo 那套合成设定（数值之眼 / 青云宗），
+# 与任何真实作品无关。
 BOOK_TRUNCATED = (
     "{\n"
-    '  "logline": "怪力少年王铁柱觉醒变身魅魔异能，从校园打到火星。",\n'
-    '  "premise": "十八岁生日，王铁柱觉醒变身女性的怪力异能，被异能办事处定级。",\n'
+    '  "logline": "一个只能看、不能改的数值之眼，让零层废柴在修真界先活下来。",\n'
+    '  "premise": "外门柴房杂役李默，靠一双看得见修为数值的眼睛活了下来。",\n'
     '  "structure": [\n'
-    '    {"part": "第一段 第1-163章", "gist": "校园里的觉醒与成长。", "turn": "觉醒异能"},\n'
-    '    {"part": "第二段 第164-326章", "gist": "跨出国门的对抗'
+    '    {"part": "第一段 第1-163章", "gist": "外门柴房的挣扎与第一次看穿。", "turn": "觉醒数值之眼"},\n'
+    '    {"part": "第二段 第164-326章", "gist": "走出宗门之后的对抗'
 )
 
 BOOK_COMPLETE = json.dumps(
     {
-        "logline": "怪力少年觉醒变身魅魔异能。",
-        "premise": "十八岁生日觉醒异能。",
+        "logline": "一个只能看、不能改的数值之眼，让零层废柴在修真界先活下来。",
+        "premise": "外门杂役李默凭数值之眼看穿修真界的规矩。",
         "structure": [
-            {"part": "第一段", "gist": "校园觉醒。", "turn": "觉醒异能"},
-            {"part": "第二段", "gist": "跨出国门。", "turn": "公开异能"},
+            {"part": "第一段", "gist": "外门挣扎。", "turn": "觉醒数值之眼"},
+            {"part": "第二段", "gist": "走出宗门。", "turn": "公开这双眼"},
         ],
-        "main_threads": [{"thread": "主线", "gist": "从校园打到火星"}],
+        "main_threads": [{"thread": "主线", "gist": "从柴房走到宗主面前"}],
         "key_turns": ["觉醒", "公开"],
-        "ending": "在火星决战。",
+        "ending": "在青云宗大殿上摊牌。",
         "confidence": "中",
         "uncertain_fields": [],
     },
@@ -496,7 +498,7 @@ def test_book_reduction_escalates_budget() -> None:
 
     check(isinstance(call, OutlineCall), "返回结构化的结果，而不是裸三元组")
     check(client.seen_max_tokens == [1200, 2400], f"第二次把预算翻倍（实际 {client.seen_max_tokens}）")
-    check(call.payload is not None and call.payload.get("ending") == "在火星决战。", "最终拿到完整大纲")
+    check(call.payload is not None and call.payload.get("ending") == "在青云宗大殿上摊牌。", "最终拿到完整大纲")
     check(not call.salvaged, "拿到完整结果就不标记为「只抢救出部分」")
     check(call.error == "", "没有错误，更不会报成「返回内容不是 JSON」")
 

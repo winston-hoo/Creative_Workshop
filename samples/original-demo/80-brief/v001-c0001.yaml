@@ -1,0 +1,45 @@
+# 第 1 章创作任务指令 · v001-c0001
+#
+# 写正文的人只看这一个文件就该能动手：他不需要回去翻设定集和卷表。
+# 这里出现的人物/势力/术语都会跟设定集对账，名字漂了会被抓出来。
+# 校验：python create_cli.py --root samples --check-brief original-demo --chapter v001-c0001
+
+schema_version: brief-v1
+work: original-demo
+chapter_id: v001-c0001
+vol: 1
+chapter_no: 1
+title: "数值"
+
+one_line: "李默醒来发现自己能看到别人头顶的修为数值，而他自己是零。"
+
+core_plot:
+  - 李默在柴房的草席上醒来，先摸到自己不是原来的身体
+  - 出门打水时看见杂役头顶浮着「炼气三层」，愣在原地
+  - 他抄起水桶照自己——头顶什么都没有，只有一个零
+  - 他压住惊惶，装作什么都没发生，把水挑回去
+
+timeline: "开篇。天元三百年秋，入冬前一个清晨。"
+
+word_target: [2800, 4000]
+
+narrative:
+  perspective: "第三限知"
+  tone: "冷幽默，克制，不煽情"
+  focus: ["数值第一次出现的瞬间要写实", "李默的算账心理", "柴房的冷"]
+
+settings:
+  characters: [李默]
+  factions: [青云宗]
+  terms: [数值之眼, 零层]
+
+foreshadow:
+  - action: 埋设
+    id: F-001
+    desc: 数值之眼是怎么来的
+
+carry_over: []
+
+must_not:
+  - 不写李默的第一人称内心独白（本作是第三限知）
+  - 不交代金手指的来源

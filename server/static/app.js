@@ -3,6 +3,8 @@
    后端 API 契约已定死，将来换 Vue3 只需替换这一层，后端不用动。 */
 
 const view = document.getElementById('view');
+const subbar = document.getElementById('subbar');
+const mainEl = document.querySelector('main');
 const connEl = document.getElementById('conn');
 
 /* ── 全局错误可见化 ──────────────────────────────────────
@@ -127,18 +129,44 @@ function askConfirm({ title, html, confirmLabel = '确认', cancelLabel = '取�
         </div>
       </div>`;
 
+    const opener = document.activeElement; // 关掉之后焦点要还给点它的那个按钮
     const done = (value) => {
       document.removeEventListener('keydown', onKey, true);
       // 必须等 await 侧读完表单值再移除。如果先 remove 再 resolve，
       // 回调里 document.getElementById(...) 会拿到 null——表现是
       // 「点了确定但像没点一样」，而且原因在弹窗组件里，极难排查。
       resolve(value);
-      setTimeout(() => back.remove(), 0);
+      setTimeout(() => {
+        back.remove();
+        // 弹窗关掉后焦点不能丢。不还回去，键盘用户就被扔回文档开头，
+        // 下一步 Tab 从顶栏重新走一遍。
+        if (opener && document.contains(opener) && typeof opener.focus === 'function') {
+          opener.focus();
+        }
+      }, 0);
     };
     const onKey = (e) => {
       if (e.key === 'Escape') {
         e.stopPropagation();
         done(false);
+        return;
+      }
+      // Tab 圈在弹窗里。弹窗背后还有整页可聚焦元素，
+      // 不挡住的话 Tab 会走到看不见的按钮上，回车点在别处。
+      if (e.key === 'Tab') {
+        const items = [...back.querySelectorAll(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]'
+        )];
+        if (!items.length) return;
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
       }
     };
     document.addEventListener('keydown', onKey, true);
@@ -218,24 +246,38 @@ async function renderShelf() {
     return;
   }
 
+  // 书架要同时列「导入的作品」和「原创作品」。
+  // 之前只渲染 imported 的那些，于是刚建好的原创作品直接从书架上消失——
+  // 入口就在眼前却点不到，比没有入口更糟。
   const imported = works.filter((w) => w.imported);
+  const originals = works.filter((w) => w.kind === 'original');
+  const others = works.filter((w) => !w.imported && w.kind !== 'original');
 
   view.innerHTML = `
     <div class="spread" style="margin-bottom:16px">
       <div>
         <h1>书架</h1>
-        <p class="lead">已导入 ${imported.length} 部作品。数据直接来自各自工作区，与命令行脚本读的是同一份。</p>
+        <p class="lead">
+          已导入 ${imported.length} 部作品${originals.length ? `，另有 ${originals.length} 部原创作品` : ''}。
+          数据直接来自各自工作区，与命令行脚本读的是同一份。
+        </p>
       </div>
-      <a class="btn" href="#/import" style="text-decoration:none;color:inherit">导入作品</a>
+      <div class="row">
+        <button class="btn" id="new-original">新建原创作品</button>
+        <a class="btn" href="#/import" style="text-decoration:none;color:inherit">导入作品</a>
+      </div>
     </div>
     ${
-      imported.length
-        ? `<div class="work-grid">${imported.map(workCard).join('')}</div>`
+      works.length
+        ? `<div class="work-grid">${[...originals, ...imported, ...others].map(workCard).join('')}</div>`
         : `<div class="empty">
              <div class="empty-icon">📚</div>
-             <h3>还没有导入作品</h3>
-             <p style="margin:0 0 16px">点右上角「导入作品」，选一个 txt 或 docx 文件，先看切分预览再确认。</p>
-             <a class="btn primary" href="#/import" style="text-decoration:none;color:inherit">开始导入</a>
+             <h3>还没有作品</h3>
+             <p style="margin:0 0 16px">「导入作品」是录入别人写完的书做结构分析；「新建原创作品」是从零写自己的书。</p>
+             <div class="row" style="justify-content:center">
+               <button class="btn primary" id="new-original-empty">新建原创作品</button>
+               <a class="btn" href="#/import" style="text-decoration:none;color:inherit">导入作品</a>
+             </div>
            </div>`
     }
     <div id="archive-area" style="margin-top:20px"></div>
@@ -244,7 +286,58 @@ async function renderShelf() {
   view.querySelectorAll('[data-archive]').forEach((btn) => {
     btn.onclick = () => archiveWork(btn.dataset.archive);
   });
+  ['new-original', 'new-original-empty'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.onclick = () => newOriginalWork();
+  });
   loadArchiveArea();
+}
+
+/* 新建原创工作区。
+   只建目录和两份带注释的骨架，**不调模型、不生成任何内容**——
+   设定集、分卷目录、逐章指令都由作者自己一步步填。 */
+async function newOriginalWork() {
+  const ok = await askConfirm({
+    title: '新建原创作品',
+    html: `
+      <p class="muted" style="margin:0 0 12px">
+        只会建出空工作区和两份可填的骨架：设定集、第一卷目录。
+        <b>不会调用模型，也不会生成任何内容。</b>
+      </p>
+      <label style="display:block;margin-bottom:8px">书名<br>
+        <input id="nw-name" style="width:100%" placeholder="例：关山灯"></label>
+      <label style="display:block;margin-bottom:8px">题材<br>
+        <input id="nw-genre" style="width:100%" placeholder="例：玄幻"></label>
+      <label style="display:block;margin-bottom:8px">一句话前提（可留空，之后在设定集里改）<br>
+        <input id="nw-logline" style="width:100%"></label>
+      <label style="display:block;margin-bottom:8px">主角名（可留空）<br>
+        <input id="nw-protagonist" style="width:100%"></label>
+      <label style="display:block">主角核心动机（可留空）<br>
+        <input id="nw-motive" style="width:100%"></label>`,
+    confirmLabel: '创建',
+  });
+  if (!ok) return;
+  const val = (id) => {
+    const el = document.getElementById(id);
+    return el ? el.value.trim() : '';
+  };
+  const name = val('nw-name');
+  if (!name) {
+    await tellUser('没有创建', '<p style="margin:0">书名不能为空。</p>');
+    return;
+  }
+  try {
+    const res = await postJSON('/api/creation/new', {
+      name,
+      genre: val('nw-genre'),
+      logline: val('nw-logline'),
+      protagonist: val('nw-protagonist'),
+      core_motive: val('nw-motive'),
+    });
+    location.hash = `#/work/${encodeURIComponent(res.work)}/creation`;
+  } catch (e) {
+    await tellUser('创建失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
 }
 
 /* 归档区：移出书架的作品在这里列出，可一键恢复。
@@ -307,6 +400,28 @@ async function restoreArchived(name) {
 }
 
 function workCard(w) {
+  if (w.kind === 'original') {
+    const c = w.creation || {};
+    return `
+    <div class="work-card">
+      <h3>${esc(w.name)}</h3>
+      <div class="meta">原创作品 · 从零写</div>
+      <div class="nums">
+        <span><b>${num(c.volumes)}</b> 卷</span>
+        <span><b>${num(c.chapters)}</b> 章</span>
+        <span><b>${num(c.briefs)}</b> 份指令</span>
+      </div>
+      <div class="row wrap" style="margin-bottom:14px">
+        <span class="chip info">不走录入</span>
+        <span class="chip">设定集 · 分卷目录 · 逐章指令</span>
+      </div>
+      <div class="actions">
+        <a class="btn primary" href="#/work/${encodeURIComponent(w.dir_name || w.name)}/creation"
+           style="text-decoration:none;color:inherit">进入创作台</a>
+        <button class="btn ghost" data-archive="${esc(w.dir_name || w.name)}">移出书架</button>
+      </div>
+    </div>`;
+  }
   const integrity = w.integrity_passed
     ? `<span class="chip ok">完整性通过</span>`
     : `<span class="chip bad">完整性未通过</span>`;
@@ -700,6 +815,89 @@ const detailState = { name: '', offset: 0, limit: 50, only: 'all' };
 /* 勾选状态要跨页保留：翻到第 3 页勾几章，再翻回来不能丢。 */
 const selected = new Set();
 
+/* 作品下面挂着八个页面。以前进这些页面只有两条路：概览页上那一排按钮，
+   或者记住 URL。进了子页就只剩一个「回作品页」——想去隔壁那一层得先退回去。
+   现在每层顶上都有同一排入口（挂在 #view 外面的 #subbar 上），当前页高亮。
+
+   创作台**不在**这一排里：它只服务「原创作品」，导入的书点进去只会看到
+   「不是原创工作区」。原创作品的入口在书架卡片上，那一页自带三层侧栏。 */
+const WORK_PAGES = [
+  { key: 'overview', label: '概览', seg: '' },
+  { key: 'annotator', label: '标注台', seg: '/annotator' },
+  { key: 'annotations', label: '标注数据', seg: '/annotations' },
+  { key: 'entities', label: '世界观与人物', seg: '/entities' },
+  { key: 'outline', label: '大纲', seg: '/outline' },
+  { key: 'kb', label: '知识库', seg: '/kb' },
+  { key: 'rewrite', label: '改写台', seg: '/rewrite' },
+  { key: 'report', label: '体检报告', seg: '/report' },
+];
+
+/* 工作台型页面放在宽容器里。阅读型页面（书架、说明、设置、正文）保持原宽度——
+   正文拉成一行八十字比窄着更难读。 */
+const WIDE_SEGMENTS = new Set(['', 'annotator', 'annotations', 'entities', 'outline',
+  'kb', 'rewrite', 'report', 'creation']);
+
+function clearSubNav() {
+  setNoNav();
+  if (mainEl) mainEl.classList.remove('wide', 'annot-page');
+}
+
+function setNoNav() {
+  subbar.innerHTML = '';
+  document.body.classList.remove('has-subnav');
+}
+
+function setWorkNav(name, active) {
+  if (!name) return clearSubNav();
+  const base = `#/work/${encodeURIComponent(name)}`;
+  subbar.innerHTML = `<nav class="worknav" aria-label="作品内的页面">` +
+    WORK_PAGES.map((p) => {
+      const on = p.key === active;
+      return `<a href="${base}${p.seg}"${on ? ' class="active" aria-current="page"' : ''}>` +
+        `${esc(p.label)}</a>`;
+    }).join('') +
+    `</nav>`;
+  document.body.classList.add('has-subnav');
+}
+
+/* 概览页一屏装不下：四五个块摞起来两千多像素，滚下去看一眼再滚回来很烦。
+   给几个胶囊直接跳过去。**不能写成 href="#sec-x"**——那会改 location.hash，
+   哈希路由会把它当成一次换页，页面直接重渲染。
+   跳转目标要配 scroll-margin-top，否则会被吸顶的顶栏和子导航压住。 */
+function inPageAnchors(items) {
+  return `<div class="anchors">` +
+    items.map(([id, label]) => `<a href="#${id}" data-anchor="${id}">${esc(label)}</a>`).join('') +
+    `</div>`;
+}
+
+function bindAnchors(root) {
+  (root || view).querySelectorAll('[data-anchor]').forEach((a) => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const target = document.getElementById(a.dataset.anchor);
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+  });
+}
+
+/* 原创作品没有录入那几层，子导航里那些入口点进去只会报错。
+   书架本来就拿过一次 /api/works，这里按需缓存，避免每页再问一次。 */
+let workKindCache = null;
+
+async function workKindOf(name) {
+  if (workKindCache && name in workKindCache) return workKindCache[name];
+  try {
+    const list = await getJSON('/api/works');
+    workKindCache = {};
+    (Array.isArray(list) ? list : []).forEach((w) => {
+      if (w && w.name) workKindCache[w.name] = w.kind;
+    });
+  } catch {
+    workKindCache = workKindCache || {};
+  }
+  return workKindCache[name] || '';
+}
+
 async function renderWork(name) {
   setTab('');
   detailState.name = name;
@@ -717,7 +915,13 @@ async function renderWork(name) {
   const s = d.statistics || {};
   const src = d.source || {};
   const it = d.integrity || {};
+  if (d.kind === 'original') {
+    // 原创作品没有录入清单，概览页与创作台是同一件事，别让它落在一个 404 上
+    location.hash = `#/work/${encodeURIComponent(name)}/creation`;
+    return;
+  }
   const anomalies = await getJSON(`/api/works/${encodeURIComponent(name)}/anomalies`).catch(() => []);
+  setWorkNav(d.name, 'overview');
 
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px"><a href="#/shelf">书架</a></p>
@@ -733,9 +937,16 @@ async function renderWork(name) {
       { k: '已标注', v: d.annotated },
     ])}
 
+    ${inPageAnchors([
+      ['data-pipeline', '数据依赖'],
+      ['sec-integrity', '完整性核验'],
+      ['task-card', '逐章标注'],
+      ['sec-chapters', '章节列表'],
+    ])}
+
     ${renderDataPipeline(d)}
 
-    <div class="card" style="margin-top:14px">
+    <div class="card" id="sec-integrity" style="margin-top:14px">
       <h3>完整性核验</h3>
       ${it.passed
         ? notice('ok', '通过。把章前区段与所有章节切片拼回去，与原文件逐字一致。')
@@ -760,25 +971,11 @@ async function renderWork(name) {
     <div class="card" id="task-card">
       <div class="spread" style="margin-bottom:10px">
         <h2 style="margin:0">逐章标注</h2>
-        <div class="row">
-          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/annotator"
-             style="text-decoration:none;color:inherit">进入标注台</a>
-          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/annotations"
-             style="text-decoration:none;color:inherit">查看标注数据</a>
-          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/kb"
-             style="text-decoration:none;color:inherit">知识库</a>
-          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/rewrite"
-             style="text-decoration:none;color:inherit">改写台</a>
-          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/entities"
-             style="text-decoration:none;color:inherit">世界观与人物</a>
-          <a class="btn" href="#/work/${encodeURIComponent(d.name)}/report"
-             style="text-decoration:none;color:inherit">查看体检报告</a>
-        </div>
       </div>
       <div id="task-body"><p class="muted">加载中…</p></div>
     </div>
 
-    <div class="card">
+    <div class="card" id="sec-chapters">
       <div class="spread" style="margin-bottom:12px">
         <h2 style="margin:0">章节列表</h2>
         <div class="row">
@@ -818,6 +1015,7 @@ async function renderWork(name) {
   loadChapters();
   loadTaskArea(detailState.name);
   loadDataPipeline(d); // 数据依赖指引：异步填状态
+  bindAnchors();
 }
 
 /* 数据依赖指引：这本书各层数据「由哪个任务产出、当前有没有」。
@@ -1267,7 +1465,8 @@ async function startEntitiesGen(button) {
     await tellUser(
       '没有需要跑的块',
       `<p style="margin:0">${num(plan.blocks)} 块全部已完成，这一轮不会重新调用模型，也不会产生费用。</p>` +
-        `<p class="muted" style="margin:8px 0 0">想从头重跑，需要先删掉 <code>50-entities/_state.json</code>。</p>`
+        `<p class="muted" style="margin:8px 0 0">想从头重跑，得先删掉实体统计的断点记录
+        （<code>50-entities/_state.json</code>），否则它会认为已经抽完了。</p>`
     );
     return;
   }
@@ -2117,8 +2316,1989 @@ function tableOrEmpty(headers, rows, emptyText) {
   </table></div>`;
 }
 
+/* ── M9 创作台 ──────────────────────────────────────────────
+ *
+ * 这一页只做两件事：把原文给他改，把校验结果回给他。
+ *
+ * 故意**没有「一键生成三层」**。创作是作者自己的设定、创意和需求一步步调出来的，
+ * 一次吐一大堆，作者一改就等于全废——那不叫效率，那叫返工。
+ * 将来接模型时也只做单份生成 + 计划预览 + 显式确认，不会往这一页加批量按钮。
+ */
+
+const creationState = {
+  name: '', data: null, kind: 'setting', key: '',
+  mode: 'form',        // setting 层用：form（表单）| raw（原文）
+  draft: null,         // 表单草稿；保存时才落盘
+  dirty: false,
+  chat: [],            // 助手对话历史
+  proposals: [],       // 助手最近一次的提案
+  proposalsFor: null,  // 这批提案出自哪一章：{volume, brief}。切层后 key 会变空，得记着
+  assistPlan: null,
+  kb: { ref: '', section: 'characters', rows: null, counts: null, picked: {}, loaded: false, loading: false },
+  prose: null,         // 已写的正文（brief 层）；draft 是表单草稿，别混
+  prosePlan: null,
+  refs: [],
+  refsLevel: 'k3',          // none / k3 / full —— 默认中间档
+  refsInitialized: false,   // 默认勾选只做一次，之后尊重作者的取消
+};
+
+/* 设定集表单的字段表。加字段就加一行，渲染器不用动。 */
+const SETTING_FORM = [
+  { title: '基本信息', fields: [
+    { k: 'work', label: '书名', type: 'text' },
+    { k: 'genre', label: '题材', type: 'text' },
+    { k: 'logline', label: '一句话前提', type: 'text', wide: true,
+      hint: '谁，在什么处境下，要做什么，代价是什么' },
+    { k: 'core_motive', label: '主角核心动机', type: 'text', wide: true,
+      hint: '一句话。标注每一章的时候会拿它来判断主角的动机有没有立住' },
+    { k: 'ultimate_hook', label: '终极钩子', type: 'text', wide: true,
+      hint: '读者追到最后的那个答案。要具体的画面或台词，不能是「揭开真相」这种空话' },
+    { k: 'target.chapters', label: '目标章数', type: 'int' },
+    { k: 'target.chars_per_chapter', label: '每章字数区间', type: 'range' },
+  ] },
+  { title: '文风', fields: [
+    { k: 'style.perspective', label: '视角', type: 'select',
+      options: ['第一人称', '第三限知', '第三全知'] },
+    { k: 'style.tone', label: '基调', type: 'text', hint: '例：轻松搞笑、冷峻克制' },
+    { k: 'style.taboo', label: '禁忌', type: 'strlist', hint: '一条一句' },
+  ] },
+  { title: '世界观', fields: [
+    { k: 'world.era', label: '时代', type: 'text' },
+    { k: 'world.rules', label: '世界硬规则', type: 'strlist' },
+    { k: 'world.places', label: '地点', type: 'objlist', key: 'name',
+      fields: [['name', '名称'], ['note', '说明']] },
+  ] },
+  { title: '力量体系', fields: [
+    { k: 'power.system', label: '体系名', type: 'text' },
+    { k: 'power.tiers', label: '等级（由低到高）', type: 'strlist' },
+  ] },
+  { title: '能力体系', fields: [
+    { k: 'abilities', label: '', type: 'objlist', key: 'name',
+      fields: [['name', '名称'], ['tier', '等级'], ['holder', '持有者'], ['effect', '效果']] },
+  ] },
+  { title: '势力', fields: [
+    { k: 'factions', label: '', type: 'objlist', key: 'name',
+      fields: [['name', '名称'], ['stance', '立场'], ['leader', '首领']] },
+  ] },
+  { title: '人物', fields: [
+    { k: 'characters', label: '', type: 'objlist', key: 'name',
+      fields: [['name', '名字'], ['role', '定位'], ['identity', '身份'],
+               ['personality', '性格'], ['motive', '动机'], ['arc', '弧光'],
+               ['faction', '所属势力']],
+      listFields: [['abilities', '能力']], withRelations: true },
+  ] },
+  { title: '术语表', fields: [
+    { k: 'terms', label: '', type: 'objlist', key: 'term',
+      fields: [['term', '术语'], ['meaning', '含义']] },
+  ] },
+  { title: '主题与象征', fields: [
+    { k: 'themes', label: '', type: 'strlist' },
+  ] },
+];
+
+function cGet(obj, path) {
+  return path.split('.').reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), obj);
+}
+function cSet(obj, path, value) {
+  const keys = path.split('.');
+  let node = obj;
+  for (const k of keys.slice(0, -1)) {
+    if (!node[k] || typeof node[k] !== 'object') node[k] = {};
+    node = node[k];
+  }
+  node[keys[keys.length - 1]] = value;
+}
+
+function cField(spec, path, value) {
+  const id = `f-${path}`;
+  const common = `id="${id}" data-set="${path}" style="width:100%"`;
+  let control = '';
+  if (spec.type === 'int') {
+    control = `<input type="number" ${common} value="${value ?? ''}">`;
+  } else if (spec.type === 'select') {
+    // 空选项是必须的：没有它，未填的 select 会默认选中第一项，
+    // 一保存就把「章末钩子类型」静默填成「突然揭示」——作者没选过，却有了值。
+    control = `<select ${common}>${['', ...(spec.options || [])]
+      .map((o) => `<option${o === value ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+  } else if (spec.type === 'range') {
+    const lo = Array.isArray(value) ? (value[0] ?? '') : '';
+    const hi = Array.isArray(value) ? (value[1] ?? '') : '';
+    control = `<span class="row"><input type="number" data-set="${path}.0" value="${lo}" style="width:80px">
+      <span class="muted">～</span>
+      <input type="number" data-set="${path}.1" value="${hi}" style="width:80px"></span>`;
+  } else {
+    control = `<input ${common} value="${esc(cellText(value))}">`;
+  }
+  return `<label class="cfield" data-field="${esc(path)}"${spec.wide ? ' data-wide="1"' : ''}>
+    <span class="muted" style="font-size:12px">${esc(spec.label)}</span><br>
+    ${control}
+    ${spec.hint ? `<br><span class="muted" style="font-size:11px">${esc(spec.hint)}</span>` : ''}
+  </label>`;
+}
+
+/* 表单里的「列表」字段必须容忍脏数据。
+   手写的 setting.yaml 里 `abilities: 横练外功、护体罡气` 是**标量字符串**而不是数组，
+   老代码直接 (entry[k] || []).join() 会抛 "join is not a function"，
+   整个创作台白屏——一个字段的类型问题，代价是这一页全废。
+   下面三个助手只负责「画得出来」：不改数据、不丢数据。 */
+function asList(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+/* 列表字段在输入框里的显示值：数组用「、」连；标量原样显示（作者能看见才能改） */
+function listText(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => (v == null ? '' : typeof v === 'object' ? '' : String(v))).join('、');
+  }
+  if (value == null || typeof value === 'object') return '';
+  return String(value);
+}
+
+/* 普通单元格：对象/数组一律降级成可见文本，绝不渲染 [object Object] */
+function cellText(value) {
+  if (value == null) return '';
+  if (typeof value === 'object') return listText(value);
+  return String(value);
+}
+
+function cStrList(spec, path, list) {
+  const rows = asList(list).map((item, i) => `
+    <div class="row" style="margin-bottom:6px">
+      <input data-set="${path}.${i}" value="${esc(cellText(item))}" style="flex:1">
+      <button class="btn ghost" data-del-list="${path}.${i}">删</button>
+    </div>`).join('');
+  return `<div class="cfield fspan" data-field="${esc(path)}" style="margin-bottom:10px">
+    ${spec.label ? `<span class="muted" style="font-size:12px">${esc(spec.label)}</span>` : ''}
+    ${rows || '<div class="muted" style="font-size:12px">（空）</div>'}
+    <button class="btn ghost" data-add-list="${path}">+ 加一条</button>
+  </div>`;
+}
+
+function cObjList(spec, path, list) {
+  const intFields = spec.intFields || [];
+  const rows = asList(list).map((entry, i) => {
+    // 条目本身也可能不是对象（比如 `characters: [夜空]` 这种简写）。
+    // 不是对象时按空表渲染，并把原值显示在 key 列里——不显示等于让作者看不见数据。
+    const isRow = entry != null && typeof entry === 'object' && !Array.isArray(entry);
+    const row = isRow ? entry : {};
+    const scalarText = isRow || entry == null ? '' : String(entry);
+    const inputs = (spec.fields || []).map(([k, label]) => {
+      // 章号这类字段必须按整数回写。type=text 的话草稿里会是字符串 "3"，
+      // yaml 落盘成 '3'，卷表的连号校验当场就崩。
+      const isInt = intFields.includes(k);
+      const shown = !isRow && k === spec.key ? scalarText : cellText(row[k]);
+      return `
+      <label style="display:block;flex:1;min-width:120px">
+        <span class="muted" style="font-size:11px">${esc(label)}</span>
+        <input ${isInt ? 'type="number" data-int="1"' : ''} data-set="${path}.${i}.${k}"
+               value="${esc(shown)}" style="width:100%">
+      </label>`;
+    }).join('');
+    const lists = (spec.listFields || []).map(([k, label]) => `
+      <label style="display:block;flex:1;min-width:140px">
+        <span class="muted" style="font-size:11px">${esc(label)}（、分隔）</span>
+        <input data-set="${path}.${i}.${k}.joined"
+               value="${esc(listText(row[k]))}" style="width:100%">
+      </label>`).join('');
+    // 关系原来是一个 `对象|关系` 的文本框：得记住分隔符，而且看不见到底有几条。
+    // 改成网格：一行一条，对象和关系各一个框，能加能删。
+    const rels = spec.withRelations ? `
+      <div style="flex-basis:100%;margin-top:6px">
+        <span class="muted" style="font-size:11px">关系</span>
+        ${asList(row.relations).map((r, j) => {
+          const rel = r != null && typeof r === 'object' && !Array.isArray(r) ? r : {};
+          return `
+          <div class="row" style="margin:4px 0;gap:6px">
+            <input data-set="${path}.${i}.relations.${j}.to" value="${esc(cellText(rel.to))}"
+              placeholder="对谁" style="flex:1">
+            <input data-set="${path}.${i}.relations.${j}.type" value="${esc(cellText(rel.type))}"
+              placeholder="什么关系（师徒 / 敌对 / 上下级）" style="flex:1">
+            <button class="btn ghost" data-del-rel="${path}.${i}.relations.${j}">删</button>
+          </div>`;
+        }).join('')}
+        <button class="btn ghost" data-add-rel="${path}.${i}.relations">+ 加一条关系</button>
+      </div>` : '';
+    return `<div style="border:1px solid var(--border);border-radius:10px;padding:10px;margin-bottom:10px">
+      <div class="row wrap" style="gap:10px">${inputs}${lists}${rels}</div>
+      <div class="row" style="justify-content:flex-end;margin-top:6px">
+        <button class="btn ghost" data-del-obj="${path}.${i}">删掉这一条</button>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="cfield fspan" data-field="${esc(path)}" style="margin-bottom:12px">
+    ${rows || '<div class="muted" style="font-size:12px">（还没有条目）</div>'}
+    <button class="btn ghost" data-add-obj="${path}" data-key="${esc(spec.key)}">+ 加一条</button>
+  </div>`;
+}
+
+/* 分卷目录的表单。第二层是「部分划分」，第三层是卷表本身。 */
+const VOLUME_FORM = [
+  { title: '卷头', fields: [
+    { k: 'vol.title', label: '卷名', type: 'text' },
+    // 起始/结束章号原来**只有原文模式能改**。而校验器正是拿它俩去比逐章表的章号，
+    // 于是「本卷缺 100 章」这类阻断在表单里永远修不掉——表单缺了两个它自己必需的字段。
+    { k: 'vol.start_chapter', label: '起始章号', type: 'int',
+      hint: '这一卷从第几章开始。要和逐章表里的章号对得上' },
+    { k: 'vol.end_chapter', label: '结束章号', type: 'int',
+      hint: '这一卷到第几章结束。中间缺号会被拦下来，那通常意味着有内容被漏掉' },
+    { k: 'vol.era', label: '时间跨度', type: 'text', hint: '例：入宗后第一个月' },
+    { k: 'vol.core_conflict', label: '本卷核心冲突', type: 'text', wide: true,
+      hint: '一句话。这一卷主角在跟什么东西对着干' },
+    { k: 'vol.goal', label: '本卷目标', type: 'text', wide: true,
+      hint: '卷末要达到的状态。达不到就说明这一卷白写' },
+    { k: 'vol.closing', label: '卷末总结', type: 'text', wide: true,
+      hint: '写完这一卷再回填' },
+  ] },
+  { title: '部分划分', fields: [
+    { k: 'vol.parts', label: '', type: 'objlist', key: 'title', intFields: ['start_chapter', 'end_chapter'],
+      fields: [['title', '标题'], ['start_chapter', '起始章'], ['end_chapter', '结束章'],
+               ['gist', '这一段干什么'], ['ending_demand', '本段末尾的落点要求']],
+      listFields: [['must_complete', '必须完成的功能（、分隔）']] },
+  ] },
+  { title: '逐章表', fields: [
+    { k: 'vol.chapters', label: '', type: 'objlist', key: 'chapter_no', intFields: ['chapter_no'],
+      fields: [['chapter_no', '章号'], ['title', '标题'], ['gist', '本章概要'],
+               ['foreshadow', '伏笔（埋设/推进/回收 + 编号）']],
+      listFields: [['characters', '出场人物']] },
+  ] },
+];
+
+/* 逐章创作任务指令的表单。这是「写这一章之前要定死的东西」。 */
+const BRIEF_FORM = [
+  { title: '本章定位', fields: [
+    { k: 'title', label: '本章标题', type: 'text' },
+    { k: 'one_line', label: '一句话概要', type: 'text', wide: true,
+      hint: '这一章发生了什么。不允许写成「继续发展」' },
+    { k: 'timeline', label: '时间位置', type: 'text', hint: '例：接第 3 章次日清晨' },
+    { k: 'hook_type', label: '章末钩子类型', type: 'select',
+      options: ['突然揭示', '紧急危机', '未完成的动作', '身份反转', '两难选择',
+                '神秘物品线索', '时间限制', '承诺威胁', '离奇消失', '言外之意'],
+      hint: '不能和上一章同一种——下一章靠它轮换。写完回来填' },
+    { k: 'core_plot', label: '核心情节（按顺序）', type: 'strlist' },
+  ] },
+  { title: '叙事', fields: [
+    { k: 'narrative.perspective', label: '视角', type: 'select',
+      options: ['第一人称', '第三限知', '第三全知'] },
+    { k: 'narrative.tone', label: '本章基调', type: 'text' },
+    { k: 'narrative.focus', label: '叙事重点', type: 'strlist',
+      hint: '这一章要花笔墨的地方，一条一句' },
+  ] },
+  { title: '涉及设定', fields: [
+    { k: 'settings.characters', label: '出场人物', type: 'strlist' },
+    { k: 'settings.factions', label: '涉及势力', type: 'strlist' },
+    { k: 'settings.terms', label: '涉及术语', type: 'strlist' },
+  ] },
+  { title: '伏笔动作', fields: [
+    { k: 'foreshadow', label: '', type: 'objlist', key: 'id',
+      fields: [['action', '动作（埋设/推进/回收）'], ['id', '伏笔号'], ['desc', '说明']] },
+  ] },
+  { title: '承接与禁令', fields: [
+    { k: 'carry_over', label: '需承接', type: 'strlist', hint: '上一章留下的东西' },
+    { k: 'must_not', label: '禁止出现', type: 'strlist', hint: '这一章绝对不要写的' },
+  ] },
+];
+
+const FORM_TABLES = { setting: SETTING_FORM, volume: VOLUME_FORM, brief: BRIEF_FORM };
+const FORM_TITLES = { setting: '设定集', volume: '分卷目录', brief: '逐章创作任务指令' };
+const SAVE_LABELS = { setting: '保存设定集', volume: '保存本卷', brief: '保存本章指令' };
+
+/* ── 「现在该干什么」与校验定位 ─────────────────────────────
+   创作台进来是 251 个输入框、九个字段分区、三层数据。原来顶上只有三张卡片：
+   「① 设定集 ❌ 人物 2 / 1 项阻断」「② 分卷目录 ❌ 1 卷 / 1 项阻断」
+   「③ 逐章指令 ❌ 0 / 0 章」——只报数字：哪一项错了、去哪儿改、先做哪层，
+   一句都没说。下面的东西负责把这三件事直接讲出来，并把每条校验结果
+   落到具体字段上，点「去修」就滚过去。 */
+
+/* 把当前层的字段铺平，用于把校验信息反查成具体字段 */
+function creationFieldSpecs(kind) {
+  const out = [];
+  (FORM_TABLES[kind] || SETTING_FORM).forEach((section, i) => {
+    (section.fields || []).forEach((spec) => out.push({ section, sectionIndex: i, spec }));
+  });
+  return out;
+}
+
+/* 后端给的是中文句子，里面会带上原始键名或者字段中文名：
+     「缺 一句话前提（logline）」「target.chapters 没填」「core_conflict（核心冲突）没写」
+     「卷名没写」「terms 是空的」
+   按「完整键 → 键尾名 → 中文标签」三级去认。认不出来就不给「去修」——
+   宁可没有链接，也不能把作者送到一个不相干的字段上。 */
+function creationLocateField(kind, message) {
+  const text = String(message || '');
+  if (!text) return null;
+  const specs = creationFieldSpecs(kind);
+  for (const item of specs) {
+    if (item.spec.k && text.includes(item.spec.k)) return item;
+  }
+  for (const item of specs) {
+    const leaf = String(item.spec.k || '').split('.').pop();
+    if (leaf.length >= 4 && text.includes(leaf)) return item;
+  }
+  for (const item of specs) {
+    const label = item.spec.label || '';
+    if (label.length >= 2 && text.includes(label)) return item;
+  }
+  // 「本卷缺 100 章」「章号断档」这类消息里既没有键名也没有字段名，
+  // 但它指向的一定是逐章表。这是卷层最常见的一条阻断，写死一条规则，
+  // 好过让作者自己去九个分区里翻。
+  if (/缺\s*\d+\s*章|章号断档/.test(text)) {
+    const hit = specs.find((s) => s.spec.k === 'vol.chapters');
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* 三层是一条链：设定集 → 分卷目录 → 逐章指令。任何时刻只有一件事该做。
+   返回 { title, why, label, kind, key } 或者 { action: 'seed-briefs' }。 */
+function creationNextStep(d) {
+  const st = d.setting || {};
+  const counts = d.counts || {};
+  const vols = d.volumes || [];
+  const firstVol = String((vols[0] || {}).vol ?? 1);
+
+  if (!st.exists) {
+    return {
+      title: '第一步：写设定集',
+      why: '设定集是另外两层的地基——分卷目录要用它的人物和势力，逐章指令要用它的术语表。',
+      label: '去写设定集', kind: 'setting', key: '',
+    };
+  }
+  if ((st.errors || []).length) {
+    return {
+      title: `设定集还有 ${(st.errors || []).length} 项要修`,
+      why: '这一层的阻断项不修完，下面两层会跟着一起错。点下面的清单可以逐条跳过去。',
+      label: '去修设定集', kind: 'setting', key: '',
+    };
+  }
+  const badVol = vols.find((v) => (v.errors || 0) > 0);
+  if (badVol) {
+    return {
+      title: `第 ${badVol.vol} 卷还有 ${badVol.errors} 项要修`,
+      why: '卷层的阻断项多半是章号断档——中间的章没列进去，后面的生成会整段错位。',
+      label: `去修第 ${badVol.vol} 卷`, kind: 'volume', key: String(badVol.vol),
+    };
+  }
+  if (!counts.chapters) {
+    return {
+      title: '第二步：在卷里填逐章表',
+      why: '卷头（卷名、核心冲突、目标）写完了，但这一卷还没列章。'
+        + '逐章表是「每一章写什么」的清单，逐章指令就是从它播种出来的。',
+      label: `去填第 ${firstVol} 卷的逐章表`, kind: 'volume', key: firstVol,
+    };
+  }
+  const missing = Math.max(0, (counts.chapters || 0) - (counts.briefs || 0));
+  if (missing) {
+    return {
+      title: `还有 ${missing} 章没有创作指令`,
+      why: '逐章指令不用一章章手抄：一键播种会把卷表里的章号、标题、概要、'
+        + '字数区间、视角直接抄进去，已有的文件一律不动。',
+      label: `一键播种 ${missing} 章指令`, action: 'seed-briefs', kind: 'brief', key: '',
+    };
+  }
+  // 播完种不等于完事：播种只搭骨架，每章的「写到哪停」还得自己写。
+  const badChapter = (d.chapters || []).find((c) => (c.errors || 0) > 0);
+  if (badChapter) {
+    return {
+      title: `第 ${badChapter.chapter_no} 章的指令还有 ${badChapter.errors} 项要修`,
+      why: '每章指令里最要紧的是「这一章要发生什么」——缺了它，生成时会自己编一段。',
+      label: '去修这一章', kind: 'brief', key: badChapter.chapter_id,
+    };
+  }
+  const firstChapter = ((d.chapters || [])[0] || {}).chapter_id || '';
+  return {
+    title: '三层都齐了',
+    why: '接下来是逐章写正文：进任意一章的创作指令，点「写这一章」。一次只出一章，写完就停。',
+    label: '去看第一章的指令', kind: 'brief', key: firstChapter,
+  };
+}
+
+/* 三层各自的状态。卡片本身可点——它们以前是死的，只能看。 */
+function creationLayerCards() {
+  const d = creationState.data || {};
+  const st = d.setting || {};
+  const counts = d.counts || {};
+  const vols = d.volumes || [];
+  const chapters = counts.chapters || 0;
+  const briefs = counts.briefs || 0;
+  const settingErrors = (st.errors || []).length;
+  const volErrors = vols.reduce((n, v) => n + (v.errors || 0), 0);
+  const chapterErrors = (d.chapters || []).filter((c) => (c.errors || 0) > 0).length;
+  const badVol = vols.find((v) => (v.errors || 0) > 0) || vols[0] || {};
+  const firstChapter = ((d.chapters || [])[0] || {}).chapter_id || '';
+
+  const card = (no, name, meta, stateLabel, stateCls, kind, key, current, go) => `
+    <a href="#" class="lcard" data-goto-kind="${kind}" data-goto-key="${esc(key)}"
+       ${current ? 'data-current="1"' : ''}>
+      <div class="lcard-head"><b>${no} ${esc(name)}</b>
+        <span class="chip ${stateCls}">${esc(stateLabel)}</span></div>
+      <div class="lcard-meta muted">${meta}</div>
+      <div class="lcard-go">${current ? '正在编辑' : esc(go || '进去 →')}</div>
+    </a>`;
+
+  const settingMeta = st.exists
+    ? `${st.characters || 0} 个人物 · ${(st.warnings || []).length} 条提示`
+    : '还没有 setting.yaml';
+  const volMeta = vols.length
+    ? `${vols.length} 卷 · 已列 ${chapters} 章`
+    : '还没有分卷文件';
+  // ③ 层是一章一份文件，没有章就没有可打开的地址。
+  // 空章号发给后端只会换回一句「章节 id 不合约定（应为 v001-c0001）：''」——
+  // 所以这一格在没列章之前指向卷表，而不是拼一个非法链接出来。
+  const briefReady = !!chapters;
+
+  return `<div class="layer-grid">
+    ${card('①', '设定集', settingMeta,
+      !st.exists ? '还没写' : settingErrors ? `${settingErrors} 项待修` : '已就绪',
+      !st.exists ? '' : settingErrors ? 'bad' : 'ok',
+      'setting', '', creationState.kind === 'setting')}
+    ${card('②', '分卷目录', volMeta,
+      !vols.length ? '还没写' : volErrors ? `${volErrors} 项待修` : '已就绪',
+      !vols.length ? '' : volErrors ? 'bad' : 'ok',
+      'volume', String(badVol.vol ?? 1), creationState.kind === 'volume')}
+    ${card('③', '逐章创作指令', `${briefs} / ${chapters} 章已填`,
+      !briefReady ? '等卷表先列章'
+        : briefs < chapters ? `${chapters - briefs} 章待填`
+        : chapterErrors ? `${chapterErrors} 章待修` : '已就绪',
+      !briefReady ? '' : (briefs < chapters || chapterErrors) ? 'warn' : 'ok',
+      briefReady ? 'brief' : 'volume',
+      briefReady ? firstChapter : String(badVol.vol ?? 1),
+      creationState.kind === 'brief',
+      briefReady ? '进去 →' : '先去卷里列章 →')}
+  </div>`;
+}
+
+/* 作者正站在某一层上编辑时，全局的「下一步」可能指向别的层（比如他正在填第 1 卷，
+   而卡片在说「去修设定集」）。补一行本层的状态，顺手给一个「去修第一项」——
+   不然他得自己在九个分区里找那 4 项阻断到底是哪 4 项。 */
+function creationCurrentLayerNote() {
+  const { errors = [], warnings = [] } = creationState.issues || {};
+  if (!errors.length && !warnings.length) return '';
+  let firstFix = '';
+  for (const msg of errors.concat(warnings)) {
+    const hit = creationLocateField(creationState.kind, msg);
+    if (hit) { firstFix = hit.spec.k; break; }
+  }
+  const parts = [];
+  if (errors.length) parts.push(`<b>${errors.length} 项阻断</b>`);
+  if (warnings.length) parts.push(`${warnings.length} 条提示`);
+  return `<div class="cnext-layer">
+    <span class="muted">这一层（${esc(creationEditorTitle())}）还有 ${parts.join('、')}</span>
+    ${firstFix ? `<button class="btn ghost" data-fix-field="${esc(firstFix)}">去修第一项</button>` : ''}
+    <button class="btn ghost" data-scroll-issues="1">看完整清单</button>
+  </div>`;
+}
+
+/* ③ 层的桥：卷表列了章、但指令还没建起来。
+   这件事跟前面两层的阻断没有依赖关系——播种只抄卷表里已有的行，
+   纯本地、不花钱，所以不排在链子里等，随时可以点。
+   原来界面根本不调这个接口，于是 ③ 层永远停在「0 / 100 章」，
+   作者只能一章一章手建，或者以为这个功能没做完。 */
+function creationSeedHint() {
+  const counts = (creationState.data || {}).counts || {};
+  const missing = Math.max(0, (counts.chapters || 0) - (counts.briefs || 0));
+  if (!missing) return '';
+  return `<button class="btn ghost" data-seed-briefs="1">按卷表播种 ${missing} 章指令（不花钱）</button>`;
+}
+
+function creationRenderGuide() {
+  const step = creationNextStep(creationState.data || {});
+  const primary = step.action === 'seed-briefs'
+    ? `<button class="btn primary" data-seed-briefs="1">${esc(step.label)}</button>`
+    : `<button class="btn primary" data-goto-kind="${esc(step.kind)}"
+         data-goto-key="${esc(step.key)}">${esc(step.label)}</button>`;
+  const seedHint = step.action === 'seed-briefs' ? '' : creationSeedHint();
+  return `<div id="creation-guide">
+    <div class="card cnext">
+      <div class="row" style="justify-content:space-between;align-items:baseline">
+        <span class="cnext-tag">下一步</span>
+        <span class="muted" style="font-size:12px">① 设定集 → ② 分卷目录 → ③ 逐章创作指令</span>
+      </div>
+      <div class="cnext-title">${esc(step.title)}</div>
+      <div class="muted cnext-why">${esc(step.why)}</div>
+      <div class="row wrap" style="margin-top:12px">${primary}${seedHint}</div>
+      ${creationCurrentLayerNote()}
+    </div>
+    ${creationLayerCards()}
+  </div>`;
+}
+
+/* 校验结果。表单模式下以前**完全看不到**——只有切到「原文」才显示，
+   而默认就是表单模式。于是作者只看到 ❌ 和「1 项阻断」，不知道是哪一项。 */
+function creationRenderIssues() {
+  const kind = creationState.kind;
+  const { errors = [], warnings = [], exists = true } = creationState.issues || {};
+  // 文件还不存在时后端不会报校验错（没东西可校验），于是这里原本显示绿色的
+  // 「没有阻断项」——而作者看到的是一张空表单，很容易以为「这一章已经没问题了」。
+  // 说清楚：文件还没建，填完保存才会建出来。
+  if (!exists) {
+    return `<div id="creation-issues" style="margin-bottom:12px">
+      ${notice('info', `这一份还没有文件——下面填完点「${
+        esc(SAVE_LABELS[kind] || '保存')}」，就会按这份内容建出来。`)}</div>`;
+  }
+  if (!errors.length && !warnings.length) {
+    return `<div id="creation-issues" style="margin-bottom:12px">
+      ${notice('ok', '这一份没有阻断项，也没有要提醒的地方。')}</div>`;
+  }
+  const li = (msg, cls) => {
+    const hit = creationLocateField(kind, msg);
+    const fix = hit
+      ? `<button class="btn ghost" style="font-size:11px;padding:1px 8px;margin-left:6px"
+           data-fix-field="${esc(hit.spec.k)}">去修</button>`
+      : '';
+    return `<li style="margin:3px 0">${esc(msg)}${fix}</li>`;
+  };
+  const block = (title, list, cls, open) => (list.length
+    ? `<details class="issues ${cls}" ${open ? 'open' : ''}>
+         <summary>${title}</summary>
+         <ul style="margin:6px 0 0 18px">${list.slice(0, 30).map(li).join('')}</ul>
+         ${list.length > 30 ? `<p class="muted" style="margin:6px 0 0">还有 ${list.length - 30} 条，切「原文」看全部。</p>` : ''}
+       </details>`
+    : '');
+  return `<div id="creation-issues" style="margin-bottom:12px">
+    ${block(`阻断 ${errors.length} 项 — 不改就开不了工`, errors, 'bad', true)}
+    ${block(`提示 ${warnings.length} 项 — 不改也能往下走`, warnings, 'warn', false)}
+  </div>`;
+}
+
+/* 滚到某个字段并闪一下。不闪的话，滚过去了也不知道该看哪一个。
+   objlist / strlist 没有单个输入框，所以挂 data-field 的是外层容器。 */
+function creationJumpToField(key) {
+  const el = document.querySelector(`[data-field="${CSS.escape(key)}"]`);
+  if (!el) return false;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 2000);
+  const input = el.querySelector('input, select, textarea');
+  if (input) input.focus({ preventScroll: true });
+  return true;
+}
+
+/* 切层的唯一入口。原来这里是 window.confirm()——这个项目自己立过规矩
+   「不要用原生 alert/confirm」：在没开 allow-modals 的 iframe 里它会被**静默**
+   变成 false，表现是「点了没反应」。而创作台是最容易被嵌进预览面板的页面，
+   作者改了半天的表单，切层时点了没反应，只会以为是卡了。 */
+async function creationGoto(kind, key) {
+  if (creationState.dirty) {
+    const ok = await askConfirm({
+      title: '有未保存的改动',
+      html: '<p style="margin:0">表单里改过的东西还没保存，切走就丢了。</p>',
+      confirmLabel: '丢掉改动，切过去',
+      cancelLabel: '留下继续改',
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  creationState.dirty = false;
+  creationState.draft = null;
+  creationState.proposals = [];
+  creationState.mode = kind === 'setting' ? creationState.mode : 'form';
+  location.hash = `#/work/${encodeURIComponent(creationState.name)}/creation/${kind}`
+    + (key ? `/${encodeURIComponent(key)}` : '');
+}
+
+/* 从卷表播种逐章指令。接口一直都在（POST …/creation/seed-briefs），
+   但界面从来没调过——于是 ③ 层永远停在「0 / 100 章」，作者只能一章章手建。
+   播种只补缺的，已有文件一律不动。 */
+async function creationSeedBriefs(vol) {
+  const ok = await askConfirm({
+    title: '按卷表播种逐章指令',
+    html: `<p style="margin:0 0 8px">把卷表里每一章的章号、标题、概要、字数区间、视角，
+      抄成一份逐章创作指令骨架。</p>
+      <p class="muted" style="margin:0">纯本地、<b>不调模型、不花钱</b>；
+      已经写过的指令文件一律不动。播完你再逐章改。</p>`,
+    confirmLabel: '开始播种',
+  });
+  if (!ok) return;
+  try {
+    const res = await api(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/seed-briefs`
+      + (vol ? `?vol=${encodeURIComponent(vol)}` : ''),
+      { method: 'POST' }
+    );
+    await tellUser('播种完成', `<p style="margin:0">新建 ${res.created.length} 份，`
+      + `跳过已有 ${res.skipped.length} 份。</p>`);
+  } catch (e) {
+    await tellUser('播种失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    return;
+  }
+  creationState.data = await getJSON(
+    `/api/works/${encodeURIComponent(creationState.name)}/creation`);
+  const side = document.querySelector('[data-sidebar]');
+  if (side) side.outerHTML = creationRenderSidebar();
+  const guide = document.getElementById('creation-guide');
+  if (guide) {
+    guide.outerHTML = creationRenderGuide();
+    creationBindGuide();
+  }
+}
+
+/* 保存之后只重画「状态」那几块，不重画表单：刚点完保存就把表单整个重建，
+   光标和滚动位置全丢，作者会以为界面抽了一下。 */
+async function creationRefreshPanels() {
+  const base = `/api/works/${encodeURIComponent(creationState.name)}/creation`;
+  try {
+    creationState.data = await getJSON(base);
+  } catch { /* 总览读不到就维持旧状态，别把页面打空 */ }
+  try {
+    const read = await getJSON(
+      `${base}/${creationState.kind}?key=${encodeURIComponent(creationState.key)}`);
+    creationState.issues = {
+      errors: read.errors || [], warnings: read.warnings || [], exists: !!read.exists,
+    };
+    creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
+  } catch { /* 同上 */ }
+  const guide = document.getElementById('creation-guide');
+  if (guide) {
+    guide.outerHTML = creationRenderGuide();
+    creationBindGuide();
+  }
+  const side = document.querySelector('[data-sidebar]');
+  if (side) side.outerHTML = creationRenderSidebar();
+  const issues = document.getElementById('creation-issues');
+  if (issues) issues.innerHTML = creationRenderIssues();
+  creationBindIssues();
+}
+
+function creationBindIssues() {
+  document.querySelectorAll('[data-fix-field]').forEach((btn) => {
+    btn.onclick = () => creationJumpToField(btn.dataset.fixField);
+  });
+}
+
+function creationBindGuide() {
+  document.querySelectorAll('#creation-guide [data-goto-kind]').forEach((el) => {
+    el.onclick = (e) => {
+      e.preventDefault();
+      creationGoto(el.dataset.gotoKind, el.dataset.gotoKey || '');
+    };
+  });
+  const seed = document.querySelectorAll('#creation-guide [data-seed-briefs]');
+  seed.forEach((el) => { el.onclick = () => creationSeedBriefs(''); });
+  const jump = document.querySelector('#creation-guide [data-scroll-issues]');
+  if (jump) {
+    jump.onclick = () => {
+      const box = document.getElementById('creation-issues');
+      if (box) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+  }
+  creationBindIssues();
+}
+
+
+function creationRenderForm(draft) {
+  const table = FORM_TABLES[creationState.kind] || SETTING_FORM;
+  const sections = table.map((section, i) => {
+    const body = section.fields.map((spec) => {
+      const value = cGet(draft, spec.k);
+      if (spec.type === 'strlist') return cStrList(spec, spec.k, value);
+      if (spec.type === 'objlist') return cObjList(spec, spec.k, value);
+      return cField(spec, spec.k, value);
+    }).join('');
+    return `<div class="card sec-card" id="sec-c-${i}" style="margin-bottom:12px">
+      <h3 style="margin:0 0 10px">${esc(section.title)}</h3>
+      <div class="fgrid">${body}</div></div>`;
+  }).join('');
+
+  // 九个分区、几千像素的表单，得有个目录，不然滚到底就找不到「人物」在哪
+  const index = table.length > 1
+    ? inPageAnchors(table.map((s, i) => [`sec-c-${i}`, s.title]))
+    : '';
+
+  // 保存按钮原来只在表单最顶上，而表单有 3500px 高：
+  // 改完最后一个分区，得先滚回顶部才能保存。改成吸顶，跟到底。
+  return `<div class="ctoolbar">
+    <div class="row">
+      <button class="btn" id="tab-form" ${creationState.mode === 'form' ? 'disabled' : ''}>表单</button>
+      <button class="btn" id="tab-raw" ${creationState.mode === 'raw' ? 'disabled' : ''}>原文</button>
+      <span class="muted" style="font-size:12px">${esc(creationEditorTitle())}</span>
+      <span class="muted" style="font-size:12px" id="draft-flag">
+        ${creationState.dirty ? '有未保存的改动' : '没有未保存的改动'}</span>
+    </div>
+    <button class="btn primary" id="creation-save">${esc(SAVE_LABELS[creationState.kind] || '保存')}</button>
+  </div>
+  ${creationRenderIssues()}
+  ${index}
+  ${sections}`;
+}
+
+function creationRenderAssist() {
+  const plan = creationState.assistPlan || {};
+  const refs = plan.refs_available || [];
+  const cost = plan.est_cost_cny == null
+    ? '（没填单价，算不出费用）'
+    : `约 ¥${plan.est_cost_cny}`;
+  const level = plan.refs_level || creationState.refsLevel || 'k3';
+  const hints = plan.refs_level_hints || {};
+  const levelBoxes = Object.keys(plan.refs_levels || { k3: '只注入结构指纹' })
+    .map((key) => `<label class="row" style="align-items:flex-start;gap:6px;margin-bottom:4px">
+        <input type="radio" name="refs-level" data-level="${esc(key)}"
+          ${level === key ? 'checked' : ''}>
+        <span style="font-size:13px">${esc((plan.refs_levels || {})[key])}
+          <span class="muted" style="font-size:11px">${esc(hints[key] || '')}</span></span>
+      </label>`).join('');
+
+  const refBoxes = refs.length
+    ? refs.map((r) => `<label class="row" style="margin:0 12px 6px 0;gap:6px">
+        <input type="checkbox" data-ref="${esc(r.name)}"
+          ${creationState.refs.includes(r.name) ? 'checked' : ''}
+          ${(r.kb_ready && level !== 'none') ? '' : 'disabled'}>
+        <span style="font-size:12px" title="${r.kb_ready ? '' : '还没建过知识库'}">
+          ${esc(r.label)}${r.kb_ready ? '' : '（没知识库）'}</span>
+      </label>`).join('')
+    : '<span class="muted" style="font-size:12px">没有可选的参照作品（书架里还没有建过知识库的已入库作品）</span>';
+
+  const preview = plan.refs_preview || '';
+  const previewBox = preview
+    ? `<details style="margin-bottom:10px">
+        <summary class="muted" style="font-size:12px;cursor:pointer">
+          看这次会喂进去什么（素材 ${num(preview.length)} 字，免费）</summary>
+        <pre style="max-height:260px;overflow:auto;font:12px/1.5 Consolas,Menlo,monospace;
+                    background:var(--surface);border:1px solid var(--border);border-radius:8px;
+                    padding:8px;margin-top:6px;white-space:pre-wrap">${esc(preview)}</pre>
+      </details>`
+    : '';
+
+  // 一次可能几十条（配齐），所以是一张表：逐行「留/改/丢」，不是几十个勾选框。
+  // 表格里直接改「内容」，改完的值会覆盖模型原值——批量生成最容易出问题的就是名字，
+  // 让作者在表里改掉，比接受完再去表单里一行行找快得多。
+  const proposals = creationState.proposals.length
+    ? `<div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:10px">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px">
+          <span class="muted" style="font-size:12px">
+            提案 ${creationState.proposals.length} 条 · 勾中的才进草稿，「内容」可直接改</span>
+          <span class="row">
+            <button class="btn ghost" id="prop-all">全选</button>
+            <button class="btn ghost" id="prop-none">全不选</button>
+            <button class="btn primary" id="assist-accept">接受勾选的</button>
+          </span>
+        </div>
+        <div style="max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead><tr class="muted" style="font-size:11px;text-align:left">
+              <th style="padding:6px;width:34px">留</th>
+              <th style="padding:6px;width:84px">类别</th>
+              <th style="padding:6px;width:52px">动作</th>
+              <th style="padding:6px">内容</th>
+            </tr></thead>
+            <tbody>${creationState.proposals.map((p) => `
+              <tr style="border-top:1px solid var(--border)">
+                <td style="padding:4px 6px">
+                  <input type="checkbox" data-prop="${p.index}" ${p.keep ? 'checked' : ''}></td>
+                <td style="padding:4px 6px">${esc(p.section_label)}</td>
+                <td style="padding:4px 6px">${esc(p.op)}</td>
+                <td style="padding:4px 6px">
+                  <input data-prop-text="${p.index}" value="${esc(p.text)}" style="width:100%"
+                    title="${esc(p.full || '')}"></td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </div>
+        <div id="assist-applied" class="muted" style="font-size:12px;margin-top:6px"></div>
+      </div>` : '';
+
+  const chat = creationState.chat.map((m) => `
+    <div style="margin-bottom:8px">
+      <span class="muted" style="font-size:11px">${m.role === 'user' ? '你' : '助手'}</span>
+      <div style="white-space:pre-wrap;font-size:13px">${esc(m.content)}</div>
+    </div>`).join('');
+
+  return `<div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 4px">和助手对话起草</h3>
+    <p class="muted" style="margin:0 0 10px;font-size:12px">
+      助手只提「建议加/改哪几条」，<b>不会整份重写</b>。你逐条勾选，接受后进上面的表单草稿，
+      再自己点保存才落盘。
+    </p>
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      本次调用：${esc(plan.model || '—')} · 预计输入 ${num(plan.est_input_tokens || 0)} token · ${cost}
+    </div>
+    <div style="margin-bottom:10px">
+      <div class="muted" style="font-size:12px;margin-bottom:4px">
+        素材依据：注入多少（实测全素材约 4 倍输入成本，产出未见明显更好，所以默认中间档）
+      </div>
+      ${levelBoxes}
+    </div>
+    <div style="margin-bottom:10px">
+      <div class="muted" style="font-size:12px;margin-bottom:4px">
+        从哪几本取${level === 'none' ? '（当前档位不注入，勾选不生效）' : ''}
+      </div>
+      <div class="row wrap">${refBoxes}</div>
+    </div>
+    ${previewBox}
+    ${chat ? `<div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:10px">${chat}</div>` : ''}
+    ${proposals}
+    <textarea id="assist-msg" placeholder="例：给我三个配角——一个导师、一个对手、一个损友，都要有明确动机"
+      style="width:100%;min-height:70px;padding:8px;border-radius:10px;
+             border:1px solid var(--border-strong);background:var(--surface);color:var(--text)"></textarea>
+    <div class="row" style="justify-content:flex-end;margin-top:8px">
+      <button class="btn" id="assist-bulk">配齐…</button>
+      <button class="btn primary" id="assist-send">问助手（${cost}）</button>
+    </div>
+    <div id="assist-note" style="margin-top:8px"></div>
+  </div>`;
+}
+
+/* 「配齐」：一次把几类设定提足。形态是勾类别 + 每类要几条，不是一句话许愿。
+   花钱前照旧先看计划（上面的 token 与费用会随类别数变）。 */
+async function assistBulk() {
+  const plan = creationState.assistPlan || {};
+  const ok = await askConfirm({
+    title: '配齐设定集',
+    html: `<p style="margin:0 0 10px" class="muted">
+        一次提足几类，提完在下面的表里逐行留/改/丢。模型会照着素材档位里注入的内容来提。</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <label><input type="checkbox" class="bk-cat" value="world.rules" checked> 世界硬规则</label>
+        <label><input type="checkbox" class="bk-cat" value="factions" checked> 势力</label>
+        <label><input type="checkbox" class="bk-cat" value="abilities" checked> 能力</label>
+        <label><input type="checkbox" class="bk-cat" value="power.tiers" checked> 力量等级</label>
+        <label><input type="checkbox" class="bk-cat" value="terms"> 术语</label>
+        <label><input type="checkbox" class="bk-cat" value="characters"> 人物</label>
+        <label><input type="checkbox" class="bk-cat" value="world.places"> 地点</label>
+        <label><input type="checkbox" class="bk-cat" value="themes"> 主题</label>
+      </div>
+      <label style="display:block;margin-top:10px">每类要几条<br>
+        <input id="bk-count" type="number" value="8" min="1" max="30" style="width:100px"></label>
+      <label style="display:block;margin-top:8px">额外要求（可留空）<br>
+        <textarea id="bk-extra" style="width:100%;min-height:56px"
+          placeholder="例：都往宗门内斗的方向靠；能力不要出现现代科技"></textarea></label>`,
+    confirmLabel: '提出来看看',
+  });
+  if (!ok) return;
+  const cats = [...document.querySelectorAll('.bk-cat')].filter((el) => el.checked)
+    .map((el) => el.value);
+  if (!cats.length) { await tellUser('没提', '<p style="margin:0">一类都没勾。</p>'); return; }
+  const countEl = document.getElementById('bk-count');
+  const count = Math.max(1, Math.min(30, Number((countEl && countEl.value) || 8)));
+  const extraEl = document.getElementById('bk-extra');
+  const extra = extraEl ? extraEl.value.trim() : '';
+  const LABELS = { 'world.rules': '世界硬规则', factions: '势力', abilities: '能力',
+    'power.tiers': '力量等级', terms: '术语', characters: '人物',
+    'world.places': '地点', themes: '主题与象征' };
+  const msg = '把设定集配齐：' + cats.map((c) => `${LABELS[c] || c} ${count} 条`).join('、')
+    + '。每一条都要具体、能用，不要占位性质的空话。'
+    + (extra ? `\n额外要求：${extra}` : '');
+  const box = document.getElementById('assist-msg');
+  if (box) box.value = msg;
+  creationAskAssistant({ bulk: true });
+}
+
+/* 写正文面板。只在「逐章创作任务指令」这一层出现。
+   形态和助手一样：先看免费计划（含阻断原因），再点一次才花钱；一次只出一章。 */
+/* 知识库面板：把已入库作品的知识库翻出来，勾中的收进自己的设定集。
+   每条都由作者点——不做「一键全收」：整批搬进自己书里，他既没看过也没法反悔。 */
+const KB_SECTIONS = [
+  ['characters', '人物'], ['factions', '势力'], ['abilities', '能力'],
+  ['locations', '地点'], ['terms', '术语'], ['relations', '关系'],
+];
+
+/* 提案与对话存 localStorage：一次配齐可能 ¥0.1，手一抖按个 F5 就全没了。
+   要活过刷新的状态是功能的一部分，不是加分项。
+   刻意**不存表单草稿**：草稿是「还没保存的改动」，刷新后静默恢复一份可能已经过期的它，
+   比丢掉更危险（你会在旧内容上继续改，然后覆盖掉磁盘上的新内容）。 */
+function creationStoreKey() {
+  // ⚠️ 键**不带层名**。回填是在逐章指令页点的，但提案表要显示在设定集页——
+  // 按键分层存的话，写进 brief 键、却去 setting 键恢复，永远拿不到（实测表格不出现）。
+  // 提案本来就是「最近一次」的临时状态，按作品存一份即可。
+  return `dsh.creation.${creationState.name}`;
+}
+function creationPersist() {
+  try {
+    localStorage.setItem(creationStoreKey(), JSON.stringify({
+      proposals: creationState.proposals, proposalsFor: creationState.proposalsFor,
+      chat: creationState.chat,
+      refs: creationState.refs, refsLevel: creationState.refsLevel,
+      savedAt: new Date().toISOString(),
+    }));
+  } catch (e) {
+    // 存储满了或被禁用都不该打断创作，就当没这个功能
+  }
+}
+function creationRestore() {
+  // ⚠️ 只看 proposals，不看 chat。chat 会活过切层，而 proposals 会被切层清掉——
+  // 把 chat 也算进守卫条件的话，回填之后（chat 有内容、proposals 被清空）永远不会恢复，
+  // 表格就永远不出现。实测栽在这。
+  if (creationState.proposals.length) return false;
+  let raw = null;
+  try { raw = localStorage.getItem(creationStoreKey()); } catch (e) { return false; }
+  if (!raw) return false;
+  try {
+    const saved = JSON.parse(raw);
+    creationState.proposals = saved.proposals || [];
+    creationState.proposalsFor = saved.proposalsFor || null;
+    creationState.chat = saved.chat || [];
+    if (saved.refs && saved.refs.length) creationState.refs = saved.refs;
+    if (saved.refsLevel) creationState.refsLevel = saved.refsLevel;
+    return creationState.proposals.length > 0 || creationState.chat.length > 0;
+  } catch (e) {
+    return false;
+  }
+}
+
+function kbDetail(row) {
+  return ['role', 'identity', 'stance', 'leader', 'effect', 'tier', 'note', 'meaning', 'type', 'from', 'to']
+    .filter((k) => row[k]).map((k) => row[k]).join('｜').slice(0, 90);
+}
+
+function creationRenderKbPanel() {
+  if (creationState.kind !== 'setting') return '';
+  const plan = creationState.assistPlan || {};
+  const works = (plan.refs_available || []).filter((r) => r.kb_ready);
+  if (!works.length) {
+    return `<div class="card" style="margin-top:12px">
+      <h3 style="margin:0 0 4px">从知识库取素材</h3>
+      <p class="muted" style="margin:0;font-size:12px">
+        书架里还没有建过知识库的作品。先对一本已入库作品跑完标注，
+        它的人物/势力/能力/世界观就能在这里翻。
+      </p></div>`;
+  }
+  const kb = creationState.kb;
+  const options = works.map((r) => `<option value="${esc(r.name)}"
+      ${kb.ref === r.name ? 'selected' : ''}>${esc(r.label)}（${num(r.chapters)} 章）</option>`).join('');
+  const tabs = KB_SECTIONS.map(([key, label]) =>
+    `<button class="btn ${kb.section === key ? 'primary' : 'ghost'}" data-kb-section="${key}">
+       ${label}${kb.counts && kb.counts[key] != null ? ` ${num(kb.counts[key])}` : ''}</button>`).join('');
+  const rows = (kb.rows || []).map((row) => `
+    <label class="row" style="align-items:flex-start;gap:8px;margin-bottom:4px">
+      <input type="checkbox" data-kb-key="${esc(row.key)}" ${kb.picked[row.key] ? 'checked' : ''}>
+      <span style="font-size:13px">${esc(row.key)}
+        <span class="muted" style="font-size:11px">${esc(kbDetail(row))}</span></span>
+    </label>`).join('');
+
+  return `<div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 4px">从知识库取素材</h3>
+    <p class="muted" style="margin:0 0 10px;font-size:12px">
+      素材依据，你来定收哪些。<b>不调模型、不花钱</b>：勾中的条目直接进上面的表单草稿，
+      再自己点「保存设定集」才落盘。知识库里没有的字段（比如人物的动机）会留空给你填。
+    </p>
+    <select id="kb-ref" style="width:100%;margin-bottom:8px">${options}</select>
+    <div class="row wrap" style="margin-bottom:8px">${tabs}</div>
+    ${kb.loading ? '<div class="muted" style="font-size:12px">读知识库…</div>' : ''}
+    ${(kb.rows && kb.rows.length) ? `<div style="max-height:280px;overflow:auto;
+        border:1px solid var(--border);border-radius:8px;padding:8px">
+        <div class="row" style="justify-content:flex-end;margin-bottom:6px">
+          <button class="btn ghost" id="kb-all">全选</button>
+          <button class="btn ghost" id="kb-none">全不选</button>
+        </div>${rows}</div>
+      <div class="row" style="justify-content:flex-end;margin-top:8px">
+        <button class="btn primary" id="kb-import">收进我的设定集</button>
+      </div>` : (kb.loaded ? '<div class="muted" style="font-size:12px">这一类是空的。</div>' : '')}
+    <div id="kb-note" style="margin-top:8px"></div>
+  </div>`;
+}
+
+function creationBindKb() {
+  if (creationState.kind !== 'setting') return;
+  const kb = creationState.kb;
+  const sel = document.getElementById('kb-ref');
+  if (sel && !kb.ref) kb.ref = sel.value;
+  if (kb.ref && !kb.loaded && !kb.loading) kbLoad();
+  if (sel) {
+    sel.onchange = () => { kb.ref = sel.value; kb.rows = null; kb.loaded = false; kbLoad(); };
+  }
+  document.querySelectorAll('[data-kb-section]').forEach((el) => {
+    el.onclick = () => {
+      kb.section = el.getAttribute('data-kb-section');
+      kb.rows = null; kb.loaded = false; kb.picked = {};
+      creationLoad();
+    };
+  });
+  document.querySelectorAll('[data-kb-key]').forEach((el) => {
+    el.onchange = () => {
+      const key = el.getAttribute('data-kb-key');
+      if (el.checked) kb.picked[key] = true; else delete kb.picked[key];
+    };
+  });
+  const all = document.getElementById('kb-all');
+  if (all) all.onclick = () => { kb.rows.forEach((r) => { kb.picked[r.key] = true; }); creationLoad(); };
+  const none = document.getElementById('kb-none');
+  if (none) none.onclick = () => { kb.picked = {}; creationLoad(); };
+  const imp = document.getElementById('kb-import');
+  if (imp) imp.onclick = () => kbImport();
+}
+
+function kbLoad() {
+  const kb = creationState.kb;
+  kb.loading = true;
+  getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/kb/`
+    + `${encodeURIComponent(kb.ref)}?section=${encodeURIComponent(kb.section)}`)
+    .then((data) => {
+      kb.rows = data.rows || [];
+      kb.counts = data.counts || {};
+      kb.loaded = true;
+      kb.loading = false;
+      creationLoad();
+    })
+    .catch((e) => {
+      kb.loading = false;
+      kb.loaded = true;
+      kb.rows = [];
+      creationLoad();
+      const note = document.getElementById('kb-note');
+      if (note) note.innerHTML = notice('bad', esc(e.message));
+    });
+}
+
+async function kbImport() {
+  const kb = creationState.kb;
+  const note = document.getElementById('kb-note');
+  const keys = Object.keys(kb.picked);
+  if (!keys.length) { note.innerHTML = notice('warn', '一条都没勾。'); return; }
+  const btn = document.getElementById('kb-import');
+  btn.disabled = true;
+  try {
+    const res = await postJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/kb-import`,
+      { ref: kb.ref, section: kb.section, keys, document: creationState.draft }
+    );
+    creationState.draft = res.document;
+    creationState.dirty = true;
+    const bad = (res.results || []).filter((r) => !r.ok);
+    const warn = (res.results || []).filter((r) => r.ok && r.warning);
+    note.innerHTML = notice(bad.length ? 'warn' : 'ok',
+      `进了 ${res.imported || 0} 条`
+      + (bad.length ? `；${bad.length} 条没进：`
+          + bad.map((r) => `${esc(r.label)}（${esc(r.reason)}）`).join('；') : '')
+      + (warn.length ? `<br>要你自己补：${warn.map((r) => esc(r.warning)).join('；')}` : '')
+      + '　<b>还没保存，检查后点上面的「保存设定集」</b>');
+    kb.picked = {};
+    creationLoad();
+  } catch (e) {
+    note.innerHTML = notice('bad', esc(e.message));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function creationRenderDraft() {
+  if (creationState.kind !== 'brief' || !creationState.key) return '';
+  const plan = creationState.prosePlan || {};
+  const cost = plan.est_cost_cny == null ? '（没填单价，算不出费用）' : `约 ¥${plan.est_cost_cny}`;
+  const words = (plan.word_range || [2800, 4000]).join('–');
+  const existing = plan.has_draft
+    ? `<span class="muted" style="font-size:12px">已有正文 ${num(plan.existing_chars || 0)} 字，再写一次会覆盖</span>`
+    : '';
+  const blockers = (plan.blocker ? [plan.blocker] : []).concat(plan.warnings || []);
+
+  return `<div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 4px">写这一章</h3>
+    <p class="muted" style="margin:0 0 10px;font-size:12px">
+      按上面的指令 + 设定集 + 本卷目录写正文。<b>一次只出一章</b>，写完就停——
+      连吐十章，第一章不满意后面九章全废。
+    </p>
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      ${plan.model ? `本次调用：${esc(plan.model)} · 输入约 ${num(plan.est_input_tokens || 0)} token`
+        + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token · ${cost}`
+        + `（目标 ${words} 字）` : '正在算计划…'}
+    </div>
+    ${blockers.length ? blockers.map((b, i) =>
+      notice(plan.blocker && i === 0 ? 'bad' : 'warn', esc(b))).join('') : ''}
+    ${existing}
+    <div class="row" style="justify-content:flex-end;margin-top:8px">
+      <button class="btn" id="draft-review" ${plan.has_draft ? '' : 'disabled'}
+        title="按技法审查维度审这一章，意见落成对本章指令的修正">技法审稿…</button>
+      <button class="btn" id="draft-writeback" ${plan.has_draft ? '' : 'disabled'}
+        title="${plan.has_draft ? '' : '还没有正文，没什么可回填的'}">回填到设定集…</button>
+      <button class="btn primary" id="draft-go" ${plan.ready ? '' : 'disabled'}>
+        ${plan.has_draft && plan.ready ? '重写这一章' : '写这一章'}${plan.ready ? `（${cost}）` : ''}</button>
+    </div>
+    <div id="draft-note" style="margin-top:8px"></div>
+  </div>`;
+}
+
+function creationRenderDraftResult() {
+  const d = creationState.prose;
+  if (!d || !d.exists) return '';
+  const stats = d.stats || {};
+  const meta = d.meta || {};
+  const usage = meta.usage || {};
+  return `<div class="card" style="margin-top:12px">
+    <div class="spread" style="margin-bottom:10px">
+      <div>
+        <h3 style="margin:0 0 2px">${esc(creationState.key)} 正文</h3>
+        <span class="muted" style="font-size:12px">
+          ${num(stats.chars || 0)} 字（目标 ${(stats.word_range || []).join('–')}）
+          ${stats.in_range ? '· 在区间内' : '· 不在区间内'}
+          ${meta.model ? `· ${esc(meta.model)}` : ''}
+          ${usage.completion_tokens ? `· 输出 ${num(usage.completion_tokens)} token` : ''}
+        </span>
+      </div>
+      <button class="btn primary" id="draft-save">保存正文</button>
+    </div>
+    ${(d.errors || []).length ? notice('bad',
+      `<b>${d.errors.length} 项要处理</b><ul style="margin:6px 0 0 18px">${
+        d.errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>`) : ''}
+    ${(d.warnings || []).length ? notice('warn',
+      `<ul style="margin:0 0 0 18px">${d.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>`) : ''}
+    <textarea id="draft-text" spellcheck="false"
+      style="width:100%;min-height:520px;font:15px/1.9 Georgia,'Songti SC',serif;
+             padding:14px;border-radius:10px;border:1px solid var(--border-strong);
+             background:var(--surface);color:var(--text);resize:vertical"
+      >${esc(d.text || '')}</textarea>
+    <div id="draft-save-note" class="muted" style="font-size:12px;margin-top:6px">
+      直接在这里改。自检只查字数、禁令字面命中、该出场的人漏了谁——钩子和情节机器查不了。
+    </div>
+  </div>`;
+}
+
+function creationBindDraft() {
+  if (creationState.kind !== 'brief' || !creationState.key) return;
+  if (!creationState.prosePlan) {
+    getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}/plan`)
+      .then((p) => { creationState.prosePlan = p; creationLoad(); })
+      .catch(() => {});
+  }
+  if (!creationState.prose) {
+    getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}`)
+      .then((d) => { creationState.prose = d; if (d.exists) creationLoad(); })
+      .catch(() => {});
+  }
+  const go = document.getElementById('draft-go');
+  if (go) {
+    go.onclick = () => {
+      const plan = creationState.prosePlan || {};
+      const cost = plan.est_cost_cny == null ? '费用未知' : `约 ¥${plan.est_cost_cny}`;
+      const words = (plan.word_range || []).join('–');
+      const extra = plan.has_draft ? `\n\n这一章已经有正文，会被覆盖。` : '';
+      if (!window.confirm(`写这一章？目标 ${words} 字，${cost}。${extra}`)) return;
+      draftGenerate();
+    };
+  }
+  const save = document.getElementById('draft-save');
+  if (save) save.onclick = () => draftSave();
+  const wb = document.getElementById('draft-writeback');
+  if (wb) wb.onclick = () => draftWriteback();
+  const rv = document.getElementById('draft-review');
+  if (rv) rv.onclick = () => draftReview();
+}
+
+/* 回填：拿这一章的正文当事实来源，把正文里**实际出现过的**东西提回设定集。
+   和起草走同一套提案表格（逐条留/改/丢），但提示词是另一套——
+   回填提错了会把编出来的东西写进真源，所以铁律是「正文里没有的一个字都不许提」。 */
+async function draftWriteback() {
+  const btn = document.getElementById('draft-writeback');
+  btn.disabled = true;
+  btn.textContent = '对正文…（慢一点）';
+  try {
+    const res = await postJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/assist`,
+      { task: 'writeback', key: creationState.key, layer: 'brief',
+        refs: creationState.refs, level: creationState.refsLevel, max_tokens: 4000 }
+    );
+    if (res.error) {
+      await tellUser('没拿到提案', `<p style="margin:0">${esc(res.error)}</p>`);
+      return;
+    }
+    creationState.proposals = res.proposals || [];
+    // 记下这批提案出自哪一章：切到设定集页之后 key 会变空，那时再想推断就晚了。
+    creationState.proposalsFor = {
+      volume: volumeKeyOf(creationState.key), brief: creationState.key };
+    creationState.chat = [...creationState.chat,
+      { role: 'assistant', content: `（回填 ${creationState.key}）${res.reply || ''}` }];
+    creationPersist();
+    // 提案表格在设定集那一层，切过去看
+    location.hash = `#/work/${encodeURIComponent(creationState.name)}/creation/setting`;
+  } catch (e) {
+    await tellUser('回填失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '回填到设定集…';
+  }
+}
+
+async function draftGenerate() {
+  const btn = document.getElementById('draft-go');
+  const note = document.getElementById('draft-note');
+  btn.disabled = true;
+  btn.textContent = '写着呢…（长篇会慢，可能要一两分钟）';
+  try {
+    const res = await postJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}`,
+      { refs: creationState.refs, level: creationState.refsLevel }
+    );
+    if (!res.ok) {
+      note.innerHTML = notice('bad', `没写成：${esc(res.error || '未知原因')}`);
+      return;
+    }
+    creationState.prose = {
+      exists: true, text: res.text, errors: res.errors, warnings: res.warnings,
+      stats: res.stats, meta: { model: creationState.prosePlan.model, usage: res.usage },
+    };
+    note.innerHTML = notice('ok',
+      `写完并已落盘：${num(res.stats.chars)} 字。${(res.errors || []).length
+        ? `有 ${res.errors.length} 项要处理，看下面。` : '自检没发现问题。'}`);
+    creationLoad();
+  } catch (e) {
+    note.innerHTML = notice('bad', esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '写这一章';
+  }
+}
+
+async function draftSave() {
+  const ta = document.getElementById('draft-text');
+  const note = document.getElementById('draft-save-note');
+  const btn = document.getElementById('draft-save');
+  btn.disabled = true;
+  try {
+    const res = await api(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}`,
+      { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: ta.value }) }
+    );
+    note.textContent = res.saved ? '已保存。' : '没保存';
+    creationState.prose = null;
+    creationState.prosePlan = null;
+    creationLoad();
+  } catch (e) {
+    note.textContent = `保存失败：${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* 伏笔账：作者最需要的一句话是「现在还有几条挂着没收」。
+   链路校验只管单条对不对，回答不了这个。 */
+/* 人物动向：长篇最隐蔽的失败不是写错，是**写着写着人不见了**。
+   「连续缺席 N 章」就是那个信号，按它排序，最上面就该处理。 */
+/* 全书梗概：从三层真源**渲染**，不是单独存的一份。
+   所以它永远跟着真源走——改了大纲或指令，这里立刻跟着变，不会像"另存一份梗概"那样过期。 */
+function creationRenderSynopsisCard(text) {
+  if (!text) return '';
+  const lines = text.split('\n').length;
+  return `<div class="card" style="margin-bottom:14px">
+    <details>
+      <summary style="cursor:pointer">
+        <b>全书梗概</b>
+        <span class="muted" style="font-size:12px">
+          　从设定集 / 分卷目录 / 逐章指令渲染而成（${num(lines)} 行），不是另存的一份，不会过期</span>
+      </summary>
+      <pre style="max-height:520px;overflow:auto;margin-top:10px;padding:10px;
+                  font:13px/1.7 Georgia,'Songti SC',serif;white-space:pre-wrap;
+                  background:var(--surface);border:1px solid var(--border);border-radius:8px"
+        >${esc(text)}</pre>
+    </details>
+  </div>`;
+}
+
+function creationRenderCastCard(cast, consistency) {
+  const rows = (cast && cast.rows) || [];
+  const problems = consistency || [];
+  if (!rows.length && !problems.length) return '';
+  const items = rows.slice(0, 14).map((r) => `
+    <li style="margin-bottom:4px">
+      <b>${esc(r.name)}</b>
+      <span class="muted" style="font-size:12px">　出场 ${num(r.count)} 章
+        ・ 第 ${num(r.first)}–${num(r.last)} 章${r.max_gap ? ` ・ 最长断档 ${num(r.max_gap)} 章` : ''}</span>
+      ${r.absent ? `<span style="color:var(--warn,#b4622a);font-size:12px">
+        　最近一次出场后已隔 ${num(r.absent)} 章</span>` : ''}
+    </li>`).join('');
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="spread" style="margin-bottom:8px">
+      <div>
+        <h3 style="margin:0 0 2px">人物动向</h3>
+        <span class="muted" style="font-size:12px">
+          共 ${num((cast && cast.counts && cast.counts.characters) || 0)} 人有出场记录，
+          扫了 ${num((cast && cast.counts && cast.counts.chapters) || 0)} 章
+          （最远到第 ${num((cast && cast.counts && cast.counts.latest_chapter_no) || 0)} 章）</span>
+      </div>
+    </div>
+    ${items ? `<ul class="list" style="margin:0;padding:0;list-style:none">${items}</ul>` : ''}
+    ${problems.length ? notice('warn',
+      `<b>卷表/指令里点过名、设定集里却没有：</b><ul style="margin:6px 0 0 18px">${
+        problems.slice(0, 8).map((p) => `<li>${esc(p)}</li>`).join('')}</ul>`) : ''}
+  </div>`;
+}
+
+function creationRenderForeshadowCard(led) {
+  if (!led || !led.counts) return '';
+  const c = led.counts;
+  if (!c.chapters) return '';
+  const open = led.open || [];
+  const rows = open.slice(0, 12).map((r) => `
+    <li style="margin-bottom:4px">
+      <b>${esc(r.id)}</b>　${esc(r.desc) || '<span class="muted">（没写说明）</span>'}
+      <span class="muted" style="font-size:11px">
+        　埋于 ${esc(String(r.planted_at))}${r.advances ? ` · 推进过 ${r.advances} 次` : ''}
+        · 挂了 ${num(r.hanging_chapters)} 章</span>
+    </li>`).join('');
+  const problems = (led.problems || []).length
+    ? notice('warn', `<ul style="margin:0 0 0 18px">${
+        led.problems.slice(0, 6).map((p) => `<li>${esc(p)}</li>`).join('')}</ul>`)
+    : '';
+  return `<div class="card" style="margin-bottom:14px">
+    <div class="spread" style="margin-bottom:8px">
+      <div>
+        <h3 style="margin:0 0 2px">伏笔账</h3>
+        <span class="muted" style="font-size:12px">
+          已埋 ${num(c.recovered + c.open)} 条 · <b>挂着 ${num(c.open)} 条没收</b> · 已收 ${num(c.recovered)} 条
+          （扫了 ${num(c.chapters)} 章，最远到第 ${num(c.latest_chapter_no)} 章）</span>
+      </div>
+    </div>
+    ${open.length ? `<ul class="list" style="margin:0 0 8px;padding:0;list-style:none">${rows}</ul>
+      ${open.length > 12 ? `<div class="muted" style="font-size:12px">还有 ${num(open.length - 12)} 条没列出来</div>` : ''}`
+      : '<div class="muted" style="font-size:13px">没有挂着的伏笔。</div>'}
+    ${problems}
+  </div>`;
+}
+
+function creationRenderEditor(read) {
+  const kind = creationState.kind;
+  if (creationState.mode === 'form') {
+    if (!creationState.draft) creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
+    return creationRenderForm(creationState.draft)
+      + creationRenderKbPanel()
+      + creationRenderAssist()
+      + creationRenderDraft()
+      + creationRenderDraftResult();
+  }
+  return `<div class="card">
+    <div class="spread" style="margin-bottom:10px">
+      <div class="row">
+        <button class="btn" id="tab-form">表单</button>
+        <button class="btn" id="tab-raw" disabled>原文</button>
+        <span class="muted" style="font-size:12px">${esc(creationEditorTitle())}</span>
+      </div>
+      <button class="btn primary" id="creation-save">保存原文</button>
+    </div>
+    <p class="muted" style="font-size:12px;margin:0 0 8px">
+      这里改的是文件原文，<b>手写注释会保留</b>；表单保存会重新生成 YAML、注释会没有。
+    </p>
+    <textarea id="creation-text" spellcheck="false"
+      style="width:100%;min-height:440px;font:13px/1.6 Consolas,Menlo,monospace;
+             padding:10px;border-radius:10px;border:1px solid var(--border-strong);
+             background:var(--surface);color:var(--text);resize:vertical"
+      >${esc(read.text || '')}</textarea>
+    <div id="creation-check" style="margin-top:10px">${creationRenderCheck(read.errors, read.warnings)}</div>
+  </div>`;
+}
+
+function creationRenderSidebar() {
+  const d = creationState.data || {};
+  const rows = [];
+  rows.push(`<li><a href="#" data-ck="setting" data-key=""
+    class="${creationState.kind === 'setting' ? 'active' : ''}">设定集</a></li>`);
+  (d.volumes || []).forEach((v) => {
+    rows.push(`<li><a href="#" data-ck="volume" data-key="${v.vol}"
+      class="${creationState.kind === 'volume' && String(creationState.key) === String(v.vol) ? 'active' : ''}">
+      第 ${v.vol} 卷${v.title ? `　${esc(v.title)}` : ''}
+      ${v.errors ? `<span class="chip bad" style="margin-left:6px">${v.errors} 项</span>` : ''}</a></li>`);
+  });
+  // 徽标要带单位：光一个「1」，作者分不清是 1 项待修还是 1 章已填。
+  const chapters = (d.chapters || []).map((c) => {
+    const flag = !c.has_brief ? '<span class="muted">未填</span>'
+      : c.errors ? `<span class="chip bad">${c.errors} 项</span>`
+      : c.warnings ? `<span class="chip warn">${c.warnings} 条</span>` : '<span class="chip ok">ok</span>';
+    return `<li><a href="#" data-ck="brief" data-key="${c.chapter_id}"
+      class="${creationState.kind === 'brief' && creationState.key === c.chapter_id ? 'active' : ''}">
+      第${c.chapter_no}章 ${esc(c.title || '')} ${flag}</a></li>`;
+  });
+  return `<div class="card" data-sidebar style="padding:10px"><ul class="list" style="margin:0">${rows.join('')}</ul>
+    ${chapters.length ? `<div class="muted" style="font-size:12px;margin:10px 0 4px">逐章创作任务指令</div>
+      <ul class="list" style="margin:0;max-height:340px;overflow:auto">${chapters.join('')}</ul>` : ''}
+  </div>`;
+}
+
+function creationEditorTitle() {
+  const kind = creationState.kind;
+  if (kind === 'setting') return '设定集（人写的真源）';
+  // 卷号在 URL 里是 001 这种（文件名格式），显示时去掉前导零
+  const shown = String(creationState.key).replace(/^0+(?=\d)/, '');
+  if (kind === 'volume') return `第 ${shown} 卷 分卷目录`;
+  return `逐章创作任务指令 · ${creationState.key}`;
+}
+
+function creationRenderCheck(errors, warnings) {
+  const parts = [];
+  if (errors && errors.length) {
+    parts.push(notice('bad', `<b>阻断 ${errors.length} 项</b>（不改就开不了工）<ul style="margin:6px 0 0 18px">${
+      errors.slice(0, 20).map((e) => `<li>${esc(e)}</li>`).join('')}</ul>`));
+  }
+  if (warnings && warnings.length) {
+    parts.push(notice('warn', `<b>提示 ${warnings.length} 项</b><ul style="margin:6px 0 0 18px">${
+      warnings.slice(0, 20).map((w) => `<li>${esc(w)}</li>`).join('')}</ul>`));
+  }
+  if (!parts.length) parts.push(notice('ok', '这一份没问题。'));
+  return parts.join('');
+}
+
+async function creationLoad() {
+  const d = creationState.data || {};
+  const qs = `?key=${encodeURIComponent(creationState.key)}`;
+  let read = { exists: false, text: '', errors: [], warnings: [] };
+  try {
+    read = await getJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/${creationState.kind}${qs}`
+    );
+  } catch (e) {
+    view.innerHTML = notice('bad', `读取失败：${esc(e.message)}`);
+    return;
+  }
+  // 校验结果挂在 state 上：表单渲染时要用它画「阻断/提示」清单。
+  // 原来它只存在于这个局部变量里，于是只有「原文」那一支能显示，
+  // 而默认进的就是表单模式——作者只看到 ❌ 和「1 项阻断」，看不到是哪一项。
+  creationState.issues = {
+    errors: read.errors || [], warnings: read.warnings || [], exists: !!read.exists,
+  };
+  view.innerHTML = `
+    <p class="muted" style="margin-bottom:6px">
+      <a href="#/shelf">书架</a> / ${esc(creationState.name)} / 创作台
+    </p>
+    <h1 style="margin:0 0 4px">创作台</h1>
+    <p class="muted" style="margin:0 0 14px">
+      三层都是你自己写的真源，这里只做编辑与校验。
+      <b>没有一键生成</b>——创作要一步步调，一次全吐出来改起来等于全废。
+    </p>
+    <div id="creation-guide-anchor"></div>
+    ${creationRenderForeshadowCard(d.foreshadows)}
+    ${creationRenderCastCard(d.cast, d.consistency)}
+    ${creationRenderSynopsisCard(d.synopsis)}
+    <div style="display:grid;grid-template-columns:280px 1fr;gap:14px;align-items:start">
+      ${creationRenderSidebar()}
+      <div id="creation-editor">${creationRenderEditor(read)}</div>
+    </div>
+  `;
+
+  // 引导块放在「读的资料」之前：先告诉他该干什么，再给他看现状。
+  const anchor = document.getElementById('creation-guide-anchor');
+  anchor.outerHTML = creationRenderGuide();
+
+  view.querySelectorAll('[data-ck]').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      creationGoto(el.getAttribute('data-ck'), el.getAttribute('data-key') || '');
+    });
+  });
+  creationBindGuide();
+  bindAnchors(view);
+
+  if (creationState.kind === 'setting' || creationState.kind === 'volume'
+      || creationState.kind === 'brief') {
+    if (creationState.mode === 'form') creationBindForm(read);
+    else creationBindRaw(read);
+    creationBindAssist();
+    creationBindDraft();
+    creationBindKb();
+  } else {
+    creationBindRaw(read);
+  }
+  // 放在最后：恢复在前、落盘在后。反过来的话，一进页面就会用空状态盖掉存着的提案。
+  creationPersist();
+}
+
+/* 表单：改哪个框就更新草稿的哪条路径。**只改草稿，不落盘**。 */
+function creationBindForm(read) {
+  const rerender = () => {
+    document.getElementById('creation-editor').innerHTML = creationRenderEditor(read);
+    if (creationState.mode === 'form') creationBindForm(read);
+    else creationBindRaw(read);
+    creationBindAssist();
+    creationBindIssues();
+    bindAnchors(view); // 分区目录的跳转是重渲染后新生成的，得重新绑
+  };
+  const refreshFlag = () => {
+    const el = document.getElementById('draft-flag');
+    if (el) el.textContent = creationState.dirty ? '有未保存的改动' : '没有未保存的改动';
+  };
+
+  document.querySelectorAll('[data-set]').forEach((el) => {
+    el.addEventListener('input', () => {
+      const path = el.getAttribute('data-set');
+      let value = el.value;
+      if (path.endsWith('.joined')) {
+        const base = path.slice(0, -'.joined'.length);
+        cSet(creationState.draft, base, value.split(/[、,，]/).map((s) => s.trim()).filter(Boolean));
+
+      } else if (el.type === 'number' || el.getAttribute('data-int')) {
+        cSet(creationState.draft, path, value === '' ? null : Number(value));
+      } else {
+        cSet(creationState.draft, path, value);
+      }
+      creationState.dirty = true;
+      refreshFlag();
+    });
+  });
+  document.querySelectorAll('[data-add-list]').forEach((el) => {
+    el.onclick = () => {
+      const path = el.getAttribute('data-add-list');
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.push('');
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  document.querySelectorAll('[data-del-list]').forEach((el) => {
+    el.onclick = () => {
+      const [path, index] = el.getAttribute('data-del-list').split(/\.(?=\d+$)/);
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.splice(Number(index), 1);
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  document.querySelectorAll('[data-add-obj]').forEach((el) => {
+    el.onclick = () => {
+      const path = el.getAttribute('data-add-obj');
+      const key = el.getAttribute('data-key');
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.push({ [key]: '' });
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  document.querySelectorAll('[data-del-obj]').forEach((el) => {
+    el.onclick = () => {
+      const [path, index] = el.getAttribute('data-del-obj').split(/\.(?=\d+$)/);
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.splice(Number(index), 1);
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  // 关系网格的增删。cSet 能走数组下标，但**新建下标**它会给一个 {} 而不是 push，
+  // 所以「加一条关系」必须显式 push，不能靠 data-set 自动建。
+  document.querySelectorAll('[data-add-rel]').forEach((el) => {
+    el.onclick = () => {
+      const path = el.getAttribute('data-add-rel');
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.push({ to: '', type: '' });
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  document.querySelectorAll('[data-del-rel]').forEach((el) => {
+    el.onclick = () => {
+      const [path, index] = el.getAttribute('data-del-rel').split(/\.(?=\d+$)/);
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.splice(Number(index), 1);
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  document.getElementById('tab-form').onclick = () => { creationState.mode = 'form'; rerender(); };
+  document.getElementById('tab-raw').onclick = () => { creationState.mode = 'raw'; rerender(); };
+  document.getElementById('creation-save').onclick = () => creationSaveForm();
+}
+
+/* 跨层接受：一批提案指向不同的层，就分头 apply、分头落盘。
+   当前正在编辑的那一层只进草稿（作者自己点保存）；
+   不在编辑的那几层读的是**磁盘上的当前内容**，接受即保存——
+   省掉一套三份草稿并存的界面，代价是那几层立即落盘，所以结果里会写明。 */
+async function assistApplyMulti(accept) {
+  const note = document.getElementById('assist-applied');
+  accept.disabled = true;
+  const byLayer = {};
+  creationState.proposals.filter((p) => p.keep).forEach((p) => {
+    const L = p.layer || creationState.kind;
+    (byLayer[L] = byLayer[L] || []).push(p);
+  });
+  const lines = [];
+  let bad = 0;
+  try {
+    for (const L of Object.keys(byLayer)) {
+      const group = byLayer[L];
+      const editing = L === creationState.kind;
+      // ⚠️ 卷号/章节号要从**提案出自哪一章**取，不能从当前页面推断：
+      // 回填是在逐章指令页点的，可提案表显示在设定集页（那时 key 是空的），
+      // 从当前页面猜会得到空卷号 → 400。实测栽在这。
+      const origin = (creationState.proposalsFor || {})[L] || '';
+      const key = L === 'volume' ? (origin || volumeKeyOf(creationState.key))
+        : (L === 'brief' ? (origin || creationState.key) : '');
+      let doc;
+      if (editing) {
+        doc = creationState.draft;
+      } else {
+        // ⚠️ 取不到就必须停：拿 {} 去 apply 会把那一层清成空文档（这个坑踩过一次）
+        const read = await getJSON(
+          `/api/works/${encodeURIComponent(creationState.name)}/creation/${L}`
+          + (key ? `?key=${encodeURIComponent(key)}` : ''));
+        doc = read.data || {};
+        if (!Object.keys(doc).length) {
+          lines.push(`${LLabel(L)}：读不到文档，跳过了（怕把空的写回去）`);
+          bad += 1;
+          continue;
+        }
+      }
+      const res = await postJSON(
+        `/api/works/${encodeURIComponent(creationState.name)}/creation/assist/apply`,
+        { document: doc, proposals: group,
+          accepted: group.map((_, i) => i), layer: L });
+      const okN = res.results.filter((r) => r.ok).length;
+      bad += res.results.filter((r) => !r.ok).length;
+      if (editing) {
+        creationState.draft = res.document;
+        creationState.dirty = true;
+        lines.push(`${LLabel(L)}：进 ${okN} 条（**还没保存**，检查后点上面的保存）`);
+      } else {
+        await api(`/api/works/${encodeURIComponent(creationState.name)}/creation/${L}`
+          + (key ? `?key=${encodeURIComponent(key)}` : ''),
+          { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: res.document }) });
+        lines.push(`${LLabel(L)}：进 ${okN} 条，**已直接保存**`);
+      }
+      const rejected = res.results.filter((r) => !r.ok);
+      if (rejected.length) {
+        lines.push('　没进的：' + rejected.map((r) => `${esc(r.label)}（${esc(r.reason)}）`).join('；'));
+      }
+    }
+    note.innerHTML = notice(bad ? 'warn' : 'ok', lines.join('<br>'));
+    creationPersist();
+  } catch (e) {
+    note.innerHTML = notice('bad', esc(e.message));
+  } finally {
+    accept.disabled = false;
+  }
+}
+
+function LLabel(layer) {
+  return { setting: '设定集', volume: '卷表', brief: '逐章指令' }[layer] || layer;
+}
+
+/* v001-c0007 → 001 */
+function volumeKeyOf(chapterId) {
+  const m = /^v(\d{3,})-c\d+$/.exec(String(chapterId || ''));
+  return m ? m[1] : '';
+}
+
+/* 技法审稿：按审查维度审这一章，意见落成**对本章指令的修正**（正文改不了，
+   改了等于重写）。走的是回填那同一套提案表格，逐条勾选后才进指令草稿。 */
+async function draftReview() {
+  const btn = document.getElementById('draft-review');
+  btn.disabled = true;
+  btn.textContent = '审着呢…（按维度过一遍，慢一点）';
+  try {
+    const res = await postJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/assist`,
+      { task: 'review', key: creationState.key, layer: 'brief',
+        refs: creationState.refs, level: creationState.refsLevel, max_tokens: 4000 }
+    );
+    if (res.error) {
+      await tellUser('没审出来', `<p style="margin:0">${esc(res.error)}</p>`);
+      return;
+    }
+    creationState.proposals = res.proposals || [];
+    creationState.proposalsFor = { brief: creationState.key };
+    creationState.chat = [...creationState.chat,
+      { role: 'assistant', content: `（技法审稿 ${creationState.key}）${res.reply || ''}` }];
+    creationPersist();
+    creationLoad();
+  } catch (e) {
+    await tellUser('审稿失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '技法审稿…';
+  }
+}
+
+function creationBindRaw(read) {
+  const ta = document.getElementById('creation-text');
+  if (!ta) return;
+  ta.addEventListener('input', () => { creationState.dirty = true; });
+  const tabForm = document.getElementById('tab-form');
+  if (tabForm) {
+    tabForm.onclick = () => {
+      creationState.mode = 'form';
+      creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
+      creationLoad();
+    };
+  }
+  document.getElementById('creation-save').addEventListener('click', async () => {
+    const btn = document.getElementById('creation-save');
+    btn.disabled = true;
+    btn.textContent = '保存中…';
+    try {
+      const res = await api(
+        `/api/works/${encodeURIComponent(creationState.name)}/creation/${creationState.kind}` +
+        `?key=${encodeURIComponent(creationState.key)}`,
+        { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: ta.value }) }
+      );
+      document.getElementById('creation-check').innerHTML =
+        creationRenderCheck(res.errors, res.warnings) +
+        (res.saved ? '<div class="muted" style="margin-top:6px">已保存。</div>' : '');
+      if (res.saved) {
+        creationState.dirty = false;
+        creationState.data = await getJSON(
+          `/api/works/${encodeURIComponent(creationState.name)}/creation`);
+        const box = document.querySelector('[data-sidebar]');
+        if (box) box.outerHTML = creationRenderSidebar();
+      }
+    } catch (e) {
+      document.getElementById('creation-check').innerHTML = notice('bad', esc(e.message));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = creationState.kind === 'setting' ? '保存原文' : '保存并校验';
+    }
+  });
+}
+
+async function creationSaveForm() {
+  const btn = document.getElementById('creation-save');
+  const note = document.getElementById('draft-flag');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    const res = await api(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/${creationState.kind}` +
+      `?key=${encodeURIComponent(creationState.key)}`,
+      { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: creationState.draft }) }
+    );
+    if (note) {
+      note.textContent = res.saved
+        ? '已保存（表单保存会重写 YAML，手写注释不保留）' : '没保存';
+    }
+    if (res.saved) {
+      creationState.dirty = false;
+      // 保存之后最该看到的反馈是「校验结果变了没有」——哪条阻断消掉了。
+      // 只重画状态那几块，不重画表单，滚动位置和光标都留着。
+      await creationRefreshPanels();
+    }
+  } catch (e) {
+    if (note) note.textContent = `保存失败：${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = SAVE_LABELS[creationState.kind] || '保存';
+  }
+}
+
+/* 助手面板：先看计划（免费），再决定要不要花钱问一句。 */
+function creationRefreshPlan() {
+  const refs = (creationState.refs || []).join(',');
+  const level = creationState.refsLevel || 'k3';
+  const url = `/api/works/${encodeURIComponent(creationState.name)}/creation/assist/plan`
+    + `?level=${encodeURIComponent(level)}`
+    + `&layer=${encodeURIComponent(creationState.kind)}`
+    + `&key=${encodeURIComponent(creationState.key)}`
+    + (refs ? `&refs=${encodeURIComponent(refs)}` : '');
+  return getJSON(url).then((plan) => { creationState.assistPlan = plan; return plan; });
+}
+
+function creationBindAssist() {
+  const send = document.getElementById('assist-send');
+  if (!send) return;
+  // 刷新后先把上次的提案/对话捞回来（有东西就不再覆盖）
+  if (creationRestore()) creationLoad();
+  if (!creationState.assistPlan) {
+    // ⚠️ 默认勾上参照之后必须**重算一次计划**。不重算的话，界面上的 token 数与费用
+    // 是「没选素材」时的数字，预览也是空的——作者看着 ¥0.0076 的价，实际打出去
+    // 是 ¥0.0113，而他会以为知识库没起作用。
+    creationRefreshPlan()
+      .then(() => {
+        if (!creationState.refsInitialized) {
+          creationState.refsInitialized = true;
+          creationState.refsLevel = creationState.assistPlan.refs_level || 'k3';
+          // 有知识库的作品默认勾上：知识库就是素材依据，不该等作者想起来去勾。
+          // 只决定这一次，之后作者取消勾选不会被改回去。
+          creationState.refs = (creationState.assistPlan.refs_available || [])
+            .filter((r) => r.kb_ready).map((r) => r.name);
+          return creationRefreshPlan();
+        }
+        return null;
+      })
+      .then(() => creationLoad())
+      .catch(() => {});
+  }
+  document.querySelectorAll('[data-level]').forEach((el) => {
+    el.onchange = () => {
+      if (!el.checked) return;
+      creationState.refsLevel = el.getAttribute('data-level');
+      // 档位一变，价格与素材预览都得跟着变
+      creationRefreshPlan().then(() => creationLoad()).catch(() => {});
+    };
+  });
+  document.querySelectorAll('[data-ref]').forEach((el) => {
+    el.onchange = () => {
+      const name = el.getAttribute('data-ref');
+      creationState.refs = el.checked
+        ? [...creationState.refs, name]
+        : creationState.refs.filter((r) => r !== name);
+      // 勾选一变，价格与素材预览都得跟着变
+      creationRefreshPlan().then(() => creationLoad()).catch(() => {});
+    };
+  });
+  send.onclick = () => creationAskAssistant();
+  const bulk = document.getElementById('assist-bulk');
+  if (bulk) bulk.onclick = () => assistBulk();
+
+  const propAll = document.getElementById('prop-all');
+  if (propAll) propAll.onclick = () => {
+    creationState.proposals.forEach((p) => { p.keep = true; });
+    creationLoad();
+  };
+  const propNone = document.getElementById('prop-none');
+  if (propNone) propNone.onclick = () => {
+    creationState.proposals.forEach((p) => { p.keep = false; });
+    creationLoad();
+  };
+  // 「留」这一列的勾选要写回 p.keep：接受时读的是 p.keep，不是 DOM。
+  document.querySelectorAll('[data-prop]').forEach((el) => {
+    el.onchange = () => {
+      const p = creationState.proposals[Number(el.getAttribute('data-prop'))];
+      if (p) p.keep = el.checked;
+    };
+  });  // 「内容」改动就地写回提案：改的是主键（条目表）或 value（字符串数组/单字段）。
+  // 不写回的话，作者在表里改完名字，接受时用的还是模型给的原名。
+  document.querySelectorAll('[data-prop-text]').forEach((el) => {
+    el.onchange = () => {
+      const p = creationState.proposals[Number(el.getAttribute('data-prop-text'))];
+      if (!p) return;
+      const text = el.value.trim();
+      p.text = text;
+      if (p.primary_field === 'value') p.value = text;
+      else p.entry = { ...(p.entry || {}), [p.primary_field]: text };
+      p.label = `${p.section_label} · ${p.op} · ${text}`;
+    };
+  });
+
+  const accept = document.getElementById('assist-accept');
+  if (accept) {
+    accept.onclick = () => assistApplyMulti(accept);
+  }
+}
+
+async function creationAskAssistant(opts) {
+  const bulk = !!(opts && opts.bulk);
+  const box = document.getElementById('assist-msg');
+  const msg = (box.value || '').trim();
+  const note = document.getElementById('assist-note');
+  if (!msg) { note.innerHTML = notice('warn', '先说一句要求。'); return; }
+  const btn = document.getElementById('assist-send');
+  btn.disabled = true;
+  btn.textContent = bulk ? '提几十条，慢一点…' : '问着呢…';
+  try {
+    const res = await postJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/assist`,
+      { message: msg, history: creationState.chat, refs: creationState.refs,
+        level: creationState.refsLevel, layer: creationState.kind, key: creationState.key,
+        max_tokens: bulk ? 8000 : 2000 }
+    );
+    if (res.error) {
+      note.innerHTML = notice('bad', `没拿到提案：${esc(res.error)}`);
+    } else {
+      creationState.chat = [...creationState.chat,
+        { role: 'user', content: msg },
+        { role: 'assistant', content: res.reply || '（没有回应）' }];
+      creationState.proposals = res.proposals || [];
+      note.innerHTML = notice('ok', `拿到 ${creationState.proposals.length} 条提案，逐条勾选后再接受。`);
+    }
+    if ((res.refs_missing || []).length) {
+      note.innerHTML += notice('warn', `这些参照没被用上：${esc(res.refs_missing.join('、'))}`);
+    }
+  } catch (e) {
+    note.innerHTML = notice('bad', esc(e.message));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '问助手';
+    box.value = '';
+    creationLoad();
+  }
+}
+
+function htmlToNode(html) {
+  const t = document.createElement('template');
+  t.innerHTML = html.trim();
+  return t.content.firstElementChild;
+}
+
+async function renderCreation(name, kind, key) {
+  setTab('');
+  // 层与键进 URL：刷新和直接打开链接都能停在同一层。
+  // 之前层只存在内存里，刷新就弹回设定集，写指令写到一半刷新会莫名其妙。
+  creationState.name = name;
+  const nextKind = ['setting', 'volume', 'brief'].includes(kind) ? kind : 'setting';
+  if (nextKind !== creationState.kind || (key || '') !== creationState.key) {
+    creationState.draft = null;
+    creationState.dirty = false;
+    creationState.kb.rows = null;
+    creationState.kb.loaded = false;
+    creationState.kb.picked = {};
+    // 提案**不清**：回填是在指令页点的、提案表却显示在设定集页，清掉就白点了。
+    // 跨层不会被搞混——现在每条提案自带 layer，应用时按它分组，不靠当前在哪一层。
+  }
+  creationState.kind = nextKind;
+  creationState.key = key || '';
+  // 原创作品只有「创作台」这一层有内容，录入那几层的入口不摆出来——
+  // 摆出来点进去就是一句报错，比没有入口更让人困惑。
+  // 原创作品只有这一页，摆一排只有它自己的子导航没有意义；面包屑和顶栏够了。
+  workKindOf(name).then((kind) => {
+    if (creationState.name === name && kind === 'original') setNoNav();
+  });
+  view.innerHTML = '<p class="muted">加载中…</p>';
+  try {
+    creationState.data = await getJSON(`/api/works/${encodeURIComponent(name)}/creation`);
+  } catch (e) {
+    // 导入的作品没有 60-setting/，创作台读不了。这里原来只有一句报错，
+    // 作者会以为自己点错了地方却不知道该去哪。说清楚它是给谁用的、下一步去哪。
+    const onlyOriginal = /原创/.test(e.message || '');
+    if (mainEl) mainEl.classList.remove('wide'); // 一页错误提示不需要 1680px 宽
+    view.innerHTML = notice('bad', `读取创作台失败：${esc(e.message)}`) +
+      (onlyOriginal
+        ? `<p class="muted" style="margin:0 0 12px">
+             创作台只服务「原创作品」——自己从零写的书。这本书是导入进来的，
+             它的结构分析请走标注台、知识库和体检报告。
+           </p>
+           <div class="row wrap">
+             <a class="btn" href="#/work/${encodeURIComponent(name)}" style="text-decoration:none;color:inherit">回作品页</a>
+             <a class="btn" href="#/shelf" style="text-decoration:none;color:inherit">去书架新建原创作品</a>
+           </div>`
+        : '');
+    return;
+  }
+  // 卷号漏了：原创作品必然有第 1 卷，把地址补全就好，没必要让后端回一句
+  // 「卷号必须是 1-9999 的数字：''」。
+  if (creationState.kind === 'volume' && !creationState.key) {
+    const firstVol = ((creationState.data.volumes || [])[0] || {}).vol || 1;
+    location.hash = `#/work/${encodeURIComponent(name)}/creation/volume/${firstVol}`;
+    return;
+  }
+  // 逐章指令是一章一份文件，没有章号就没有文件可读，也没有「新建一份空指令」这种事
+  // （空指令等于没写）。原来会把空章号原样发给后端，换回一句
+  // 「章节 id 不合约定（应为 v001-c0001）：''」——作者看不懂，也不知道是点错了
+  // 还是程序坏了。改成一句话 + 明确的下一步。
+  if (creationState.kind === 'brief' && !creationState.key) {
+    const chapters = creationState.data.chapters || [];
+    const firstVol = ((creationState.data.volumes || [])[0] || {}).vol || 1;
+    const first = chapters[0];
+    if (mainEl) mainEl.classList.remove('wide');
+    const base = `#/work/${encodeURIComponent(name)}/creation`;
+    view.innerHTML = `<p class="muted" style="margin-bottom:6px">
+        <a href="#/shelf">书架</a> / ${esc(name)} / 创作台
+      </p>
+      <h1 style="margin:0 0 8px">逐章创作指令</h1>
+      ${notice('warn', first
+        ? '这一层是一章一份指令，得先说是哪一章。'
+        : '这一层是一章一份指令，而这本书还没有列出任何章。')}
+      <p class="muted" style="margin:0 0 12px">
+        ${first
+          ? `分卷目录里已经列了 ${chapters.length} 章。挑一章进去写，`
+            + '或者回分卷目录确认章节表列全了，再一键播种全部指令。'
+          : '先去分卷目录把这一卷的逐章表列出来——逐章指令是照着卷表播种的，'
+            + '卷表里没有的章，这里就没有对应的文件。'}
+      </p>
+      <div class="row wrap">
+        <a class="btn primary" href="${base}">回创作台总览</a>
+        <a class="btn" href="${base}/volume/${esc(firstVol)}"
+          style="text-decoration:none;color:inherit">${first ? '去分卷目录' : '去列逐章表'}</a>
+        ${first ? `<a class="btn" href="${base}/brief/${esc(first.chapter_id)}"
+          style="text-decoration:none;color:inherit">去写第 ${first.chapter_no} 章</a>` : ''}
+      </div>`;
+    return;
+  }
+  await creationLoad();
+}
+
 async function renderReport(name) {
   setTab('');
+  setWorkNav(name, 'report');
   view.innerHTML = '<p class="muted">正在聚合报告…</p>';
   let r;
   try {
@@ -2438,7 +4618,8 @@ function drawSettings() {
         超出后：${esc(d.budget.on_exceed || 'abort')}
       </p>
       <p class="muted" style="margin:8px 0 0">
-        改这些数值请编辑 <code>providers.yaml</code> 的 <code>settings.budget</code>。
+        预算上限在设置页改不了，要编辑配置文件
+        （<code>providers.yaml</code> 里的 <code>settings.budget</code> 一段）。
         闸门按实测 token 累计拦，估算只是预估。
       </p>
     </div>
@@ -2701,10 +4882,11 @@ function providerCard(p, d) {
         ${
           p.enabled
             ? '<span class="chip ok">已启用</span>'
-            : '<span class="chip warn">enabled: false</span>'
+            : '<span class="chip warn">已在配置里停用</span>'
         }
-        <span class="muted">这个标记目前只作提示，不拦调用；要改请编辑 <code>providers.yaml</code> 的
-          <code>enabled</code>，或直接点下面的「测试连接」确认能不能用。</span>
+        <span class="muted">这个标记目前只作提示，不拦调用。要真停用，得改配置文件里服务商自己那一段的
+          <code>enabled</code>（<code>providers.yaml</code>）；要确认现在能不能用，
+          直接点下面的「测试连接」。</span>
       </p>
 
       ${
@@ -3130,6 +5312,7 @@ function missingNotice(src) {
 
 async function renderOutline(name) {
   setTab('');
+  setWorkNav(name, 'outline');
   view.innerHTML = '<p class="muted">读取大纲…</p>';
   let data;
   try {
@@ -3281,6 +5464,7 @@ async function renderAnnotations(name) {
   stopTaskPolling();
   chapterState.data = null;
   annotListState.name = name;
+  setWorkNav(name, 'annotations');
   view.innerHTML = '<p class="muted">加载中…</p>';
 
   let data;
@@ -3389,6 +5573,7 @@ async function renderEntities(name) {
   setTab('');
   stopTaskPolling();
   chapterState.data = null;
+  setWorkNav(name, 'entities');
   view.innerHTML = '<p class="muted">加载中…</p>';
 
   let latest;
@@ -3519,7 +5704,11 @@ async function renderEntities(name) {
         ['人物', '定位', '身份', '首次出现'],
         (m.characters || []).map(
           (c) =>
-            `<tr><td><strong>${esc(c.name)}</strong></td><td>${esc(c.role || '—')}</td>` +
+            `<tr><td><strong>${esc(c.name)}</strong>${
+              (c.aliases || []).length
+                ? `<div class="muted">别名：${esc(c.aliases.join('、'))}</div>`
+                : ''
+            }</td><td>${esc(c.role || '—')}</td>` +
             `<td>${esc(c.identity || '—')}</td><td>第${c.first_chapter ?? '—'}章</td></tr>`
         )
       )}
@@ -3683,18 +5872,31 @@ async function renderGenreLab() {
           <button class="ghost" data-aggregate="${esc(g.genre)}" style="font-size:12px">聚合</button></td>
     </tr>`).join('');
 
+  /* 登记表原来每行长得一模一样：一个「（未登记）」下拉、一个「或新题材名」输入框、
+     一个「登记」。看不出哪部已经登记过，也看不出下拉和输入框谁说了算
+     （其实是输入框说了算，填过东西就一直赢，很容易登记成别的题材）。
+     现在：加一列「当前」标出状态，两个控件互斥（选了下拉就清输入框，反之亦然），
+     按钮只在真的会改变登记时才可点。 */
+  const registered = works.filter((w) => mapping[w.name]).length;
+
   const assignRows = works
-    .map((w) => `<tr>
+    .map((w) => {
+      const cur = mapping[w.name] || '';
+      return `<tr>
       <td>${esc(w.name)}</td>
+      <td>${cur ? `<span class="chip ok">${esc(cur)}</span>` : '<span class="chip">未登记</span>'}</td>
       <td>
-        <select data-genre-of="${esc(w.name)}" style="font:inherit;font-size:12px;padding:4px 6px;border-radius:8px;border:1px solid var(--border-strong)">
-          <option value="">（未登记）</option>
-          ${genres.map((g) => `<option value="${esc(g.genre)}" ${mapping[w.name] === g.genre ? 'selected' : ''}>${esc(g.genre)}</option>`).join('')}
-        </select>
-        <input data-new-genre="${esc(w.name)}" type="text" placeholder="或新题材名" style="font:inherit;font-size:12px;padding:4px 6px;margin-left:6px;width:110px">
-        <button class="ghost" data-assign="${esc(w.name)}" style="font-size:12px">登记</button>
+        <div class="row wrap" style="gap:6px">
+          <select data-genre-of="${esc(w.name)}" style="font:inherit;font-size:12px;padding:4px 6px;border-radius:8px;border:1px solid var(--border-strong)">
+            <option value="">（不登记）</option>
+            ${genres.map((g) => `<option value="${esc(g.genre)}" ${cur === g.genre ? 'selected' : ''}>${esc(g.genre)}</option>`).join('')}
+          </select>
+          <input data-new-genre="${esc(w.name)}" type="text" placeholder="或新建题材名" style="font:inherit;font-size:12px;padding:4px 6px;width:120px;border-radius:8px;border:1px solid var(--border-strong)">
+          <button class="ghost" data-assign="${esc(w.name)}" style="font-size:12px">${cur ? '改登记' : '登记'}</button>
+        </div>
       </td>
-    </tr>`).join('');
+    </tr>`;
+    }).join('');
 
   const compareForm = works.length
     ? `<div class="row wrap">
@@ -3713,10 +5915,17 @@ async function renderGenreLab() {
     <p class="lead">L2 题材规则（M6）· 三份对比报告（M8）· 融合骨架（M5）　·　纯本地计算，不调模型</p>
 
     <div class="card">
-      <h2>作品 → 题材登记</h2>
+      <div class="spread" style="margin-bottom:8px">
+        <h2 style="margin:0">作品 → 题材登记</h2>
+        ${works.length ? `<span class="muted">${works.length} 部，已登记 ${registered} 部</span>` : ''}
+      </div>
       ${
         assignRows
-          ? `<div class="table-wrap"><table><thead><tr><th>作品</th><th>题材</th></tr></thead><tbody>${assignRows}</tbody></table></div>`
+          ? `<p class="muted" style="margin:0 0 8px">
+               下拉里选一个已有题材，或者在右边填一个新题材名——两个填了哪个就算哪个，
+               选了下拉会自动清空右边的输入框。选「（不登记）」再点按钮可以取消登记。
+             </p>
+             <div class="table-wrap"><table><thead><tr><th>作品</th><th>当前</th><th>登记到</th></tr></thead><tbody>${assignRows}</tbody></table></div>`
           : '<p class="muted">书架为空。</p>'
       }
     </div>
@@ -3756,6 +5965,20 @@ async function renderGenreLab() {
   `;
 
   // 登记题材
+  view.querySelectorAll('[data-genre-of]').forEach((sel) => {
+    const work = sel.dataset.genreOf;
+    const input = view.querySelector(`[data-new-genre="${CSS.escape(work)}"]`);
+    const btn = view.querySelector(`[data-assign="${CSS.escape(work)}"]`);
+    if (!input || !btn) return;
+    const cur = mapping[work] || '';
+    // 提交时输入框优先，所以「选了下拉却忘了清输入框」会登记成别的题材。
+    // 与其让人猜谁赢，不如让两个控件互斥。
+    const sync = () => { btn.disabled = (input.value.trim() || sel.value || '') === cur; };
+    sel.onchange = () => { if (sel.value) input.value = ''; sync(); };
+    input.oninput = () => { if (input.value.trim()) sel.value = ''; sync(); };
+    sync();
+  });
+
   view.querySelectorAll('[data-assign]').forEach((btn) => {
     btn.onclick = async () => {
       const work = btn.dataset.assign;
@@ -3946,6 +6169,8 @@ async function renderAnnotator(name) {
   stopTaskPolling();
   chapterState.data = null;
   annState.name = name;
+  setWorkNav(name, 'annotator');
+  if (mainEl) mainEl.classList.add('annot-page');
   view.innerHTML = '<p class="muted">加载中…</p>';
 
   try {
@@ -4427,6 +6652,7 @@ async function renderKnowledgeBase(name) {
   setTab('');
   stopTaskPolling();
   chapterState.data = null;
+  setWorkNav(name, 'kb');
   view.innerHTML = '<p class="muted">读取知识库…</p>';
 
   let data;
@@ -4468,7 +6694,11 @@ async function renderKnowledgeBase(name) {
   const personRows = (person.rows || [])
     .map(
       (r) => `<tr>
-        <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.role || r.identity || '')}</div></td>
+        <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.role || r.identity || '')}</div>${
+          (r.aliases || []).length
+            ? `<div class="muted">别名：${esc(r.aliases.join('、'))}</div>`
+            : ''
+        }</td>
         <td class="num">${num(r.appearance_count)}</td>
         <td class="num">第${r.first_seen ?? '—'}章</td>
         <td class="num">第${r.last_seen ?? '—'}章</td>
@@ -4537,7 +6767,10 @@ async function renderKnowledgeBase(name) {
           ? tableOrEmpty(
               ['人物', '角色', '势力', '能力'],
               (k1.characters || []).slice(0, 60).map((c) => [
-                esc(c.name || ''),
+                esc(c.name || '') +
+                  ((c.aliases || []).length
+                    ? ` <span class="muted">（${esc(c.aliases.join('、'))}）</span>`
+                    : ''),
                 esc(c.role || c.identity || '—'),
                 esc((c.factions || []).join('、') || '—'),
                 esc((c.abilities || []).slice(0, 3).join('、') || '—'),
@@ -4640,6 +6873,7 @@ async function renderWorkbench(name) {
   stopTaskPolling();
   chapterState.data = null;
   rwState.name = name;
+  setWorkNav(name, 'rewrite');
   view.innerHTML = '<p class="muted">读取改写台…</p>';
 
   let plan;
@@ -4951,7 +7185,12 @@ function renderHelp() {
 
 function setTab(name) {
   document.querySelectorAll('.tab').forEach((el) => {
-    el.classList.toggle('active', el.dataset.tab === name);
+    const on = el.dataset.tab === name;
+    el.classList.toggle('active', on);
+    // 当前页要能被读屏软件念出来。作品子页不属于任何一个顶栏标签，
+    // 那时候 name 是空串，全部摘掉 aria-current 才对。
+    if (on) el.setAttribute('aria-current', 'page');
+    else el.removeAttribute('aria-current');
   });
 }
 
@@ -4964,6 +7203,16 @@ function route() {
     if (!onAnnotator) annState.cur = null; // 离开标注台就清掉当前章，别让 J/K 在别的页面上翻章
     const hash = location.hash || '#/shelf';
     const parts = hash.replace(/^#\/?/, '').split('/');
+    // 离开了创作台就把「有未保存改动」清掉。留着的话，那面旗会在别的页面上继续挂着，
+    // 之后随便点个站内链接都会弹一次「有未保存的改动」——而那时早就没有创作台了。
+    // （点站内链接的拦截在捕获阶段先跑，所以这里清不会把该拦的漏掉。）
+    if (!(parts[0] === 'work' && parts[2] === 'creation')) creationState.dirty = false;
+    // 每换一页先清掉上一页的子导航与宽容器，由具体的视图再按需装上。
+    // 不清的话，从作品页回到书架会留着一条指向别人作品的子导航。
+    clearSubNav();
+    if (parts[0] === 'work' && parts[1] && WIDE_SEGMENTS.has(parts[2] || '') && mainEl) {
+      mainEl.classList.add('wide');
+    }
     if (parts[0] === 'import') {
       stopTaskPolling();
       chapterState.data = null;
@@ -4998,6 +7247,13 @@ function route() {
         chapterState.data = null;
         return renderOutline(decodeURIComponent(parts[1]));
       }
+      if (parts[2] === 'creation') {
+        return renderCreation(
+          decodeURIComponent(parts[1]),
+          parts[3] ? decodeURIComponent(parts[3]) : '',
+          parts[4] ? decodeURIComponent(parts.slice(4).join('/')) : ''
+        );
+      }
       if (parts[2] === 'chapter' && parts[3]) {
         stopTaskPolling();
         return renderChapter(decodeURIComponent(parts[1]), decodeURIComponent(parts.slice(3).join('/')));
@@ -5013,6 +7269,39 @@ function route() {
 }
 
 window.addEventListener('hashchange', route);
+
+/* ── 离开创作台时的未保存保护 ──────────────────────────────
+   创作台的表单只改内存里的草稿，不点「保存」就不落盘。而顶栏标签、
+   作品子导航、面包屑都会换哈希——一次误点就丢掉整份改到一半的设定集。
+   两处都拦：
+     · 刷新/关标签：beforeunload（浏览器自己弹，拦不住也不该拦）
+     · 站内跳转：捕获阶段的点击拦截，用页面内确认框问一句
+   只在真的脏了的时候拦，平时零影响。 */
+window.addEventListener('beforeunload', (e) => {
+  if (!creationState.dirty) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+document.addEventListener('click', (e) => {
+  if (!creationState.dirty) return;
+  const a = e.target && e.target.closest ? e.target.closest('a[href^="#/"]') : null;
+  if (!a) return;
+  if (a.getAttribute('href') === location.hash) return;
+  e.preventDefault();
+  e.stopPropagation();
+  askConfirm({
+    title: '有未保存的改动',
+    html: '<p style="margin:0">创作台里改过的东西还没保存，离开就丢了。</p>',
+    confirmLabel: '丢掉改动，离开',
+    cancelLabel: '留下继续改',
+    danger: true,
+  }).then((ok) => {
+    if (!ok) return;
+    creationState.dirty = false;
+    location.hash = a.getAttribute('href');
+  });
+}, true);
 
 /* 停在 #/import 时再点「导入作品」标签，hash 没变 → 不触发 hashchange → 路由不重跑。
    表现和「点了没反应」一模一样。这里补一次手动渲染。 */

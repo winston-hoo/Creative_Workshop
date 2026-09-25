@@ -1,0 +1,35 @@
+# 第 6 章创作任务指令 · v001-c0006
+
+schema_version: brief-v1
+work: original-demo
+chapter_id: v001-c0006
+vol: 1
+chapter_no: 6
+title: "盯着他的人"
+one_line: "他靠看数值拖垮对手拿到灵石，暗处有人记下了他的名字。"
+core_plot:
+  - 李默全程躲，靠对手每次出招掉数值，硬拖到对方脱力
+  - 满场哗然，管事的脸色很难看——彩头是块下品灵石
+  - 他领了灵石，指尖一搭就发现这块石头被人动过手脚
+  - 高台上玄阳真人看了他一眼就走了；他收起灵石，装什么都不知道
+timeline: "接第5章，同一日傍晚。"
+word_target: [2800, 4000]
+narrative:
+  perspective: "第三限知"
+  tone: "冷幽默，克制，不煽情"
+  focus: ["拖垮对手的过程要写细", "最后那一眼对视"]
+settings:
+  characters: [李默, 玄阳真人]
+  factions: [青云宗]
+  terms: [数值之眼]
+foreshadow:
+  - action: 埋设
+    id: F-004
+    desc: 灵石被谁动过手脚
+  - action: 推进
+    id: F-001
+    desc: 数值之眼看到灵石时的反应和看人不一样
+carry_over:
+  - 第4章苏清月出场后一直没再出现，这一章要交代她去了哪
+must_not:
+  - 不要让玄阳真人开口（他只是远远看一眼）
