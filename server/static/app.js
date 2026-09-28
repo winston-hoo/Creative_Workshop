@@ -3037,15 +3037,26 @@ function creationRenderAssist() {
           <span class="muted" style="font-size:11px">${esc(hints[key] || '')}</span></span>
       </label>`).join('');
 
+  // 可不可选跟着**当前档位**走：k3 只要结构指纹（标注满 5 章即可），full 才要 K1。
+  // 以前三档共用一个 kb_ready（= 有没有 K1），于是「只想借节奏」也被
+  // 「没跑实体统计」挡在门外——而实体统计要读全本调模型，是这条链上最贵的一步，
+  // 还一点都帮不到结构指纹。挡人的时候必须说清缺的是哪一步，不然作者会去点
+  // 「构建知识库」，点完仍然不可用（缺的根本不是那一下）。
   const refBoxes = refs.length
-    ? refs.map((r) => `<label class="row" style="margin:0 12px 6px 0;gap:6px">
+    ? refs.map((r) => {
+        const ready = level === 'none' ? false : (level === 'full' ? r.k1_ready : r.k3_ready);
+        const why = level === 'none'
+          ? '当前档位是「不注入」'
+          : (r.missing || '这一档给不出素材');
+        return `<label class="row" style="margin:0 12px 6px 0;gap:6px">
         <input type="checkbox" data-ref="${esc(r.name)}"
           ${creationState.refs.includes(r.name) ? 'checked' : ''}
-          ${(r.kb_ready && level !== 'none') ? '' : 'disabled'}>
-        <span style="font-size:12px" title="${r.kb_ready ? '' : '还没建过知识库'}">
-          ${esc(r.label)}${r.kb_ready ? '' : '（没知识库）'}</span>
-      </label>`).join('')
-    : '<span class="muted" style="font-size:12px">没有可选的参照作品（书架里还没有建过知识库的已入库作品）</span>';
+          ${ready ? '' : 'disabled'}>
+        <span style="font-size:12px" title="${esc(why)}">
+          ${esc(r.label)}${ready ? '' : `（${esc(why)}）`}</span>
+      </label>`;
+      }).join('')
+    : '<span class="muted" style="font-size:12px">没有可选的参照作品（书架里还没有已入库的作品）</span>';
 
   const preview = plan.refs_preview || '';
   const previewBox = preview
@@ -3245,8 +3256,9 @@ function creationRenderKbPanel() {
     return `<div class="card" style="margin-top:12px">
       <h3 style="margin:0 0 4px">从知识库取素材</h3>
       <p class="muted" style="margin:0;font-size:12px">
-        书架里还没有建过知识库的作品。先对一本已入库作品跑完标注，
-        它的人物/势力/能力/世界观就能在这里翻。
+        书架里还没有能供素材的作品。这一栏翻的是 K1 实体卡片，
+        所以要先对一本已入库作品跑<b>实体统计</b>（人物/势力/能力/地点就从这儿来），
+        再点一次「构建知识库」。只跑标注跑不出这一栏。
       </p></div>`;
   }
   const kb = creationState.kb;
@@ -4096,10 +4108,15 @@ function creationBindAssist() {
         if (!creationState.refsInitialized) {
           creationState.refsInitialized = true;
           creationState.refsLevel = creationState.assistPlan.refs_level || 'k3';
-          // 有知识库的作品默认勾上：知识库就是素材依据，不该等作者想起来去勾。
+          // 有可用素材的作品默认勾上：知识库就是素材依据，不该等作者想起来去勾。
           // 只决定这一次，之后作者取消勾选不会被改回去。
-          creationState.refs = (creationState.assistPlan.refs_available || [])
-            .filter((r) => r.kb_ready).map((r) => r.name);
+          // 「可用」按当前档位算：k3 看结构指纹，full 看 K1，none 一个都不勾。
+          const lvl = creationState.refsLevel;
+          creationState.refs = lvl === 'none'
+            ? []
+            : (creationState.assistPlan.refs_available || [])
+              .filter((r) => (lvl === 'full' ? r.k1_ready : r.k3_ready))
+              .map((r) => r.name);
           return creationRefreshPlan();
         }
         return null;

@@ -2919,23 +2919,38 @@ def creation_seed_briefs(paths: Paths, name: str, vol: int | None = None) -> dic
 # 勾中的进界面草稿，作者再点保存才落盘。这里不替作者做决定，也不整份重写。
 
 
+# 每个档位真正吃的是哪份数据。以前三档共用一个「K1 非空」的判据，
+# 于是只想借节奏（k3 只用结构指纹）的作品也被卡住，而放开它要跑实体统计——
+# 那是这条链上最贵的一步（读全本调模型），却对结构指纹一点贡献都没有。
+REFS_LEVEL_NEEDS: dict[str, str] = {"none": "", "k3": "k3", "full": "k1"}
+
+# 「不可用」要说清缺的是哪一步。只说「没知识库」的话，
+# 作者会去点「构建知识库」，而点完仍然不可用——缺的根本不是那一下。
+REFS_MISSING_HINTS: dict[str, str] = {
+    "k1": "没跑实体统计，给不出人物/势力/能力",
+    "k3": "标注不足 5 章，给不出结构指纹",
+}
+
+
 def _setting_refs_block(
     paths: Paths, refs: list[str], level: str = "k3"
 ) -> tuple[str, list[str]]:
     """把作者选定的已入库作品拼成参照素材。
 
     `level` 决定给多少：none 什么都不给 / k3 只给结构指纹 / full 再加人物势力能力等。
-    读不到或没建过知识库的会被跳过并说明——列出来点了却没反应的选项比没有更烦人。
+    就绪判据**跟着档位走**（见 REFS_LEVEL_NEEDS）：k3 只要指纹，full 才要 K1。
+    读不到或本档给不出东西的会被跳过并说明——列出来点了却没反应的选项比没有更烦人。
     """
     from workshop.setting_assist import build_refs_block
 
+    need = REFS_LEVEL_NEEDS.get(level, "k1")
     picked: list[dict[str, Any]] = []
     missing: list[str] = []
     for name in refs[:6]:
         kb_dir = paths.work_dir(name) / "20-kb"
         k1_path = kb_dir / "k1-entities.json"
         if not k1_path.exists():
-            missing.append(f"{name}（还没建过知识库）")
+            missing.append(f"{name}（还没构建过知识库）")
             continue
         try:
             k1 = json.loads(k1_path.read_text(encoding="utf-8-sig"))
@@ -2943,8 +2958,11 @@ def _setting_refs_block(
         except (ValueError, OSError):
             missing.append(f"{name}（知识库读不了）")
             continue
-        if not k1.get("available"):
-            missing.append(f"{name}（知识库 K1 是空的，先重建）")
+        if need == "k3" and not k3_raw.get("available"):
+            missing.append(f"{name}（{REFS_MISSING_HINTS['k3']}）")
+            continue
+        if need == "k1" and not k1.get("available"):
+            missing.append(f"{name}（{REFS_MISSING_HINTS['k1']}）")
             continue
         k3_lines = [
             f"{it.get('rule')}：{(it.get('statistic') or {}).get('mean') or (it.get('statistic') or {}).get('dominant') or ''}"
@@ -2956,30 +2974,58 @@ def _setting_refs_block(
     if level == "k3":
         # 中间档不需要 K1：连读都不读，免得把几百条人物装进内存又丢掉
         picked = [{"work": p["work"], "k3": p["k3"], "k1": {}} for p in picked]
-    return build_refs_block(picked, level=level), missing
+    block = build_refs_block(picked, level=level)
+    if picked and not block.strip():
+        # 挑中的作品一条素材都拼不出来（指纹空 / 条目全被白名单丢掉）。
+        # 这种时候前缀里少了这几千字，模型会自己补，而作者以为它是照着知识库写的。
+        missing.append("选中的作品没拼出任何素材，这次等于没注入参照")
+    return block, missing
+
+
+def _kb_flag(path: Path) -> bool:
+    """读一份知识库切片，问它「本档可用吗」。读不到就是不可用。"""
+    if not path.exists():
+        return False
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8-sig")).get("available"))
+    except (ValueError, OSError):
+        return False
 
 
 def assist_refs(paths: Paths) -> list[dict[str, Any]]:
-    """可选的参照作品。只列真的能用的——列出来点了报错的选项比没有更烦人。"""
+    """可选的参照作品。只列真的能用的——列出来点了报错的选项比没有更烦人。
+
+    就绪状态**按档位分开报**，不合成一个总开关：k3 只需要结构指纹（标注满 5 章），
+    full 才需要 K1（跑过实体统计）。合成一个「有没有知识库」的话，
+    只想借节奏的作者会被推去跑最贵的实体统计，而跑完指纹仍然是空的。
+    """
     out: list[dict[str, Any]] = []
     for work in list_works(paths):
         if not work.get("imported"):
             continue
         kb_dir = paths.work_dir(work["dir_name"]) / "20-kb"
-        k1_path = kb_dir / "k1-entities.json"
-        available = False
-        if k1_path.exists():
-            try:
-                available = bool(
-                    json.loads(k1_path.read_text(encoding="utf-8-sig")).get("available")
-                )
-            except (ValueError, OSError):
-                available = False
+        has_kb = (kb_dir / "k1-entities.json").exists()
+        k1_ready = _kb_flag(kb_dir / "k1-entities.json")
+        k3_ready = _kb_flag(kb_dir / "k3-fingerprint.json")
+        if not has_kb:
+            missing = "还没构建过知识库"
+        elif not k1_ready and not k3_ready:
+            missing = "知识库是空的：没跑实体统计，标注也不足 5 章"
+        elif not k3_ready:
+            missing = REFS_MISSING_HINTS["k3"]
+        elif not k1_ready:
+            missing = REFS_MISSING_HINTS["k1"]
+        else:
+            missing = ""
         out.append(
             {
                 "name": work["dir_name"],
                 "label": work.get("name") or work["dir_name"],
-                "kb_ready": available,
+                # 兼容旧语义：kb_ready 就是「有 K1 素材」，取素材面板按它筛
+                "kb_ready": k1_ready,
+                "k1_ready": k1_ready,
+                "k3_ready": k3_ready,
+                "missing": missing,
                 "chapters": work.get("chapters") or 0,
             }
         )
