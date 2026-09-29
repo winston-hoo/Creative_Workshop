@@ -95,12 +95,16 @@ LAYER_SPECS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "themes": {"kind": "strlist", "path": ("themes",), "label": "主题与象征"},
         "taboo": {"kind": "strlist", "path": ("style", "taboo"), "label": "文风禁忌"},
-        "logline": {"kind": "scalar", "path": ("logline",), "label": "一句话前提"},
-        "core_motive": {"kind": "scalar", "path": ("core_motive",), "label": "主角核心动机"},
-        "ultimate_hook": {"kind": "scalar", "path": ("ultimate_hook",), "label": "终极钩子"},
         "era": {"kind": "scalar", "path": ("world", "era"), "label": "时代"},
         "power_system": {"kind": "scalar", "path": ("power", "system"), "label": "力量体系名"},
         "tone": {"kind": "scalar", "path": ("style", "tone"), "label": "基调"},
+        # 这里原来还有 logline（一句话前提）、core_motive（主角核心动机）、
+        # ultimate_hook（终极钩子）三条。全部删掉，理由分三种（作者 2026-09-29 要求）：
+        #   · 终极钩子：只被 render_story_anchor 抄进提示词一段散文，别处没人读。
+        #   · 一句话前提：把「第一章的处境」写成书级标量，等于给主角钉了个准星。
+        #   · 主角核心动机：跟 characters[主角].motive **是同一个东西**——校验器本来就
+        #     强制每个角色写 motive，这里再要一遍，就是让作者答同一道题两次。
+        # 后两个要的仍然是有效信息，只是不该以「书级标量」的形式存在。
     },
     "volume": {
         "title": {"kind": "scalar", "path": ("vol", "title"), "label": "卷名"},
@@ -117,6 +121,10 @@ LAYER_SPECS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "chapters": {
             "kind": "objlist", "path": ("vol", "chapters"), "key": "chapter_no", "label": "章节",
+            # 提案表那一格显示／编辑哪个字段。不写就用主键，而章节的主键是章节号——
+            # 整列「1、2、3」，作者认不出哪一章是哪一章（实测 2026-09-29）。
+            # 用 display 指定一个给人看的字段，主键挪到「类别」列，不丢。
+            "display": "title",
             "fields": ["title", "gist", "foreshadow"],
             "int_fields": ["chapter_no"],
             "list_fields": ["characters"],
@@ -150,6 +158,36 @@ LAYER_SPECS: dict[str, dict[str, dict[str, Any]]] = {
 
 # 兼容旧名：设定集那一层单独用时就是它
 SECTION_SPECS = LAYER_SPECS["setting"]
+
+
+def _label_aliases(specs: dict[str, Any]) -> dict[str, str]:
+    """label → 键名。只收在这一层里**唯一**的标签。
+
+    重名的标签不给映射：猜错等于把内容悄悄写进别的小节，比拒收坏得多。
+    """
+    by_label: dict[str, list[str]] = {}
+    for key, spec in specs.items():
+        label = str(spec.get("label") or "").strip()
+        if label:
+            by_label.setdefault(label, []).append(key)
+    return {lab: keys[0] for lab, keys in by_label.items() if len(keys) == 1}
+
+
+# 模型时不时把 section 写成**中文标签**（「世界硬规则」）而不是键名（rules）。
+# 提示词里白纸黑字写着「原样照抄下面的键名，不要翻译成英文」，它照样写标签——
+# 而且是随机的：同一批里势力/能力/等级给键名，偏偏 hard rules 给标签（实测 2026-09-29）。
+# 与其跟它较劲，不如两边都认：标签本来就在白名单里、是唯一的，认它**没有放松任何闸门**，
+# 认不出来照样拒收。注意方向是单向的——键名永远优先，标签只是兜底。
+_SECTION_ALIASES = {layer: _label_aliases(specs) for layer, specs in LAYER_SPECS.items()}
+
+
+def resolve_section(layer: str, section: str) -> str:
+    """把模型给的 section 归一到白名单里的键名。认不出来就原样返回（照样被拒）。"""
+    specs = LAYER_SPECS.get(layer) or LAYER_SPECS["setting"]
+    name = str(section or "").strip()
+    if name in specs:
+        return name
+    return _SECTION_ALIASES.get(layer, {}).get(name, name)
 
 LAYERS = tuple(LAYER_SPECS.keys())
 LAYER_LABELS = {"setting": "设定集", "volume": "分卷目录", "brief": "逐章创作任务指令"}
@@ -701,6 +739,33 @@ def describe_proposal(proposal: dict[str, Any], layer: str = "setting") -> str:
     return f"{label} · {op} · {value[:40]}"
 
 
+def _brief(value: Any, limit: int = 24) -> str:
+    """把值截短放进拒收原因里。
+
+    世界硬规则一条能有一百多字，原样抄进 reason，作者看到的就是一屏乱码，
+    根本认不出是哪一条没进（实测 2026-09-29）。列表里的 label 本来就是短的，
+    这里只管那些可能是长文本的地方。
+    """
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _other_layer_hint(name: str, layer: str) -> str:
+    """未知小节要点名「它属于哪一层」。
+
+    实测（作者在卷表层问「把世界观配齐」）：模型照着他的中文说法自造英文节名
+    （世界硬规则→world_rules、力量等级→power_levels），一批几十条全被拒。
+    只回一句「不认识的小节」，作者拿到的是一屏废纸——他不知道自己是站在了错的层，
+    也不知道该去哪一层重问，只能反复重试同一件不会成功的事。
+    """
+    if not name:
+        return ""
+    owners = [f"{LAYER_LABELS[k]}层" for k in LAYERS if k != layer and name in LAYER_SPECS[k]]
+    if not owners:
+        return ""
+    return f"；「{name}」是{'／'.join(owners)}的位置，去那一层再提一次"
+
+
 def apply_proposals(
     document: dict[str, Any],
     proposals: list[dict[str, Any]],
@@ -741,9 +806,13 @@ def apply_proposals(
             row["reason"] = "提案不是一条对象"
             results.append(row)
             continue
+        # 中文标签也认（见 resolve_section）。归一到键名之后，往下走的全是同一个键，
+        # 拒收原因里报出来的也才是键名，不然作者看到的是「不认识的小节「世界硬规则」」。
+        row["section"] = resolve_section(layer, row["section"])
         spec = specs.get(row["section"])
         if spec is None:
-            row["reason"] = f"不认识的小节「{row['section']}」，已拒收（模型只能动白名单里的位置）"
+            row["reason"] = (f"不认识的小节「{row['section']}」，已拒收（模型只能动白名单里的位置）"
+                             + _other_layer_hint(row["section"], layer))
             results.append(row)
             continue
         op = row["op"]
@@ -779,7 +848,9 @@ def apply_proposals(
                 continue
             if op == "add":
                 if value in bucket:
-                    row["reason"] = f"「{value}」已经在里面了"
+                    # 世界硬规则一条能有一百多字，整条抄进 reason 会把这一行撑成
+                    # 一屏乱码，作者根本看不出哪条没进（实测 2026-09-29）。
+                    row["reason"] = f"「{_brief(value)}」已经在里面了"
                 else:
                     bucket.append(value)
                     row["ok"] = True
@@ -787,7 +858,7 @@ def apply_proposals(
                 continue
             if op == "remove":
                 if value not in bucket:
-                    row["reason"] = f"「{value}」本来就不在里面"
+                    row["reason"] = f"「{_brief(value)}」本来就不在里面"
                 else:
                     bucket.remove(value)
                     row["ok"] = True

@@ -815,8 +815,8 @@ def api_report(
 class CreationNewBody(BaseModel):
     name: str
     genre: str = ""
-    logline: str = ""
     protagonist: str = ""
+    # 主角的动机，会写到 characters[主角].motive 上；不是书级字段
     core_motive: str = ""
 
 
@@ -858,7 +858,6 @@ def api_creation_new(body: CreationNewBody) -> dict:
             PATHS,
             safe_name(body.name),
             genre=body.genre,
-            logline=body.logline,
             protagonist=body.protagonist,
             core_motive=body.core_motive,
         )

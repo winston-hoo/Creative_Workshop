@@ -62,8 +62,6 @@ def empty_setting(work: str = "", genre: str = "") -> dict[str, Any]:
         "schema_version": SETTING_SCHEMA_VERSION,
         "work": work,
         "genre": genre,
-        "logline": "",
-        "core_motive": "",
         "target": {"chapters": 0, "chars_per_chapter": [2800, 4000]},
         "style": {"perspective": "第三限知", "tone": "", "taboo": []},
         "world": {"era": "", "places": [], "rules": []},
@@ -79,7 +77,6 @@ def setting_template_text(
     work: str,
     genre: str,
     *,
-    logline: str = "",
     protagonist: str = "",
     core_motive: str = "",
 ) -> str:
@@ -137,11 +134,11 @@ schema_version: {SETTING_SCHEMA_VERSION}
 work: {yaml_scalar(work)}
 genre: {yaml_scalar(genre)}
 
-# 一句话前提：谁，在什么处境下，要做什么，代价是什么。不超过 80 字。
-logline: {yaml_scalar(logline)}
-
-# 主角核心动机（一句话）。它同时是标注原语 P21 的度量对象，写不清那一列数据就不可信。
-core_motive: {yaml_scalar(core_motive)}
+# 「一句话前提」「终极钩子」原来在这里各占一个标量，已删（2026-09-29）。
+# 它们把「第一章的处境」写成书级常量，写正文时被当成准星去对照每一章——
+# 主角第一页是杂役、是学生，不代表最后一页还是。往哪儿去由 characters[].arc 说，
+# 世界是什么样由下面的 world / power / factions 说。
+# 主角动机也不再写到这儿：写到人物自己身上（characters[].motive），一份就够。
 
 # 篇幅目标。分卷目录的估费用它算。
 target:
@@ -214,8 +211,10 @@ def validate_setting(data: dict[str, Any]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
 
-    for key, label in (("work", "作品名"), ("genre", "题材"), ("logline", "一句话前提"),
-                       ("core_motive", "主角核心动机")):
+    # 这里原来拦四样：作品名、题材、一句话前提（logline）、主角核心动机（core_motive）。
+    # 后两个删了（2026-09-29）。动机不是不管了——下面「每个人物都要有 role/motive」
+    # 那条会管，而且是让人物自己带，不再要求书级写一遍。
+    for key, label in (("work", "作品名"), ("genre", "题材")):
         if not str(data.get(key) or "").strip():
             errors.append(f"缺 {label}（{key}）")
 
@@ -301,10 +300,6 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
         meta.append(f"目标：{target['chapters']} 章{each}")
     lines.append("　".join(meta))
     lines.append("")
-    if data.get("logline"):
-        lines += [f"> {data['logline']}", ""]
-    if data.get("core_motive"):
-        lines += [f"**主角核心动机**：{data['core_motive']}", ""]
 
     style = data.get("style") or {}
     if style:
@@ -407,10 +402,6 @@ def render_injection_block(data: dict[str, Any], *, max_chars: int | None = None
     sections: dict[str, list[str]] = {}
 
     basis = [f"【作品】{data.get('work') or '—'}", f"【题材】{data.get('genre') or '—'}"]
-    if data.get("logline"):
-        basis.append(f"【一句话前提】{data['logline']}")
-    if data.get("core_motive"):
-        basis.append(f"【主角核心动机】{data['core_motive']}")
     target = data.get("target") or {}
     span = target.get("chars_per_chapter") or []
     if target.get("chapters"):
@@ -528,8 +519,8 @@ _TEMPLATE_WORK_YAML = """# 原创作品配置 · {work}
 #    没有 00-ingest，因此标注/体检/知识库那条链暂时跑不了（那些阶段要 manifest）。
 #    等 90-draft 里攒出定稿章节，再走一次录入就能把自己写的书也纳入结构分析。
 #
-# protagonist / core_motive 由 60-setting/setting.yaml 同步而来，
-# **改主角或动机请改设定集**，别只改这里——标注原语 P21 的度量对象就是这两个字段。
+# protagonist / core_motive 由 60-setting/setting.yaml 同步而来（都取 role: 主角 那个人），
+# **改主角或动机请改设定集里的人物行**，别只改这里——标注原语 P21 的度量对象就是这两个字段。
 
 work: {work}
 kind: {kind}
@@ -552,7 +543,6 @@ def create_original_work(
     name: str,
     genre: str = "",
     *,
-    logline: str = "",
     protagonist: str = "",
     core_motive: str = "",
     overwrite: bool = False,
@@ -574,8 +564,9 @@ def create_original_work(
         path.mkdir(parents=True, exist_ok=True)
 
     setting = empty_setting(name, genre)
-    setting["logline"] = logline
-    setting["core_motive"] = core_motive
+    # core_motive 写到**人物行**上，不再往 setting 顶层放一份书级副本。
+    # 顶层那份跟 characters[主角].motive 写的是同一件事，作者被问两遍，
+    # 改的时候还只改一处（2026-09-29）。
     if protagonist:
         setting["characters"] = [{"name": protagonist, "role": "主角", "motive": core_motive}]
 
@@ -585,7 +576,7 @@ def create_original_work(
     if not setting_path.exists():
         setting_path.write_text(
             setting_template_text(
-                name, genre, logline=logline, protagonist=protagonist, core_motive=core_motive
+                name, genre, protagonist=protagonist, core_motive=core_motive
             ),
             encoding="utf-8",
         )
@@ -631,7 +622,7 @@ def sync_work_config(work_dir: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"找不到设定集：{setting_path}")
     setting = load_setting(setting_path)
 
-    leads = [str(c.get("name") or "").strip() for c in (setting.get("characters") or [])
+    leads = [c for c in (setting.get("characters") or [])
              if isinstance(c, dict) and str(c.get("role") or "").strip() == "主角"]
     work_yaml = wd / "work.yaml"
     data = yaml.safe_load(work_yaml.read_text(encoding="utf-8")) or {} if work_yaml.exists() else {}
@@ -639,8 +630,11 @@ def sync_work_config(work_dir: str | Path) -> dict[str, Any]:
     data["work"] = str(setting.get("work") or data.get("work") or wd.name)
     data["kind"] = str(data.get("kind") or ORIGINAL_KIND)
     data["genre"] = str(setting.get("genre") or data.get("genre") or "")
-    data["protagonist"] = leads[0] if leads else ""
-    data["core_motive"] = str(setting.get("core_motive") or "")
+    data["protagonist"] = str(leads[0].get("name") or "").strip() if leads else ""
+    # core_motive 是标注原语 P21 的度量对象，不能空着不管。
+    # 设定集里那份书级副本已经删了，改从主角身上取——本来就写的是一件事，
+    # 留两份只会有一份先过期。
+    data["core_motive"] = str(leads[0].get("motive") or "").strip() if leads else ""
     data.setdefault("style_checks", [])
     data.setdefault("ingest", {"chapter_patterns": [], "section_markers": []})
     work_yaml.write_text(
@@ -966,15 +960,13 @@ def render_synopsis(work_dir: str | Path) -> str:
     if meta:
         out.append("　".join(meta))
 
-    if setting.get("logline"):
-        out.append(f"\n**一句话前提**：{setting['logline']}")
     lead = [c for c in (setting.get("characters") or [])
             if isinstance(c, dict) and str(c.get("role") or "") == "主角"]
     who = lead[0] if lead else {}
-    if who.get("name") or setting.get("core_motive"):
-        line = f"**主角**：{who.get('name') or '（未定）'}"
-        if setting.get("core_motive"):
-            line += f"　核心动机：{setting['core_motive']}"
+    if who.get("name"):
+        line = f"**主角**：{who['name']}"
+        if who.get("motive"):
+            line += f"　开局动机：{who['motive']}"
         out.append(line)
     if setting.get("power", {}).get("system") or setting.get("power", {}).get("tiers"):
         p = setting["power"]
@@ -1047,22 +1039,48 @@ def render_synopsis(work_dir: str | Path) -> str:
 #   作品基因（防跑偏锚点）+ 前情 + 角色当前状态 + 待回收伏笔 + 上一章末段
 # 但**不抄它的记忆文件**——那会变成第二套真源。这里全部是渲染，没有存储。
 
-ANCHOR_HEADER = "【全书锚点】这些是这本书不能变的东西。动笔前先钉住，写的过程中一个字都不要偏离。"
+ANCHOR_HEADER = (
+    "【全书锚点】三段分开读，别把它们当成一回事。"
+    "「开局」是第一章的处境，本来就该变——主角第一页是杂役、是学生，"
+    "不代表最后一页还是；拿它当准星去对照每一章，写出来就是第一章的重播。"
+    "「走向」是这本书要走到的地方，每一章都得朝它挪一步。"
+    "「世界」是钉死的设定，写的过程中一个字都不要偏离。"
+)
+ANCHOR_OPENING_LABEL = "开局（第一章的处境，后面会变）："
+ANCHOR_DIRECTION_LABEL = "走向（每一章都要往前推）："
+ANCHOR_WORLD_LABEL = "世界（钉死不偏离）："
 WRITE_BRIEF_ORDER = ("anchor", "recap", "part", "cast", "foreshadow", "hook", "prev")
 
 
 def render_story_anchor(work_dir: str | Path) -> str:
-    """防跑偏锚点：一句话前提、终极钩子、主角与动机、体系与势力。纯渲染。"""
+    """防跑偏锚点：开局处境、故事走向、钉死的世界。纯渲染。
+
+    ⚠️ 这里原来是一整块「这些是不能变的东西，一个字都不要偏离」，
+    把一句话前提、主角动机、主角弧光跟力量体系、势力一起钉死。这是错的，
+    而且自相矛盾：**弧光的定义就是「他会变」**。把「全书要走完的路」放进
+    「一个字都不要偏离」下面，等于命令模型主角不准成长。
+
+    改了三轮才切对：
+      第一轮只把它拆成「世界 / 故事」，可「故事」那桶里一句话前提和核心动机
+      仍然被当成「要推进到的方向」——一样是当成常量。
+      作者当场戳破：主角开局是杂役、是学生，到大结局还要是杂役、是学生吗？
+      第二轮把「开局 / 走向 / 世界」分开，可那三个字段还在。
+      作者第三次追问：这几个为什么不去掉？（都是 2026-09-29）
+
+    现在剩两段，来源各自唯一：
+      开局 —— 主角是谁、开局什么身份、开局图什么（读 characters[主角]，不是书级副本）。
+      走向 —— 主角弧光。每一章都要朝它挪一步。
+      世界 —— 力量体系、势力、文风。这些才是真的不能动。
+    """
     wd = Path(work_dir)
     setting = load_work_setting(wd)
-    lines = [ANCHOR_HEADER]
+    head: list[str] = []
+    opening: list[str] = []
+    direction: list[str] = []
+    world: list[str] = []
     if setting.get("work"):
-        lines.append(f"作品：{setting['work']}"
-                     + (f"（{setting['genre']}）" if setting.get("genre") else ""))
-    if setting.get("logline"):
-        lines.append(f"一句话前提：{setting['logline']}")
-    if setting.get("ultimate_hook"):
-        lines.append(f"终极钩子（读者追到最后的那个答案）：{setting['ultimate_hook']}")
+        head.append(f"作品：{setting['work']}"
+                    + (f"（{setting['genre']}）" if setting.get("genre") else ""))
     lead = [c for c in (setting.get("characters") or [])
             if isinstance(c, dict) and str(c.get("role") or "").strip() == "主角"]
     if lead:
@@ -1070,31 +1088,37 @@ def render_story_anchor(work_dir: str | Path) -> str:
         line = f"主角：{who.get('name')}"
         if who.get("identity"):
             line += f"（{who['identity']}）"
-        if setting.get("core_motive"):
-            line += f"，核心动机：{setting['core_motive']}"
-        lines.append(line)
+        # 动机取**人物身上**那个。设定集里原来还有一份书级副本 core_motive，
+        # 两份写的是一件事，作者被问了两次——副本已删（2026-09-29）。
+        if who.get("motive"):
+            line += f"，开局动机：{who['motive']}"
+        opening.append(line)
         if who.get("arc"):
-            lines.append(f"主角弧光（全书要走完的路）：{who['arc']}")
-    elif setting.get("core_motive"):
-        lines.append(f"主角核心动机：{setting['core_motive']}")
+            direction.append(f"主角弧光（从开局那个处境走到哪儿）：{who['arc']}")
     power = setting.get("power") or {}
     if power.get("system") or power.get("tiers"):
         tiers = " → ".join(str(t) for t in power.get("tiers") or [])
-        lines.append(f"力量体系：{power.get('system') or '（未名）'}" + (f"（{tiers}）" if tiers else ""))
+        world.append(f"力量体系：{power.get('system') or '（未名）'}" + (f"（{tiers}）" if tiers else ""))
     factions = [str(f.get("name")) for f in (setting.get("factions") or []) if isinstance(f, dict)]
     if factions:
-        lines.append("势力：" + "、".join(factions))
+        world.append("势力：" + "、".join(factions))
     style = setting.get("style") or {}
     if style.get("perspective") or style.get("tone"):
-        lines.append("文风：" + "　".join(
+        world.append("文风：" + "　".join(
             x for x in (f"视角 {style.get('perspective')}" if style.get("perspective") else "",
                         f"基调 {style.get('tone')}" if style.get("tone") else "") if x))
     # 只有书名时**不输出**：一个什么都没说的「锚点」只会占掉模型的注意力，
     # 而作者会以为"锚点已经有了"。锚点必须有实质内容才有意义。
-    substantive = bool(setting.get("logline") or setting.get("ultimate_hook")
-                       or setting.get("core_motive") or lead)
-    if len(lines) == 1 or not substantive:
+    substantive = bool(opening or direction or world)
+    if not substantive:
         return ""
+    lines = [ANCHOR_HEADER] + head
+    if opening:
+        lines += [ANCHOR_OPENING_LABEL] + ["　" + ln for ln in opening]
+    if direction:
+        lines += [ANCHOR_DIRECTION_LABEL] + ["　" + ln for ln in direction]
+    if world:
+        lines += [ANCHOR_WORLD_LABEL] + ["　" + ln for ln in world]
     return "\n".join(lines)
 
 

@@ -85,8 +85,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         info = create_original_work(
             _workspaces(args),
             args.new,
-            args.genre or "",
-            logline=args.logline or "",
+            genre=args.genre or "",
             protagonist=args.protagonist or "",
             core_motive=args.core_motive or "",
         )
@@ -346,9 +345,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--list", action="store_true", help="列出所有原创工作区")
 
     p.add_argument("--genre", default="", help="题材")
-    p.add_argument("--logline", default="", help="一句话前提")
     p.add_argument("--protagonist", default="", help="主角名")
-    p.add_argument("--core-motive", dest="core_motive", default="", help="主角核心动机")
+    # 写到 characters[主角].motive 上，不是书级字段（那个 2026-09-29 删了）
+    p.add_argument("--core-motive", dest="core_motive", default="", help="主角一开局图什么")
     p.add_argument("--vol", type=int, default=0, help="只处理某一卷")
     p.add_argument("--chapter", default="", metavar="v001-c0001", help="只处理某一章")
     p.add_argument("--root", default=None, help="工作区根目录，默认项目下的 workspaces/")

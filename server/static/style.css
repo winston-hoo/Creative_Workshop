@@ -10,8 +10,13 @@
   --border: rgba(15, 23, 42, 0.10);
   --border-strong: rgba(15, 23, 42, 0.22);
   --text: #1a1d24;
-  --text-2: #5b6270;
-  --text-3: #9199a6;
+  /* 二级/三级文字原来分别是 #5b6270 / #9199a6。三级色在浅底上只有 2.5–2.9:1，
+     而它承载的是提示、计数、字段说明、面包屑——正文字号 12px 的时候，
+     等于让人眯着眼读。两档一起压深：二级 7.6:1、三级 5.7:1（白底），
+     最差的一档（--surface-3 底）也有 4.7:1，过 WCAG AA 的 4.5:1。
+     两档之间仍保持可辨的深浅差，层级没塌。 */
+  --text-2: #4d5464;
+  --text-3: #606774;
   --accent: #2563eb;
   --accent-strong: #1d4ed8;
   --accent-bg: #eef3fe;
@@ -111,6 +116,10 @@ h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; }
 h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; color: var(--text-2); }
 
 .muted { color: var(--text-3); font-size: 12px; }
+/* 字段说明。原来字段下面的说明是 inline 的 11px muted：比正文小两号，
+   实测作者整片跳过不看，于是「一句话前提是什么意思」要问三遍（2026-09-29）。
+   12px + --text-2 是「读得到，但抢不走注意力」的那一档。 */
+.chint { color: var(--text-2); font-size: 12px; line-height: 1.55; }
 .lead { color: var(--text-2); font-size: 13px; margin: 0 0 20px; }
 
 .card {
@@ -137,12 +146,22 @@ button, .btn {
   background: var(--surface);
   color: var(--text);
   cursor: pointer;
+  /* 链接做成按钮时默认带下划线。以前这行是每个 <a class="btn"> 上的内联
+     style="text-decoration:none;color:inherit"——顺手把 color 也继承成了正文色，
+     于是 .btn.primary 的白字被内联样式盖掉，蓝底上印深灰字（3.3:1，不达 AA）。
+     收进这里一份，内联样式就能删干净。 */
+  text-decoration: none;
   transition: background 0.15s, border-color 0.15s, transform 0.05s;
 }
 button:hover, .btn:hover { background: var(--surface-2); }
 button:active { transform: translateY(1px); }
 button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
-button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent-bg); outline-offset: 1px; }
+/* 焦点框统一由文件末尾的 :focus-visible 那条画（--accent 蓝，白底 5.2:1）。
+   这里原来写的是 `outline: 2px solid var(--accent-bg)`——那是 #eef3fe 的浅蓝，
+   在白底上对比度 1.07:1，等于没画；而且 `button:focus-visible` 的权重比
+   `:focus-visible` 高，末尾那条再怎么写也盖不回来。键盘用户 Tab 到按钮上，
+   屏幕上什么都不会发生。只留 offset。 */
+button:focus-visible, .btn:focus-visible { outline-offset: 1px; }
 button.primary, .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -175,7 +194,13 @@ input[type="text"], input[type="password"], input[type="number"], select, textar
   color: var(--text);
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+/* 选择器原来写的是 `input:focus`，勾选框和单选框也被一起 `outline: none` 了；
+   它的权重（0,1,1）又高过末尾的 `:focus-visible`（0,1,0），
+   于是「Tab 走到第几章那个勾选框」完全没有焦点提示。把这两类摘出去，
+   让它们走通用的 :focus-visible 轮廓。 */
+input:not([type="checkbox"]):not([type="radio"]):focus, select:focus, textarea:focus {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg);
+}
 
 label.check { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; cursor: pointer; }
 label.check input { margin-top: 4px; accent-color: var(--accent); }
@@ -330,7 +355,9 @@ pre.code {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-details > summary { cursor: pointer; font-size: 13px; color: var(--text-2); transition: color 0.15s; }
+/* 折叠标题（校验清单、成本明细）原来只有 21px 高，比一根手指的落点小得多，
+   连点两下很容易点空。上下各给 3px，落到 28px。 */
+details > summary { cursor: pointer; font-size: 13px; color: var(--text-2); padding: 3px 0; transition: color 0.15s; }
 details > summary:hover { color: var(--text); }
 details[open] > summary { margin-bottom: 10px; }
 
@@ -515,7 +542,9 @@ svg polyline { stroke-linejoin: round; stroke-linecap: round; }
 }
 .annot-panel .pfield { margin-bottom: 14px; }
 .annot-panel .pfield .pf-label { font-size: 12px; color: var(--text-2); margin-bottom: 5px; font-weight: 600; }
-.annot-panel .pf-hint { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+/* 字段下面的说明是「这个格子该怎么填」的唯一解释，11px 中文在 1080p 上要凑近看。
+   提到 12px，跟界面其余小字对齐。 */
+.annot-panel .pf-hint { font-size: 12px; color: var(--text-3); margin-top: 4px; }
 
 .annot-rating { display: flex; gap: 5px; flex-wrap: wrap; }
 .annot-rating .r-btn {
@@ -563,7 +592,13 @@ svg polyline { stroke-linejoin: round; stroke-linecap: round; }
   position: sticky; top: 54px; z-index: 10;
 }
 .annot-batbar .spacer { flex: 1; }
-.annot-batbar a { color: var(--accent); text-decoration: none; font-size: 12px; }
+/* 标注台顶部这条操作栏里的「回作品页 / 作品名」是纯文字链接，只有 48×18 的落点，
+   比条里其他控件矮一截，鼠标要瞄。给它撑到 24 高的可点区（WCAG 2.5.8 的靶心下限）。 */
+.annot-batbar a {
+  display: inline-flex; align-items: center; min-height: 24px; padding: 0 4px;
+  color: var(--accent); text-decoration: none; font-size: 12px;
+}
+.annot-batbar a:hover { text-decoration: underline; }
 
 kbd {
   display: inline-block;
@@ -781,6 +816,65 @@ main.annot-page { padding-bottom: 20px; }
   border-radius: 12px; box-shadow: var(--shadow);
 }
 .sec-card { scroll-margin-top: 126px; }
+
+/* ── 创作台：本层工具抽屉 ──────────────────────────────
+   「从知识库取素材」和「和助手对话起草（含配齐…）」原来接在表单屁股后面。
+   设定集表单 3500px 高，实测这两块分别在 y≈3421 和 y≈3969，整页 4600px——
+   要滚过三屏半才见得到，新作者只会看到一张没有尽头的表单，不知道有这两件事。
+
+   改成右侧抽屉，入口钉在常驻的吸顶工具条上（左侧栏里再给一份带解释的）。
+   抽屉**不加遮罩、不占表单宽度**：接受提案的结果要落进左边那份表单草稿，
+   两边得看得见彼此，所以它是非模态的，只有 Esc 和「收起」两个关闭方式。
+   ponytail: 只做覆盖式抽屉，没做「宽屏常驻右栏」。天花板：视口够宽时抽屉仍会盖住表单右半边。
+   触发条件：作者换宽显示器、并且抱怨遮挡时，再加一条 @media (min-width:1440px)
+   把 .cdrawer 从 fixed 改成网格第三列即可，JS 不用动。 */
+.cdrawer {
+  position: fixed; top: 54px; right: 0; bottom: 0;
+  width: min(560px, 94vw);
+  display: flex; flex-direction: column;
+  background: var(--bg);
+  border-left: 1px solid var(--border-strong);
+  box-shadow: -18px 0 42px rgba(15, 23, 42, 0.14);
+  z-index: 60;
+  animation: drawerIn 0.18s ease;
+}
+/* 作者规则里的 display:flex 会盖掉 UA 的 [hidden]{display:none}，得显式写一条 */
+.cdrawer[hidden] { display: none; }
+@keyframes drawerIn {
+  from { transform: translateX(28px); opacity: 0.5; }
+  to { transform: none; opacity: 1; }
+}
+.cdrawer-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.cdrawer-head strong { font-size: 14px; }
+.cdrawer-hint { flex: 1; font-size: 12px; }
+.cdrawer-body { flex: 1 1 auto; overflow: auto; padding: 14px 16px 48px; }
+/* 抽屉外面已经有留白，里面的卡片不用再各留一份上边距 */
+.cdrawer-body > .card { margin: 0 0 14px; }
+
+.ctoolbar-sep { width: 1px; height: 20px; background: var(--border); }
+
+/* 左侧栏贴住：表单滚到中段也还能换层、开工具。
+   栏高被逐章列表自己的 max-height 限住，不会长过视口。 */
+.card[data-sidebar] { position: sticky; top: 118px; }
+
+.cside-sec { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 8px; }
+.cside-title { font-size: 12px; color: var(--text-3); margin: 0 0 5px; }
+.cside-tool {
+  display: block; width: 100%; text-align: left;
+  padding: 7px 9px; margin-bottom: 6px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.cside-tool b { display: block; font-size: 13px; font-weight: 600; }
+.cside-tool small { display: block; font-size: 12px; color: var(--text-3); line-height: 1.5; }
+.cside-tool:hover { border-color: var(--accent); background: var(--accent-bg); }
+.cside-tool:hover b { color: var(--accent); }
 
 /* 校验清单：阻断默认展开，提示默认收着 */
 .issues { border-radius: var(--radius-sm); padding: 10px 13px; margin-bottom: 8px; font-size: 13px; }

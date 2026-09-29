@@ -2748,12 +2748,133 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
     }
 
 
+def _seed_brief(wd: Path, name: str, chapter_id: str) -> dict[str, Any]:
+    """给还没建过的这一章拼一份骨架。
+
+    ⚠️ 这件事**本来就该发生**：`chapter_brief.empty_brief()` 的参数表（title / gist /
+    perspective）几乎和卷表那条章节记录一一对应，它就是为这件事写的——但全仓库
+    零个调用点，是死代码。结果第三步「新建一章」是一张白纸：作者得凭记忆把前两层
+    写过的东西重抄一遍，抄错了自己都不知道（作者 2026-09-29 报的）。
+    """
+    cb, vo, _setting_dir, VOLUME_DIR, BRIEF_DIR = _creation_modules()
+    from workshop.creation import load_work_setting
+
+    parsed = cb.parse_chapter_id(chapter_id)
+    if not parsed:
+        return {}
+    vol_no, chapter_no = parsed
+    # 卷表：这一章的章名、梗概、出场人物、伏笔都在这儿
+    try:
+        doc = vo.load_volume(vo.volume_path(wd / VOLUME_DIR, vol_no))
+    except (OSError, ValueError):
+        doc = {}
+    chapters = (doc.get("vol") or {}).get("chapters") or []
+    chapter = next((c for c in chapters if str(c.get("chapter_no")) == str(chapter_no)), {})
+    # 设定集：视角是全书的，卷表里没有
+    try:
+        setting = load_work_setting(wd)
+    except (OSError, ValueError):
+        setting = {}
+    data = cb.empty_brief(
+        name, vol_no, chapter_no,
+        title=str(chapter.get("title") or ""),
+        gist=str(chapter.get("gist") or ""),
+        perspective=str((setting.get("style") or {}).get("perspective") or ""),
+    )
+    data["settings"]["characters"] = _names(chapter.get("characters"))
+    # ⚠️ core_plot 是**阻断项**（「core_plot 是空的——没有核心情节，写正文的人只能自己编」），
+    # 而卷表那一格 gist 本来就是「这一章发生什么」——同一份东西的不同粒度。
+    # 不给它，作者打开这页先吃一条红色阻断，还得把卷表里的情节重抄一遍（作者 2026-09-29 报的）。
+    beats = _beats(chapter.get("gist"))
+    data["core_plot"] = beats
+    # 一句话概要就取首句。原来整段 gist 塞进去，一格「一句话概要」里躺着三段话，
+    # 而下面 core_plot 是空的——正好反了。
+    if beats:
+        data["one_line"] = beats[0]
+    # ⚠️ 卷表那条 `foreshadow` 是**自由文本**，分不出哪条是埋设、哪条是回收，一律当「埋设」。
+    # 猜错会污染伏笔台账（ledger 读的就是这个字段），所以这一格作者必须自己过一眼。
+    data["foreshadow"] = [
+        {"action": "埋设", "id": f"{chapter_id}-f{i:02d}", "desc": text}
+        for i, text in enumerate(_split_threads(chapter.get("foreshadow")), start=1)
+    ]
+    # 需承接：**上一章指令**里埋设过的伏笔。首章没有上一章，留空就对了——
+    # 别拿卷表上一章的梗概去凑：那是那一章自己的料，不是这一章要接的东西。
+    data["carry_over"] = (
+        _open_threads_of(wd / BRIEF_DIR, cb, cb.chapter_id_of(vol_no, chapter_no - 1))
+        if chapter_no > 1 else []
+    )
+    return data
+
+
+def _beats(text: Any) -> list[str]:
+    """把卷表的 gist 拆成一条一个情节节拍。
+
+    句末标点（。！？；和换行）切刀，标点留着——读起来还是一句完整的话。
+    拆不出多句时（整段就一句），原样一条返回。
+    """
+    raw = str(text or "").replace("\r", " ")
+    for sep in ("\n", "；", ";", "！", "？", "!", "?"):
+        raw = raw.replace(sep, "。")
+    return [part.strip() + "。" for part in raw.split("。") if part.strip()]
+
+
+def _names(value: Any) -> list[str]:
+    """卷表里的人物可能是一张列表，也可能是「主角、挑夫」这样一条字符串——
+    白名单把 characters 标成 list_fields，但 YAML 里手写和模型给的都是字符串。
+
+    ⚠️ 字符串必须**按顿号拆**，不能直接遍历：遍历会得到「主」「角」「、」「挑」「夫」，
+    而它看起来还有模有样，不核对根本发现不了（实测 2026-09-29）。
+    """
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    raw = str(value or "")
+    for sep in ("，", ",", "；", ";", "/"):
+        raw = raw.replace(sep, "、")
+    return [part.strip() for part in raw.split("、") if part.strip()]
+
+
+def _split_threads(text: Any) -> list[str]:
+    """把卷表里那一条自由文本拆成几条。中文分号、英文分号、换行都算分隔。"""
+    raw = str(text or "").replace("\n", "；").replace(";", "；")
+    return [part.strip() for part in raw.split("；") if part.strip()]
+
+
+def _open_threads_of(brief_dir: Path, cb: Any, chapter_id: str) -> list[str]:
+    """上一章指令里「埋设」过的伏笔。上一章还没建指令就返回空——不是错误。"""
+    if not chapter_id:
+        return []
+    path = cb.brief_path(brief_dir, chapter_id)
+    if not path.exists():
+        return []
+    try:
+        prev = cb.load_brief(path)
+    except (OSError, ValueError):
+        return []
+    return [
+        str(f.get("desc"))
+        for f in (prev.get("foreshadow") or [])
+        if str(f.get("action") or "") == "埋设" and str(f.get("desc") or "").strip()
+    ]
+
+
 def creation_read(paths: Paths, name: str, kind: str, key: str = "") -> dict[str, Any]:
     """读一份原文 + 它的校验结果。"""
     wd = _creation_work_dir(paths, name)
     path = _creation_path(wd, kind, key)
     if not path.exists():
-        return {"exists": False, "path": str(path), "text": "", "errors": [], "warnings": []}
+        out: dict[str, Any] = {"exists": False, "path": str(path), "text": "",
+                               "errors": [], "warnings": []}
+        # 指令层没建过就**不是空壳**：拿卷表和设定集把骨架拼出来。前端照常渲染成表单，
+        # 作者在别人写好的基础上改，而不是从零抄一遍。exists 仍然是 false——
+        # 「磁盘上还没有这份文件」这个事实不能改，保存路径还要靠它。
+        if kind == "brief" and key:
+            out["data"] = _seed_brief(wd, name, key)
+            # 明确告诉前端「这份是我拼的、没落过盘」。前端拿它去标记「有未保存的改动」——
+            # 靠 !exists && data 非空去猜也行，但那是猜；多一个字段省掉一次误判。
+            out["seeded"] = bool(out["data"])
+        else:
+            out["data"] = {}
+        return out
     text = path.read_text(encoding="utf-8")
     errors, warnings = _creation_validate_text(wd, kind, key, text)
     out = {"exists": True, "path": str(path), "text": text,
@@ -2766,6 +2887,14 @@ def creation_read(paths: Paths, name: str, kind: str, key: str = "") -> dict[str
     except yaml.YAMLError:
         parsed = None
     out["data"] = parsed if isinstance(parsed, dict) else {}
+    # 文件已经存在、但 core_plot 是空的：这一章多半是在「预填」上线**之前**就建出来的，
+    # 于是永远停在一条阻断上——播种只在文件不存在时跑，够不着它（作者 2026-09-29 报的）。
+    # 把「照卷表补出来该是什么样」一起发回去，页面给一个按钮，**作者点了才动他的文件**。
+    # 不在这儿自动合并：那是他的文件，我们只负责把选项摆出来。
+    if (kind == "brief" and key and not (out["data"].get("core_plot") or [])):
+        seed = _seed_brief(wd, name, key)
+        if seed.get("core_plot"):
+            out["suggest"] = seed
     return out
 
 def creation_write(paths: Paths, name: str, kind: str, key: str, text: str) -> dict[str, Any]:
@@ -3112,7 +3241,12 @@ def run_setting_assist(
     from workshop.config import load_config
     from workshop.llm import OpenAICompatProvider
     from workshop.secrets import SecretStore, setup_logging
-    from workshop.setting_assist import LAYER_SPECS, describe_proposal, run_assist
+    from workshop.setting_assist import (  # noqa: PLC0415
+        LAYER_SPECS,
+        describe_proposal,
+        resolve_section,
+        run_assist,
+    )
 
     if not str(message or "").strip() and task not in ("writeback", "review"):
         raise ValueError("要说点什么才能问")
@@ -3185,6 +3319,9 @@ def run_setting_assist(
             head, _, tail = section.partition(":")
             if head in LAYER_SPECS and tail:
                 target_layer, section = head, tail
+        # 模型有时给中文标签而不是键名（见 resolve_section）。这里就归一，
+        # 否则提案表那一列会显示「未知小节「世界硬规则」」，而它其实是能认的。
+        section = resolve_section(target_layer, section)
         spec = (LAYER_SPECS.get(target_layer) or {}).get(section) or {}
         entry = row.get("entry") if isinstance(row.get("entry"), dict) else None
         if entry is None:
@@ -3195,18 +3332,25 @@ def run_setting_assist(
             flat = {k: v for k, v in row.items()
                     if k not in ("section", "op", "value", "entry")}
             entry = flat or None
-        # 表格里那一个「内容」输入框绑到哪儿：条目表绑主键，其余绑 value。
+        # 表格里那一个「内容」输入框绑到哪儿：条目表默认绑主键，其余绑 value。
         # 改完的值会覆盖模型给的原值——批量生成最容易出问题的就是名字。
+        # 但主键不一定好认：章节的主键是章节号，那一列整排「1、2、3」，
+        # 作者看不出哪一章是哪一章。白名单里可以用 display 指定一个给人看的字段
+        # （章节用 title），主键就挪到「类别」列，谁也不丢。
         if spec.get("key"):
-            primary_field, primary = spec["key"], str((entry or {}).get(spec["key"]) or "")
+            primary_field = str(spec.get("display") or spec["key"])
+            primary = str((entry or {}).get(primary_field) or "")
+            keyed = ("" if primary_field == spec["key"]
+                     else str((entry or {}).get(spec["key"]) or ""))
         else:
-            primary_field, primary = "value", str(row.get("value") or "")
+            primary_field, primary, keyed = "value", str(row.get("value") or ""), ""
         proposals.append(
             {
                 "index": index,
                 "section": section,
                 "layer": target_layer,
-                "section_label": spec.get("label") or f"未知小节「{section}」",
+                "section_label": (spec.get("label") or f"未知小节「{section}」")
+                                 + (f" {keyed}" if keyed else ""),
                 "op": str(row.get("op") or ""),
                 "label": describe_proposal(row, target_layer),
                 # 发**解析后**的 entry（含平铺兜底那份）。发 row 里的原始值的话，

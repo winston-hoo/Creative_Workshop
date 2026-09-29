@@ -160,7 +160,10 @@ def test_template_parses_and_starts_blocked() -> None:
         check(first_vol["vol"]["vol"] == 1, "卷骨架能解析且卷号正确")
 
         errors, _w = validate_setting(data)
-        check(any("一句话前提" in e for e in errors), f"空设定集被拦下来（实际 {errors[:2]}）")
+        # 原来断言的是「缺一句话前提」。logline 和 core_motive 已经不在校验里了
+        # （2026-09-29），刚建出来的工作区现在**是干净的**——这反而更值得盯住：
+        # 新建一个作品不该一上来就顶着阻断项。
+        check(not errors, f"刚建出来的设定集没有阻断项（实际 {errors[:2]}）")
         vol_errors, _w = vo.validate_volume(first_vol)
         check(vol_errors, "空卷表被拦下来（没有章表）")
 
@@ -696,9 +699,23 @@ def test_write_brief_assembly() -> None:
 
         anchor = render_story_anchor(wd)
         check("全书锚点" in anchor, "锚点块在")
-        check("主角：李默" in anchor and "活着回去" in anchor, "锚点里有主角与核心动机")
-        check("那双眼睛到底是谁给的" in anchor, "终极钩子进了锚点")
+        check("主角：李默" in anchor and "活着回去" in anchor,
+              "锚点里有主角与开局动机——动机取 characters[主角].motive，不取已删的书级副本")
+        check("那双眼睛到底是谁给的" not in anchor, "终极钩子不再进锚点（字段已删）")
         check("修为（炼气 → 筑基）" in anchor, "力量体系进了锚点")
+        # 「钉死的」和「会变的」必须分开。主角开局是杂役、是学生，
+        # 不代表大结局还是杂役、还是学生——把它跟力量体系一起塞进「一个字都不要偏离」，
+        # 等于告诉模型主角不准成长，写出来就是第一章的重播（作者 2026-09-29 指出）。
+        for label in ("开局（第一章的处境，后面会变）", "走向（每一章都要往前推）",
+                      "世界（钉死不偏离）"):
+            check(label in anchor, f"锚点有「{label}」这一段")
+        opening = anchor.split("走向（每一章都要往前推）")[0]
+        check("主角：" in opening and "开局动机" in opening,
+              "主角与开局动机在「开局」段——那是第一章的处境，不是准星")
+        check("一句话前提" not in anchor, "一句话前提不再进锚点（字段已删）")
+        direction = anchor.split("走向（每一章都要往前推）")[1].split("世界（钉死不偏离）")[0]
+        check("主角弧光" in direction, "主角弧光在「走向」段——那才是要走到的地方")
+        check("力量体系" in anchor.split("世界（钉死不偏离）")[1], "力量体系在「世界」段")
 
         recap = render_recap(wd, upto_chapter_no=1)
         check("第 1 卷" in recap, "前情有第一卷")

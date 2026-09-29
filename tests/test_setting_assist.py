@@ -154,20 +154,31 @@ def test_strlist_and_scalar() -> None:
             {"section": "rules", "op": "add", "value": "查克拉用尽会昏迷"},
             {"section": "rules", "op": "remove", "value": "本来就没有这条"},
             {"section": "tiers", "op": "add", "value": "筑基"},
-            {"section": "logline", "op": "set", "value": "新的前提"},
-            {"section": "core_motive", "op": "add", "value": "数组动作用在单字段上"},
+            # logline / core_motive 原来在这儿当标量用例，两个字段都删了
+            # （见 setting_assist.LAYER_SPECS 那段注释），改用还在的标量。
+            {"section": "tone", "op": "set", "value": "冷峻克制"},
+            {"section": "era", "op": "add", "value": "数组动作用在单字段上"},
             {"section": "themes", "op": "add", "value": ""},
             {"section": "terms", "op": "add", "entry": {"meaning": "没写术语名"}},
+            # 模型时不时把 section 写成中文标签而不是键名（实测 2026-09-29，
+            # 一整批 8 条世界硬规则就这么全丢了）。标签也认，但**闸没放松**。
+            {"section": "世界硬规则", "op": "add", "value": "用中文标签提的也认"},
+            {"section": "根本没这一节", "op": "add", "value": "X"},
         ],
     )
     check(results[0]["ok"], "规则 add 成功")
     check(not results[1]["ok"] and "已经在里面" in results[1]["reason"], "重复规则被拒")
     check(not results[2]["ok"] and "本来就不在" in results[2]["reason"], "remove 不存在的条目被拒")
     check(setting["power"]["tiers"] == ["炼气", "筑基"], "等级按顺序追加")
-    check(setting["logline"] == "新的前提", "单字段 set 成功")
+    check(setting["style"]["tone"] == "冷峻克制", "单字段 set 成功")
     check(not results[5]["ok"] and "只能用 set" in results[5]["reason"], "数组动作用在单字段上被拒")
     check(not results[6]["ok"] and "value 是空的" in results[6]["reason"], "空值被拒")
     check(not results[7]["ok"] and "缺主键" in results[7]["reason"], "术语缺 term 被拒")
+    rules_got = setting.get("world", {}).get("rules") or []
+    check(results[8]["ok"] and "用中文标签提的也认" in rules_got,
+          "section 写成中文标签「世界硬规则」也认，并落回键名 rules")
+    check(not results[9]["ok"] and "不认识的小节" in results[9]["reason"],
+          "认标签不等于放松：编出来的小节照样拒")
     check(all(r["ok"] or r["reason"] for r in results), "每一条都有结果或原因，没有静默")
 
 
@@ -311,6 +322,10 @@ def test_volume_layer() -> None:
           "卷头字段可以 set")
     check(not results[5]["ok"] and "不认识的小节" in results[5]["reason"],
           "把设定集的小节名用到卷层上会被拒（两层的白名单是分开的）")
+    # 光说「不认识」不够：作者站在卷表层问设定集的事时，整批提案会全数被拒，
+    # 他需要知道的是「该去哪一层重问」，而不是一屏一模一样的拒收原因。
+    check("设定集层" in results[5]["reason"],
+          f"拒收原因点名了那个小节属于哪一层（{results[5]['reason']}）")
     check(len(chapters) == 4, f"只进了两章（实际 {len(chapters)}）")
 
 
