@@ -928,7 +928,7 @@ def start_annotation(
     setup_logging(secrets_store.known_values)
     api_key = _read_api_key(cfg, provider)
     if provider.api_key_ref and not api_key:
-        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+        raise ValueError(_no_key_msg(provider))
 
     opts = resolve_annotation_options(cfg, AnnotateOptions())
     client = OpenAICompatProvider(
@@ -1938,7 +1938,7 @@ def start_rewrite(
     cfg = load_config(paths.root / "providers.yaml")
     provider, model_id = _resolve_provider_and_model(cfg, provider_id, model_id)
     if provider.api_key_ref and not _read_api_key(cfg, provider):
-        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+        raise ValueError(_no_key_msg(provider))
 
     tasks = load_chapter_tasks(paths.ingest_dir(name))
     task = next((t for t in tasks if t.chapter_id == chapter_id), None)
@@ -2281,7 +2281,7 @@ def start_entities(
     setup_logging(store.known_values)
     api_key = _read_api_key(cfg, provider)
     if provider.api_key_ref and not api_key:
-        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+        raise ValueError(_no_key_msg(provider))
     client = OpenAICompatProvider(
         base_url=provider.base_url,
         api_key=api_key,
@@ -2483,7 +2483,7 @@ def start_outline(
     setup_logging(store.known_values)
     api_key = _read_api_key(cfg, provider)
     if provider.api_key_ref and not api_key:
-        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+        raise ValueError(_no_key_msg(provider))
 
     client = OpenAICompatProvider(
         base_url=provider.base_url,
@@ -2855,6 +2855,21 @@ def _open_threads_of(brief_dir: Path, cb: Any, chapter_id: str) -> list[str]:
         for f in (prev.get("foreshadow") or [])
         if str(f.get("action") or "") == "埋设" and str(f.get("desc") or "").strip()
     ]
+
+
+def _no_key_msg(provider: Any) -> str:
+    """密钥读不到时该说什么。
+
+    ⚠️ 原来只说「请设置环境变量 DEEPSEEK_API_KEY」——**对打包版的用户是死路**：
+    双击 exe 的人不会去设环境变量，他需要知道的是「往哪个文件里填」。
+    打包版数据根里连 config/secrets.json 都不存在，所以他照着那句提示做，
+    在文件系统里找不到任何对应的东西（作者 2026-09-29 卡在这儿）。
+    """
+    ref = getattr(provider, "api_key_ref", "DEEPSEEK_API_KEY")
+    return (
+        f"读不到密钥 {ref}。在数据目录下的 config/secrets.json 里填 "
+        f'{{"{ref}": "你的密钥"}}，或者设置同名环境变量 {ref}。'
+    )
 
 
 def creation_read(paths: Paths, name: str, kind: str, key: str = "") -> dict[str, Any]:
@@ -3286,7 +3301,7 @@ def run_setting_assist(
     _ctx = render_write_brief(_wd, chapter_no=_cno, prev_chapter_no=max(0, _cno - 1))
     provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
     if provider.api_key_ref and not _read_api_key(cfg, provider):
-        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+        raise ValueError(_no_key_msg(provider))
 
     store = SecretStore(paths.root / "config")
     setup_logging(store.known_values)
@@ -3487,7 +3502,7 @@ def run_draft(
     cfg = load_config(paths.root / "providers.yaml")
     provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
     if provider.api_key_ref and not _read_api_key(cfg, provider):
-        raise ValueError(f"读不到密钥，请设置环境变量 {provider.api_key_ref}")
+        raise ValueError(_no_key_msg(provider))
 
     store = SecretStore(paths.root / "config")
     setup_logging(store.known_values)

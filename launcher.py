@@ -19,6 +19,7 @@ import os
 import socket
 import sys
 import threading
+import traceback
 import webbrowser
 from pathlib import Path
 
@@ -59,6 +60,21 @@ def seed(target_root: Path) -> list[str]:
         target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
         written.append(name)
     return written
+
+
+def _hold_window() -> None:
+    """出错时**别让窗口关掉**。
+
+    双击 exe 出问题时，控制台会在用户读到任何字之前消失——用户能报告的只有
+    「一闪而过」，排查等于从零开始。所以先把话说完，再等一次回车。
+    源码方式不加这道闸：否则 CI 和脚本会被一个 input() 卡死。
+    """
+    if not is_frozen():
+        return
+    try:
+        input("按回车关闭这个窗口…")
+    except EOFError:  # 输出被重定向、没有 stdin
+        pass
 
 
 def pick_port(preferred: int) -> int:
@@ -105,4 +121,17 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit as exc:
+        # 只有我们自己抛的 SystemExit("……") 算启动失败（整数码是正常退出和
+        # argparse 的用法错误，那两种各有各的输出，别插嘴）。
+        if isinstance(exc.code, str):
+            print(f"\n启动失败：{exc.code}")
+            _hold_window()
+        raise
+    except BaseException:
+        # 启动阶段崩了。这一条如果不留窗口，用户能报告的只有「一闪而过」。
+        traceback.print_exc()
+        _hold_window()
+        raise SystemExit(1)
