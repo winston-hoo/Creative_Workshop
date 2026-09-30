@@ -91,7 +91,10 @@ def test_strip_wrapping() -> None:
 def test_count_chars() -> None:
     print("字数统计")
 
-    check(count_chars("你好 世界\n\n再来") == 6, f"空白不计入（实际 {count_chars('你好 世界\n\n再来')}）")
+    # 把样本拎出来：f-string 的表达式里不许有反斜杠（Python 3.12 才放开），
+    # 写在里面会让整个文件在 3.11 上直接语法错，测试根本跑不起来。
+    sample = "你好 世界\n\n再来"
+    check(count_chars(sample) == 6, f"空白不计入（实际 {count_chars(sample)}）")
     check(count_chars("") == 0, "空串是 0")
     check(count_chars("   \n\t ") == 0, "纯空白是 0")
 

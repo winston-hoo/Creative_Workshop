@@ -98,6 +98,10 @@ LAYER_SPECS: dict[str, dict[str, dict[str, Any]]] = {
         "era": {"kind": "scalar", "path": ("world", "era"), "label": "时代"},
         "power_system": {"kind": "scalar", "path": ("power", "system"), "label": "力量体系名"},
         "tone": {"kind": "scalar", "path": ("style", "tone"), "label": "基调"},
+        # 视角在表单里是一个下拉，选项只有 creation._PERSPECTIVES 那三个，
+        # 而它原来**不在这张白名单里**——助手提「视角：第一人称」会被整条拒收，
+        # 作者只能自己去原文模式改。同一个字段，两条路各堵一半（2026-09-30）。
+        "perspective": {"kind": "scalar", "path": ("style", "perspective"), "label": "视角"},
         # 这里原来还有 logline（一句话前提）、core_motive（主角核心动机）、
         # ultimate_hook（终极钩子）三条。全部删掉，理由分三种（作者 2026-09-29 要求）：
         #   · 终极钩子：只被 render_story_anchor 抄进提示词一段散文，别处没人读。
@@ -211,6 +215,9 @@ class AssistPlan:
     est_cost_cny: float | None
     price_note: str
     warnings: list[str] = field(default_factory=list)
+    # 「写前必读 + 完整设定卡」那一段的字数。不计进来的话，界面上的 token 与费用
+    # 会比真实打出去的低一截，而作者正是照着这个数决定要不要点下去。
+    context_chars: int = 0
     # 这次真正会喂进去的参照素材。给界面用，让作者能**看见**知识库到底贡献了什么，
     # 而不是点一个「问助手」然后猜。
     refs_preview: str = ""
@@ -222,6 +229,7 @@ class AssistPlan:
             "provider": self.provider_id,
             "model": self.model_id,
             "setting_chars": self.setting_chars,
+            "context_chars": self.context_chars,
             "refs": self.refs,
             "ref_chars": self.ref_chars,
             "refs_level": self.level,
@@ -250,12 +258,13 @@ def build_assist_plan(
     price_output_per_mtok: float | None = None,
     bucket: str | None = None,
     layer: str = "setting",
+    context_chars: int = 0,
 ) -> AssistPlan:
     """算出这一次对话大概多少 token、多少钱。**不发起任何调用。**"""
     setting_chars = len(_render_current(setting, layer=layer))
     ref_chars = len(refs_block)
     # 真实散文的系数是 0.675（见 providers.yaml 的 measured_batch），别用探测那个 0.968
-    est_in = int((setting_chars + ref_chars + 900) * 0.675)
+    est_in = int((setting_chars + context_chars + ref_chars + 900) * 0.675)
     est_out = 700
     cost = None
     note = "未填写单价，费用无法计算。"
@@ -289,6 +298,7 @@ def build_assist_plan(
         price_note=note,
         warnings=warnings,
         refs_preview=refs_block,
+        context_chars=context_chars,
         level=level if level in REFS_LEVELS else DEFAULT_REFS_LEVEL,
     )
 
@@ -328,12 +338,29 @@ _LAYER_FRAMING = {
 
 _LAYER_RULES = {
     "setting": """- 人物必须有 name、role、motive；术语必须有 term、meaning。""",
+    # 卷表/指令这两层是**照着设定集写**的，不是重新开一本。
+    # 不给这条时，设定集写得再全，模型也会自己造一套人名与世界观：
+    # 实测（2026-09-30）：科幻设定下排出来的卷表是乡土怪谈那一套（老井、夜谈），
+    # 出场人物一栏整排写着「主角」「同伴」——设定集里的名字一次都没用上。
     "volume": """- 章节条目必须有 chapter_no（整数）和 title；章号要与本卷已有的连号，不要跳号、不要重复。
 - 卷头类字段（title / era / core_conflict / goal / closing）用 set。
-- 一次不要重排整卷章表。只提作者点名要动的那几章。""",
+- 一次不要重排整卷章表。只提作者点名要动的那几章。
+- **这一卷是照着【设定集】写的**：主角必须是设定集里那个主角，出场人物写他的**名字**，
+  不要写「主角」「同伴」这种占位称呼。势力、地点、术语、能力一律用设定集里的原词。
+  设定集里没有的东西不要现编——编出来的世界观与设定集冲突，读者第一页就会发现。
+- **动手之前先把已有的章节表跟【设定集】对一遍**。出场人物写着「主角」「同伴」，
+  或者人名、势力、地点、术语在设定集里根本找不到，就是早先跑偏留下的痕迹，
+  不是作者的设定。实测（2026-09-30）：科幻设定下卷表写着怪谈味的章名、人物写着「同伴」，
+  作者再问一次，助手答「前3章沿用已有的走向不动」，跑偏的内容就一直往下传——
+  作者看到的还是同一本书，等于没修。这几章要用 update 改：entry 带 chapter_no，
+  加上按设定集重写的 title / characters，并在 reply 里点名改了哪几章、对不上在哪。
+  对得上的章节才保持不动；**「沿用已有的」不能当成放过冲突的理由**。
+- 新加的章节不许从对不上的旧章节里抄人名：旧章节里那些不在设定集里的人物，别再写进新章。""",
     "brief": """- foreshadow 的 action 只能是「埋设」「推进」「回收」；「推进」「回收」必须引用前面已经埋设过的 id，不能凭空回收。
 - 埋设新伏笔时才给新 id（形如 v001-c0007-f01）。
-- 一句话概要、核心情节、禁止出现，都不要与已有的重复。""",
+- 一句话概要、核心情节、禁止出现，都不要与已有的重复。
+- **严格贴着【设定集】与【本卷目录】写**：出场人物填名字（设定集里那个人），涉及势力、术语用设定集里的原词。
+  设定集里没有的人与地点不要现编。""",
 }
 
 
@@ -376,6 +403,10 @@ def assist_system(layer: str = "setting", task: str = "") -> str:
   他明确要的那一类，别挤牙膏。
 - 但他**没点名**的类别不要顺手加。他要势力，你别自作主张附赠一整套力量体系。
 - 不要重复已有的条目。已有的名字不要换个写法再加一遍。
+- **reply 只写一两句话，60 字以内**：说清你打算动什么、为什么。逐条的分析不要写进 reply——
+  要动的内容都在 proposals 里，作者看的是提案表。reply 写长了会把整个 JSON 撑爆，输出被截断，
+  **整批提案一条都拿不到**（实测 2026-09-30：模型在 reply 里逐条复述「哪里跟设定集对不上」，
+  两次都在写完 reply 之前撞上输出上限，作者那边只看到一句「返回内容不是 JSON」）。
 - 把握不准的宁可少提一条，也别凑数——凑数的只会让作者多勾掉几次。
 {_LAYER_RULES.get(layer, "")}
 """
@@ -505,6 +536,8 @@ def _render_current(document: dict[str, Any], *, layer: str = "setting") -> str:
         return render_injection_block(document)
 
     if layer == "volume":
+        from .creation import as_text_list
+
         vol = document.get("vol") or {}
         lines = [
             f"卷 {vol.get('vol')}：{vol.get('title') or '（没写卷名）'}"
@@ -530,7 +563,7 @@ def _render_current(document: dict[str, Any], *, layer: str = "setting") -> str:
             if ch.get("gist"):
                 line += f"：{ch['gist']}"
             if ch.get("characters"):
-                line += f"｜出场：{'、'.join(str(c) for c in ch['characters'])}"
+                line += f"｜出场：{'、'.join(as_text_list(ch['characters']))}"
             if ch.get("foreshadow"):
                 line += f"｜伏笔：{ch['foreshadow']}"
             lines.append(line)
@@ -648,7 +681,7 @@ def run_assist(
             {"role": "system", "content": assist_system(layer)},
             {"role": "user", "content": build_user_prompt(
                 setting=setting, message=message, history=history,
-                refs_block=refs_block, layer=layer)},
+                refs_block=refs_block, layer=layer, context_block=context_block)},
         ]
     extra = build_thinking_extra(thinking, None)
     usage_total: dict[str, int] = {}

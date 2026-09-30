@@ -36,7 +36,9 @@ from workshop.setting_assist import (  # noqa: E402
     describe_proposal,
     kb_proposals,
     kb_relations_proposals,
+    run_assist,
 )
+from workshop.llm import ApiError, ErrorKind  # noqa: E402
 
 _failures: list[str] = []
 
@@ -211,6 +213,72 @@ def test_proposals_do_not_mutate_input() -> None:
     check(original == snapshot, "原设定集没被就地改掉（界面草稿才该变）")
 
 
+def test_context_block_reaches_the_model() -> None:
+    """写前必读 + 设定卡必须**真的**在发出去的消息里。
+
+    这里栽过一次，而且是最贵的那种：`build_user_prompt` 收了 context_block、
+    `run_assist` 也收了，中间那句组装忘了转发——于是起草卷表时模型只看得到
+    「当前分卷目录」那一层的空文档，设定集一个字都到不了它眼前。
+    结果：作者的科幻设定排出来是怪谈那一套（老井、夜谈），
+    出场人物整排写着「主角」「同伴」，而界面看起来一切正常（2026-09-30 实测）。
+
+    所以这条断言查的是**入参有没有走到 messages 里**，不是查函数收不收它。
+    """
+    print("提示词组装 · 上下文要走到发出去的消息里")
+
+    sent: dict = {}
+
+    class FakeClient:
+        secrets: tuple = ()
+
+        def chat(self, model_id, messages, **kw):
+            sent["messages"] = messages
+            raise ApiError(ErrorKind.BAD_REQUEST, "探针到此为止")
+
+    run_assist(
+        client=FakeClient(), model_id="m", setting=_volume(), message="把这一卷的章表配齐",
+        layer="volume", max_attempts=1,
+        context_block="【设定集：这是唯一真源，人物与世界观都按它来】\n【题材】科幻未来\n【世界观】\n硬规则：记忆可以被改写",
+    )
+    user = sent["messages"][1]["content"]
+    check("科幻未来" in user, "设定卡进了发出去的消息")
+    check("记忆可以被改写" in user, "世界观硬规则也进了（锚点里没有这一节）")
+    check("当前分卷目录" in user, "当前层文档还在")
+    check("把这一卷的章表配齐" in user, "作者的要求还在")
+
+
+def test_layer_rules_pin_the_setting() -> None:
+    """卷表/指令那两层必须被明说「照着设定集写」。"""
+    print("系统提示 · 不许另起一本")
+
+    vol = assist_system("volume")
+    brf = assist_system("brief")
+    check("主角必须是设定集里那个主角" in vol, "卷表层点名了主角要用设定集里的名字")
+    check("不要写「主角」「同伴」这种占位称呼" in vol, "并且禁掉了占位称呼")
+    check("设定集里没有的东西不要现编" in vol, "禁掉了现编世界观")
+    # 只钉「照着设定集写」还不够：已有的章节是对不上的旧内容时，
+    # 助手会答「沿用已有的走向不动」，跑偏的内容原样留在卷表里（实测 2026-09-30）。
+    check("先把已有的章节表跟【设定集】对一遍" in vol, "要求先拿已有章表跟设定集对一遍")
+    check("要用 update 改" in vol, "对不上的章节要用 update 改掉，而不是新加一章")
+    check("不能当成放过冲突的理由" in vol, "明说「沿用已有的」不能当借口")
+    check("严格贴着【设定集】与【本卷目录】写" in brf, "指令层同样钉住了设定集")
+
+
+def test_plan_counts_the_context() -> None:
+    """计划里的 token 与费用要算上「写前必读 + 设定卡」，否则报价是假的。"""
+    print("助手计划 · 上下文要计进 token")
+
+    kw = dict(work="关山灯", setting=_base(), refs_block="", refs=[],
+              provider_id="p", model_id="m", price_input_per_mtok=1.0,
+              price_output_per_mtok=4.0)
+    without = build_assist_plan(**kw)
+    with_ctx = build_assist_plan(**kw, context_chars=4000)
+    check(with_ctx.context_chars == 4000, "计划记下了上下文字数")
+    check(with_ctx.est_input_tokens > without.est_input_tokens,
+          f"上下文计进了输入 token（{without.est_input_tokens} → {with_ctx.est_input_tokens}）")
+    check(with_ctx.est_cost_cny > without.est_cost_cny, "费用也跟着涨，不报假价")
+
+
 def test_plan_is_free_and_honest() -> None:
     print("助手的计划：先给数字再花钱")
 
@@ -327,6 +395,30 @@ def test_volume_layer() -> None:
     check("设定集层" in results[5]["reason"],
           f"拒收原因点名了那个小节属于哪一层（{results[5]['reason']}）")
     check(len(chapters) == 4, f"只进了两章（实际 {len(chapters)}）")
+
+
+def test_volume_chapter_can_be_corrected() -> None:
+    """旧章节要能被按设定集改写——「跑偏的内容别再往下传」只有这一条出路。
+
+    助手如果只能 add，作者手里那些早先跑偏的章就只能自己手改；
+    而这条路径一旦悄悄变成「再加一章」，越改越乱（章号还会撞车）。
+    """
+    print("分卷目录层 · 旧章节按设定集改写")
+
+    before = _volume()
+    setting, results = apply_proposals(
+        before,
+        [{"section": "chapters", "op": "update",
+          "entry": {"chapter_no": 1, "title": "柴房的第一夜", "characters": ["周砚", "苏清月"]}}],
+        layer="volume",
+    )
+    chapters = setting["vol"]["chapters"]
+    check(results[0]["ok"], f"改已有章节成功（{results[0].get('reason', '')}）")
+    check(len(chapters) == len(before["vol"]["chapters"]),
+          f"是改原来那一章，没有多加（{len(before['vol']['chapters'])} → {len(chapters)}）")
+    check(chapters[0]["title"] == "柴房的第一夜", "标题换成了设定集里的写法")
+    check(chapters[0]["characters"] == ["周砚", "苏清月"], "出场人物换成了设定集里的人")
+    check(chapters[0]["gist"] == "看到别人的修为数值", "没提的字段原样留着")
 
 
 def test_brief_layer_foreshadow_enum() -> None:
@@ -507,9 +599,13 @@ def main() -> int:
         test_strlist_and_scalar,
         test_unchecked_are_reported,
         test_proposals_do_not_mutate_input,
+        test_context_block_reaches_the_model,
+        test_layer_rules_pin_the_setting,
+        test_plan_counts_the_context,
         test_plan_is_free_and_honest,
         test_refs_block_carries_real_material,
         test_volume_layer,
+        test_volume_chapter_can_be_corrected,
         test_brief_layer_foreshadow_enum,
         test_layer_prompts_differ,
         test_refs_levels,

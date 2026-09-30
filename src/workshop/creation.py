@@ -353,7 +353,7 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
                 if c.get(key):
                     lines.append(f"- {label}：{c[key]}")
             if c.get("abilities"):
-                lines.append("- 能力：" + "、".join(str(a) for a in c["abilities"]))
+                lines.append("- 能力：" + "、".join(as_text_list(c["abilities"])))
             for rel in c.get("relations") or []:
                 if isinstance(rel, dict):
                     lines.append(f"- 关系：{rel.get('type') or '—'} → {rel.get('to')}")
@@ -433,7 +433,7 @@ def render_injection_block(data: dict[str, Any], *, max_chars: int | None = None
             if c.get(key):
                 line += f" {label}：{c[key]}；"
         if c.get("abilities"):
-            line += f" 能力：{'、'.join(str(a) for a in c['abilities'])}；"
+            line += f" 能力：{'、'.join(as_text_list(c['abilities']))}；"
         rels = [f"{r.get('type') or '—'}→{r.get('to')}"
                 for r in (c.get("relations") or []) if isinstance(r, dict)]
         if rels:
@@ -807,6 +807,24 @@ def chain_report(work_dir: str | Path) -> dict[str, Any]:
 # 这里从逐章指令和卷表里把每个人物的出场章列出来，算「最近一次出场」和「连续缺席几章」。
 
 
+def as_text_list(value: Any) -> list[str]:
+    """把「数组或一条顿号串」归一成字符串列表。
+
+    白名单里那几个数组字段（人物能力、卷表的出场人物、部分的必须完成功能）对模型说的是
+    「用、分隔的字符串」，模型照办，落进 YAML 的就是**标量字符串**。
+
+    ⚠️ 标量**必须按顿号拆**，不能直接遍历：遍历「主角、同伴」会得到
+    「主」「角」「、」「守」「井」「人」——六个不存在的角色，而且看起来还有模有样。
+    这些行会随「写前必读」与设定卡注入到起草和写正文的提示词里（实测 2026-09-30）。
+    """
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    raw = str(value or "")
+    for sep in ("，", ",", "；", ";", "/"):
+        raw = raw.replace(sep, "、")
+    return [part.strip() for part in raw.split("、") if part.strip()]
+
+
 def character_presence(work_dir: str | Path, *, brief_only: bool = False) -> dict[str, Any]:
     """谁在第几章出场、谁已经连着好几章没露面了。纯脚本，零成本。
 
@@ -833,7 +851,7 @@ def character_presence(work_dir: str | Path, *, brief_only: bool = False) -> dic
         if not no:
             continue
         names = ((b.get("settings") or {}).get("characters") or [])
-        by_chapter.setdefault(no, set()).update(str(n).strip() for n in names if str(n).strip())
+        by_chapter.setdefault(no, set()).update(as_text_list(names))
     for vol in ([] if brief_only else volumes.values()):
         for ch in (vol.get("vol") or {}).get("chapters") or []:
             if not isinstance(ch, dict):
@@ -841,9 +859,7 @@ def character_presence(work_dir: str | Path, *, brief_only: bool = False) -> dic
             no = int(ch.get("chapter_no") or 0)
             if not no:
                 continue
-            by_chapter.setdefault(no, set()).update(
-                str(n).strip() for n in (ch.get("characters") or []) if str(n).strip()
-            )
+            by_chapter.setdefault(no, set()).update(as_text_list(ch.get("characters")))
 
     latest = max(by_chapter, default=0)
     charted = sorted(by_chapter)
@@ -901,9 +917,10 @@ def consistency_report(work_dir: str | Path) -> list[str]:
     problems: list[str] = []
 
     def _check(names: Any, known: set[str], what: str, where: str) -> None:
-        for raw in names or []:
-            name = str(raw).strip()
-            if name and name not in known:
+        # as_text_list：卷表那一格是「用、分隔的字符串」，直接遍历会得到「李」「默」「、」——
+        # 一条不许出现的名字，会变成六个不存在的角色、六条红色阻断（实测 2026-09-30）。
+        for name in as_text_list(names):
+            if name not in known:
                 problems.append(f"{where}写着{what}「{name}」，但设定集里没有这个人/势力")
 
     volumes, _bv = load_all_volumes(wd / "70-volume")
@@ -1348,7 +1365,7 @@ def render_part_task(work_dir: str | Path, *, chapter_no: int = 0) -> str:
                      f"本章是其中第 {chapter_no - lo + 1} 章"]
             if part.get("gist"):
                 lines.append(f"这一段讲什么：{part['gist']}")
-            must = [str(x).strip() for x in (part.get("must_complete") or []) if str(x).strip()]
+            must = as_text_list(part.get("must_complete"))
             if must:
                 lines.append("这一段必须完成的功能：")
                 lines += [f"  {i}. {x}" for i, x in enumerate(must, 1)]

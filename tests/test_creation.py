@@ -254,7 +254,9 @@ def test_injection_block_never_truncates_silently() -> None:
     check("没有注入" in tiny, "并且点名了哪些小节没进去")
     check(tiny.index("【作品】") < tiny.index("⚠️"), "保住优先级最高的小节")
     check("人物" in tiny and "characters" not in tiny, "告警里报的是中文小节名，不是内部 key")
-    check("关山灯" in tiny and "活着回去" in tiny, "基本信息一定保住")
+    # 保住的只能是 basis 那三行：作品名、题材、篇幅。
+    # 「活着回去」这类动机写在人物小节里，预算不够时本来就该先丢（见下一行）。
+    check("关山灯" in tiny and "玄幻" in tiny, "基本信息（作品名与题材）一定保住")
     check("【人物】" not in tiny, "预算不够时先丢人物小节")
 
     markdown = render_setting_markdown(data)
@@ -510,8 +512,19 @@ def test_chain_report() -> None:
 
         report = chain_report(work_dir)
         check(not report["ok"], "空工作区链路不通")
-        check(any("设定集" in e for e in report["errors"]), "报出了设定集的问题")
+        # 新建原创的模板已经把作品名与题材填好了，设定集这一层没有阻断项，报的是**提醒**
+        # （术语表空着、没填章数）。提醒同样要带「设定集：」前缀露出来——
+        # 只报「有文件」正是这个体检当初要修的病。
+        check(any("设定集" in w for w in report["warnings"]), "报出了设定集的提醒")
         check(any("分卷目录" in e for e in report["errors"]), "报出了分卷目录的问题")
+        # 真出阻断项时也得进 errors：题材没填是阻断，不是提醒。
+        blank = _good_setting()
+        blank["genre"] = ""
+        _write_setting(work_dir, blank)
+        check(
+            any("设定集" in e for e in chain_report(work_dir)["errors"]),
+            "设定集的阻断项进了 errors",
+        )
 
         _write_setting(work_dir, _good_setting())
         vo.save_volume(vo.volume_path(work_dir / VOLUME_DIR, 1), _good_volume(1, 1, 12))
@@ -651,6 +664,22 @@ def test_cast_and_consistency() -> None:
                            {"name": "苏清月", "role": "重要配角", "motive": "守"}],
         }, allow_unicode=True), encoding="utf-8")
         check(not consistency_report(wd), "写成别名时不再误报")
+
+        # 卷表那一格在白名单里就是「用、分隔的字符串」，模型照办，落进 YAML 的是**标量**。
+        # 标量必须按顿号拆：直接遍历「李默、苏清月」会得到「李」「默」「、」……，
+        # 六条「设定集里没有这个人」的红色阻断，外加六个不存在的角色各报一行出场，
+        # 而这两样都会随「写前必读」进到发出去的提示词里（实测 2026-09-30）。
+        (wd / "70-volume" / "volume-001.yaml").write_text(yaml.safe_dump({
+            "schema_version": "volume-v1", "vol": {
+                "vol": 1, "title": "灯下黑", "start_chapter": 1, "end_chapter": 1,
+                "chapters": [{"chapter_no": 1, "title": "数值", "characters": "李默、苏清月"}],
+            },
+        }, allow_unicode=True), encoding="utf-8")
+        names2 = {r["name"] for r in character_presence(wd)["rows"]}
+        check("苏清月" in names2 and "李默" in names2, f"顿号串拆成了人名（{sorted(names2)}）")
+        check(not any(len(n) == 1 for n in names2),
+              f"没有把顿号串逐字拆成六个角色（{sorted(names2)}）")
+        check(not consistency_report(wd), "两个名字设定集里都有，不误报缺人")
 
 
 def test_write_brief_assembly() -> None:

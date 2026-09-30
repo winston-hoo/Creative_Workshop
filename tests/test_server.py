@@ -755,6 +755,31 @@ def test_creation_desk_endpoints() -> None:
     check(not work_dir.exists(), "自检工作区已移出书架")
 
 
+def test_section_prefix_falls_back_to_current_layer() -> None:
+    """模型把层名写错时，别跟着错——否则整批提案勾了也全被拒。
+
+    实测（2026-09-30）：在卷表层问「配齐章表」，模型提出 `brief:title` / `brief:era` /
+    `brief:core_conflict`。旧逻辑只认「head 是层名」，于是整批落到指令层去解析，
+    提案表显示「未知小节「era」」，作者勾完一条都进不去。
+    """
+    print("提案小节名 · 层前缀认不准时回落到当前层")
+
+    layer, section = services._split_section_pointer("volume", "brief:era")
+    check((layer, section) == ("volume", "era"), f"错前缀被忽略，落在当前层（{layer}:{section}）")
+
+    layer, section = services._split_section_pointer("volume", "brief:title")
+    check((layer, section) == ("volume", "title"), f"两层都有 title 时按当前层解（{layer}:{section}）")
+
+    layer, section = services._split_section_pointer("brief", "volume:chapters")
+    check((layer, section) == ("volume", "chapters"), "回填那种正确的前缀照样认")
+
+    layer, section = services._split_section_pointer("volume", "chapters")
+    check((layer, section) == ("volume", "chapters"), "没前缀的原样不动")
+
+    layer, section = services._split_section_pointer("volume", "乱写:chapters")
+    check((layer, section) == ("volume", "chapters"), "前缀不是层名时也当没写前缀")
+
+
 def main() -> int:
     print("=" * 58)
     print("工作台接口自检")
@@ -785,6 +810,7 @@ def main() -> int:
         test_annotate_status_before_run,
         test_report_without_annotations,
         test_creation_desk_endpoints,
+        test_section_prefix_falls_back_to_current_layer,
         test_chapter_detail_reads_text,
         test_chapter_raw_variant,
         test_chapter_unknown_id_404,

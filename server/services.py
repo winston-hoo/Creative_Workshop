@@ -3193,6 +3193,7 @@ def setting_assist_plan(
     bucket = price_bucket(provider)
     plan = build_assist_plan(
         work=name, setting=document, refs_block=block, refs=refs, level=level, layer=layer,
+        context_chars=len(_assist_context(paths, name, layer, key)),
         provider_id=provider.id, model_id=model,
         price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
         price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
@@ -3231,6 +3232,69 @@ def apply_setting_proposals(
 
     new_document, results = apply_proposals(document, proposals, accepted=accepted, layer=layer)
     return {"document": new_document, "results": results}
+
+
+def _assist_context(paths: Paths, name: str, layer: str, key: str = "") -> str:
+    """「问助手」这次要喂进去的上下文：写前必读（锚点/前情/角色动态…）+ **完整设定卡**。
+
+    设定卡（世界观硬规则、时代、地点、术语、禁忌、能力、主题）原来在卷表与逐章指令
+    这两层**根本不在提示词里**：那时只给「写前必读」，而它只抄了力量体系、势力、文风三行。
+    作者把设定写在世界观与术语表里，起草卷表时模型一个字都看不到，于是编出另一本书
+    （2026-09-30 实测：科幻设定 + 题材「科幻未来」，排出来的卷表是怪谈那一套（老井、夜谈），
+    出场人物一栏整排写着「主角」「同伴」——设定集里的名字一次都没用上）。
+
+    顺序与写正文那条路一致：锚点压在最前面，设定卡跟在后面。
+    """
+    from workshop.creation import load_work_setting, render_injection_block, render_write_brief
+
+    wd = _creation_work_dir(paths, name)
+    chapter_no = 0
+    if layer == "brief" and key:
+        chapter_no = int((creation_document(paths, name, "brief", key) or {}).get("chapter_no") or 0)
+
+    parts: list[str] = []
+    brief_block = render_write_brief(
+        wd, chapter_no=chapter_no, prev_chapter_no=max(0, chapter_no - 1)
+    )
+    if brief_block:
+        parts.append(brief_block)
+    # 设定集那一层不用再拼：它的「当前文档」本身就是这张卡，拼进去等于喂两遍。
+    if layer != "setting":
+        try:
+            card = render_injection_block(load_work_setting(wd))
+        except (OSError, ValueError):
+            card = ""
+        if card:
+            parts.append("【设定集：这是唯一真源，人物与世界观都按它来】\n" + card)
+    return "\n\n".join(parts)
+
+
+def _split_section_pointer(layer: str, section: str) -> tuple[str, str]:
+    """拆「层:小节」：**当前层认识这个小节，就按当前层解**；不认识才认前缀。
+
+    回填写回三层时，小节名本来就带层前缀（`setting:abilities` / `volume:chapters` /
+    `brief:foreshadow`），而这三个小节**都只存在于它自己那一层**，所以下面的顺序
+    对它们毫无影响——前缀照样认。
+
+    要治的是另一种：起草时模型也会自己加前缀，而且层名加错。实测（2026-09-30）
+    在卷表层问「配齐章表」，模型连着提出 `brief:title` / `brief:era` / `brief:core_conflict`。
+    旧逻辑只认「head 是不是层名」，于是整批按指令层去解析：提案表显示「未知小节「era」」，
+    作者勾完一条也进不去——白问一次、白花一次钱，还以为是软件坏了。
+
+    两层都有这个小节时（title、characters 这种重名），按当前层解。
+    取的是「可预期」：写错层最多落错一格，作者在提案表上一眼能看出来；
+    跟着模型乱写的前缀走，则是整批显示成未知小节，反倒看不出来。
+    """
+    from workshop.setting_assist import LAYER_SPECS
+
+    head, sep, tail = section.partition(":")
+    if not sep or not tail:
+        return layer, section
+    if tail in (LAYER_SPECS.get(layer) or {}):
+        return layer, tail
+    if head in LAYER_SPECS and tail in (LAYER_SPECS[head] or {}):
+        return head, tail
+    return layer, tail
 
 
 def run_setting_assist(
@@ -3291,14 +3355,9 @@ def run_setting_assist(
             layer = "brief"
             document = brief_doc
     cfg = load_config(paths.root / "providers.yaml")
-    # 写前必读：锚点 + 前情 + 角色动态 + 待回收伏笔 + 上一章末段。
+    # 写前必读 + 完整设定卡：锚点、前情、角色动态、待回收伏笔、上一章末段，以及整张设定集。
     # 起草卷表/指令时，模型原先只看得到那一层自己的文档——看不到设定集，也看不到前面各卷。
-    from workshop.creation import render_write_brief
-    _wd = _creation_work_dir(paths, name)
-    _cno = 0
-    if layer == "brief" and key:
-        _cno = int((creation_document(paths, name, "brief", key) or {}).get("chapter_no") or 0)
-    _ctx = render_write_brief(_wd, chapter_no=_cno, prev_chapter_no=max(0, _cno - 1))
+    _ctx = _assist_context(paths, name, layer, key)
     provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
     if provider.api_key_ref and not _read_api_key(cfg, provider):
         raise ValueError(_no_key_msg(provider))
@@ -3329,11 +3388,7 @@ def run_setting_assist(
         # 这样每一层往下走的还是同一个 apply_proposals（白名单、主键去重、逐条原因都一样）。
         # 前缀是必须的：title 在卷层和指令层都有、characters 在两层形状完全不同，裸名分不出。
         section = str(row.get("section") or "")
-        target_layer = layer
-        if ":" in section:
-            head, _, tail = section.partition(":")
-            if head in LAYER_SPECS and tail:
-                target_layer, section = head, tail
+        target_layer, section = _split_section_pointer(layer, section)
         # 模型有时给中文标签而不是键名（见 resolve_section）。这里就归一，
         # 否则提案表那一列会显示「未知小节「世界硬规则」」，而它其实是能认的。
         section = resolve_section(target_layer, section)

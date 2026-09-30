@@ -55,6 +55,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 from server import main as server_main  # noqa: E402
 from server import services  # noqa: E402
+from workshop.creation import create_original_work, load_work_setting  # noqa: E402
 from workshop.samples import build_synthetic_novel  # noqa: E402
 
 app = server_main.app
@@ -282,8 +283,14 @@ def test_ui() -> None:
         detail = page.inner_text("#view")
         check("逐字一致" in detail, "作品概览显示重建校验通过")
         check("章节列表" in detail, "概览含章节列表")
-        page.wait_for_selector(".table-wrap table", timeout=20000)
-        check("v001-c0001" in page.inner_text(".table-wrap"), "章节列表有数据")
+        # 作品页上不止一个 .table-wrap（上面那张「完整性核验」的问题表也是），
+        # 直接读第一个会读到那张表——「章节列表有数据」就是这么间歇性红的。
+        # 所以要等**带章节链接的那张**表，并且只读它。
+        chapter_table = page.locator(".table-wrap", has=page.locator('a[href*="/chapter/"]'))
+        chapter_table.wait_for(timeout=20000)
+        # 失败时把看到的原文带出来：只写「没数据」等于让人再去复现一次
+        rows = chapter_table.inner_text()
+        check("v001-c0001" in rows, f"章节列表有数据（实际 {rows[:60]!r}）")
 
         print("\n章节阅读")
         # 点章节标题进阅读页。这一步验证的是「列表和正文是通的」——
@@ -427,6 +434,72 @@ def test_ui() -> None:
         )
         check(page.input_value("#key-value-deepseek") == "", "输入框不回显已有密钥")
         page.click('[data-toggle-key="deepseek"]')
+
+        print("\n创作台 · 设定集表单的下拉")
+        # 创作台原来没有一个浏览器级的检查，于是「select 忘了写 options」这种错
+        # 一直没人拦：下拉点开是空的，而代码路径、接口、保存全都正常。
+        # 作者报的就是这个——设定集的「视角」下拉空白，选不出任何东西（2026-09-30）。
+        CREATION_WORK = "界面冒烟原创"
+        create_original_work(WS, CREATION_WORK, "科幻", protagonist="李默", core_motive="找出事故的真相")
+        page.goto(f"{base}/#/work/{CREATION_WORK}/creation/setting", wait_until="networkidle")
+        page.wait_for_selector('select[data-set="style.perspective"]', timeout=20000)
+        options = page.eval_on_selector_all(
+            'select[data-set="style.perspective"] option', "els => els.map((e) => e.textContent)"
+        )
+        check(options[1:] == ["第一人称", "第三限知", "第三全知"],
+              f"视角下拉有三个选项（实际 {options}）")
+        page.select_option('select[data-set="style.perspective"]', "第三限知")
+        page.click('button:has-text("保存设定集")')
+        # 选了能存下去：校验器只认这三个词，选项与它一旦不一致，保存就会被拦住
+        page.wait_for_timeout(1200)
+        check(
+            (load_work_setting(WS / CREATION_WORK) or {}).get("style", {}).get("perspective")
+            == "第三限知",
+            "选中的视角存进了 setting.yaml",
+        )
+
+        print("\n创作台 · 指令没落盘，写不成正文")
+        # 作者报「无法进行创作」（2026-09-30）：逐章指令的表单是满的——标题、一句话概要、
+        # 核心情节都在——因为那是后端拿卷表和设定集**拼**出来的骨架，磁盘上根本没有这个文件。
+        # 点「写这一章」被拦下，报「还没有 v001-c0001 的创作任务指令」。
+        # 两边都不算错，错的是没人把「这份还没落盘」说出来。
+        (WS / CREATION_WORK / "70-volume" / "volume-001.yaml").write_text(
+            "schema_version: volume-v1\n"
+            f"work: {CREATION_WORK}\n"
+            "vol:\n"
+            "  vol: 1\n"
+            "  title: 第一卷\n"
+            "  start_chapter: 1\n"
+            "  end_chapter: 2\n"
+            "  chapters:\n"
+            "    - chapter_no: 1\n"
+            "      title: 第一次上机\n"
+            "      gist: 李默第一次进试验舱做兼容性测试\n"
+            "      characters: [李默]\n"
+            "    - chapter_no: 2\n"
+            "      title: 隔着一层雾\n"
+            "      gist: 别人看得很清楚，他总觉得隔着一层雾\n"
+            "      characters: [李默]\n",
+            encoding="utf-8",
+        )
+        brief_file = WS / CREATION_WORK / "80-brief" / "v001-c0001.yaml"
+        check(not brief_file.exists(), "这一章本来没有指令文件")
+        page.goto(f"{base}/#/work/{CREATION_WORK}/creation/brief/v001-c0001",
+                  wait_until="networkidle")
+        page.wait_for_selector("#creation-draft-host", timeout=20000)
+        # 计划是异步取的，卡片先写「正在算计划…」。不等它落地就断言，读到的是上一次的状态。
+        _settled = ("() => !document.querySelector('#creation-draft-host')"
+                    ".innerText.includes('正在算计划')")
+        page.wait_for_function(_settled, timeout=20000)
+        check("还没建文件" in page.inner_text("#draft-flag"), "工具栏明说这份还没落盘")
+        check(page.is_disabled("#draft-go"), "没落盘时「写这一章」是灰的")
+        check(page.is_visible("#draft-save-brief"), "卡片里就地给了「保存本章指令」")
+        page.click("#draft-save-brief")
+        page.wait_for_selector("#draft-save-brief", state="detached", timeout=20000)
+        page.wait_for_function(_settled, timeout=20000)
+        check("还没有" not in page.inner_text("#creation-draft-host"), "存完不再报缺指令")
+        check(not page.is_disabled("#draft-go"), "存完「写这一章」能点了")
+        check(brief_file.exists(), "指令文件真的落了盘")
 
         print("\n移出书架（只许移测试作品自己）")
         page.click('a[href="#/shelf"]')

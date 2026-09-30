@@ -2341,6 +2341,11 @@ const creationState = {
   refsInitialized: false,   // 默认勾选只做一次，之后尊重作者的取消
 };
 
+/* 视角只有这三种，后端 validate_setting 也按这三个词卡（creation._PERSPECTIVES 是同一份）。
+   一个 select 的 options 忘了写，下拉就是**空的、点开什么都没有**——设定集和逐章指令
+   两处都有这个字段，所以列在这里只写一遍，不给它们各写一份再各自漏掉。 */
+const PERSPECTIVES = ['第一人称', '第三限知', '第三全知'];
+
 /* 设定集表单的字段表。加字段就加一行，渲染器不用动。
 
    ⚠️ 每个字段的 hint 必须回答「这是什么」，不是一句口号。
@@ -2363,7 +2368,7 @@ const SETTING_FORM = [
       hint: '写正文时会拿它提醒你这一章是不是太短' },
   ] },
   { title: '文风', fields: [
-    { k: 'style.perspective', label: '视角', type: 'select',
+    { k: 'style.perspective', label: '视角', type: 'select', options: PERSPECTIVES,
       hint: '谁的眼睛在看这个故事。中途改会让读者晕，定了就别换' },
     { k: 'style.tone', label: '基调', type: 'text', hint: '整本书读起来什么感觉',
       eg: '轻松搞笑、冷峻克制' },
@@ -2624,7 +2629,7 @@ const BRIEF_FORM = [
   ] },
   { title: '叙事', fields: [
     { k: 'narrative.perspective', label: '视角', type: 'select',
-      options: ['第一人称', '第三限知', '第三全知'] },
+      options: PERSPECTIVES },
     { k: 'narrative.tone', label: '本章基调', type: 'text', hint: '这一章和别章不一样的地方，没有就留空' },
     { k: 'narrative.focus', label: '叙事重点', type: 'strlist',
       hint: '这一章要花笔墨的地方，一条一句',
@@ -3016,6 +3021,7 @@ async function creationRefreshPanels() {
       `${base}/${creationState.kind}?key=${encodeURIComponent(creationState.key)}`);
     creationState.issues = {
       errors: read.errors || [], warnings: read.warnings || [], exists: !!read.exists,
+      seeded: !!read.seeded,
     };
     creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
   } catch { /* 同上 */ }
@@ -3057,6 +3063,19 @@ function creationBindGuide() {
 }
 
 
+/* 表单里显示的东西 ≠ 磁盘上有东西。
+
+   逐章指令可以整份从卷表和设定集**拼**出来：标题、一句话概要、核心情节都填好了，
+   看着就是一份写好的指令，可磁盘上根本没有这个文件。作者据此以为已经写好了，
+   点「写这一章」却被拦下，报「还没有 v001-c0001 的创作任务指令」
+   （实测 2026-09-30：作者回「无法进行创作」，而他眼前那张表是满的）。
+   后端把这件事单独标成 seeded，别再靠 exists 去猜。
+*/
+function creationNotSaved() {
+  return !!(creationState.issues && creationState.issues.seeded);
+}
+
+
 function creationRenderForm(draft) {
   const table = FORM_TABLES[creationState.kind] || SETTING_FORM;
   const sections = table.map((section, i) => {
@@ -3089,7 +3108,9 @@ function creationRenderForm(draft) {
       <button class="btn" id="tab-raw" ${creationState.mode === 'raw' ? 'disabled' : ''}>原文</button>
       <span class="muted" style="font-size:12px">${esc(creationEditorTitle())}</span>
       <span class="muted" style="font-size:12px" id="draft-flag">
-        ${creationState.dirty ? '有未保存的改动' : '没有未保存的改动'}</span>
+        ${creationNotSaved()
+          ? '有未保存的改动（这一份是从卷表和设定集预填的，还没建文件）'
+          : creationState.dirty ? '有未保存的改动' : '没有未保存的改动'}</span>
     </div>
     <div class="row">
       ${creationHasKb() ? `<button class="btn" data-tools-open="kb"
@@ -3677,7 +3698,7 @@ function creationRenderDraft() {
     : '';
   const blockers = (plan.blocker ? [plan.blocker] : []).concat(plan.warnings || []);
 
-  return `<div class="card" style="margin-top:12px">
+  return `<div class="card" id="creation-draft-host" style="margin-top:12px">
     <h3 style="margin:0 0 4px">写这一章</h3>
     <p class="muted" style="margin:0 0 10px;font-size:12px">
       按上面的指令 + 设定集 + 本卷目录写正文。<b>一次只出一章</b>，写完就停——
@@ -3691,6 +3712,12 @@ function creationRenderDraft() {
     ${blockers.length ? blockers.map((b, i) =>
       notice(plan.blocker && i === 0 ? 'bad' : 'warn', esc(b))).join('') : ''}
     ${existing}
+    ${creationNotSaved() ? `
+    <div class="row" style="justify-content:space-between;align-items:center;margin-top:8px">
+      <span class="muted" style="font-size:12px">
+        上面那份指令还只是骨架，磁盘上没有这个文件——保存之后才写得成。</span>
+      <button class="btn" id="draft-save-brief">保存本章指令</button>
+    </div>` : ''}
     <div class="row" style="justify-content:flex-end;margin-top:8px">
       <button class="btn" id="draft-review" ${plan.has_draft ? '' : 'disabled'}
         title="按技法审查维度审这一章，意见落成对本章指令的修正">技法审稿…</button>
@@ -3738,6 +3765,25 @@ function creationRenderDraftResult() {
   </div>`;
 }
 
+/* 保存指令之后必须重算这张卡。
+
+   计划是缓存的（creationBindDraft 只在 prosePlan 为空时去取），而保存表单那条路
+   只重画引导块、侧栏和校验清单——不碰这张卡。于是指令已经落盘，卡片还红着
+   「还没有…的创作任务指令」，按钮照样灰着：作者看到的是「保存了也写不了」。
+*/
+async function creationRefreshDraftCard() {
+  const host = document.getElementById('creation-draft-host');
+  if (!host) return;
+  creationState.prosePlan = null;
+  try {
+    creationState.prosePlan = await getJSON(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}/plan`);
+  } catch { return; }  // 取不到就维持原样，别把卡片打空
+  host.outerHTML = creationRenderDraft();
+  creationBindDraft();
+}
+
 function creationBindDraft() {
   if (creationState.kind !== 'brief' || !creationState.key) return;
   if (!creationState.prosePlan) {
@@ -3751,6 +3797,17 @@ function creationBindDraft() {
       + `${encodeURIComponent(creationState.key)}`)
       .then((d) => { creationState.prose = d; if (d.exists) creationLoad(); })
       .catch(() => {});
+  }
+  const saveBrief = document.getElementById('draft-save-brief');
+  if (saveBrief) {
+    saveBrief.onclick = async () => {
+      saveBrief.disabled = true;
+      saveBrief.textContent = '保存中…';
+      // 复用工具栏那个「保存本章指令」：校验、落盘、刷新面板都在那一条路上，
+      // 在这里另写一遍落盘逻辑，两边迟早会不一致。
+      await creationSaveForm();
+      await creationRefreshDraftCard();
+    };
   }
   const go = document.getElementById('draft-go');
   if (go) {
@@ -4202,6 +4259,7 @@ async function creationLoad() {
   // 而默认进的就是表单模式——作者只看到 ❌ 和「1 项阻断」，看不到是哪一项。
   creationState.issues = {
     errors: read.errors || [], warnings: read.warnings || [], exists: !!read.exists,
+    seeded: !!read.seeded,
   };
   view.innerHTML = `
     <p class="muted" style="margin-bottom:6px">
@@ -4251,12 +4309,9 @@ async function creationLoad() {
   creationPersist();
   // ⚠️ 这一份骨架是后端拿卷表和设定集**拼**出来的，磁盘上还没有这个文件。
   // 不标出来的话，作者看见一表单的字会以为已经存过了，改两笔就走——这章等于没建。
-  // 必须放在绑定之后：绑定和重画会把 #draft-flag 的文案重新写一遍。
-  if (read.seeded) {
-    creationState.dirty = true;
-    const flag = document.getElementById('draft-flag');
-    if (flag) flag.textContent = '有未保存的改动（这一份是从卷表和设定集预填的，还没建文件）';
-  }
+  // 文案由 creationRenderForm 里的 creationNotSaved() 出（重画也会照着出）；
+  // 这里只管把它算成「有未保存的改动」，关页面时才会拦一下。
+  if (read.seeded) creationState.dirty = true;
 }
 
 /* 草稿被别处换掉之后（应用提案、素材库导入），**必须把表单重画一遍**。
