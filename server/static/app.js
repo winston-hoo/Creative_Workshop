@@ -2336,6 +2336,9 @@ const creationState = {
   prose: null,         // 已写的正文（brief 层）；draft 是表单草稿，别混
   prosePlan: null,
   toolsOpen: false,    // 右侧工具抽屉（素材库 / 助手）开着没有
+  toolsPane: 'kb',     // 抽屉里当前在看哪个页签
+  rerenderForm: null,  // 草稿被别处换掉之后的整页重画（见 creationDraftChanged）
+  issues: null,        // 当前层的校验结果 {errors, warnings, exists, seeded}
   refs: [],
   refsLevel: 'k3',          // none / k3 / full —— 默认中间档
   refsInitialized: false,   // 默认勾选只做一次，之后尊重作者的取消
@@ -2354,8 +2357,9 @@ const PERSPECTIVES = ['第一人称', '第三限知', '第三全知'];
    （「世界硬规则」「弧光」「主题」干脆什么都没有），11px 灰字在表单里等于不存在。
    写 hint 的三条自查：说清它是什么 / 说清谁在读它（不填会怎样）/ 给一个真能用的例子。 */
 const SETTING_FORM = [
-  { title: '基本信息', fields: [
-    { k: 'work', label: '书名', type: 'text', hint: '随时能改，不用纠结' },
+  // grid 决定这一节的字段排几列；wide 的字段整行通栏（书名、字数区间这种）。
+  { title: '基本信息', grid: 'g3', fields: [
+    { k: 'work', label: '书名', type: 'text', wide: true, hint: '随时能改，不用纠结。' },
     { k: 'genre', label: '题材', type: 'text', hint: '一句话分类，主要给以后翻书架的你和一个大致定位',
       eg: '东方玄幻 / 都市异能 / 悬疑推理' },
     // 「一句话前提」「主角核心动机」「终极钩子」原来在这三行，2026-09-29 删掉。
@@ -2363,67 +2367,78 @@ const SETTING_FORM = [
     // 主角第一页是杂役是学生，不代表最后一页还是。动机本来就在人物行的 motive 上，
     // 两份写的是一件事。往哪儿去由人物的弧光说，世界是什么样由 world/power 说。
     { k: 'target.chapters', label: '目标章数', type: 'int',
-      hint: '大致规模，用来看进度，不是硬指标' },
-    { k: 'target.chars_per_chapter', label: '每章字数区间', type: 'range',
-      hint: '写正文时会拿它提醒你这一章是不是太短' },
+      hint: '大致规模，用来看进度，不是硬指标。' },
+    { k: 'target.chars_per_chapter', label: '每章字数区间', type: 'range', wide: true,
+      hint: '写正文时会拿它提醒你这一章是不是太短。' },
   ] },
   { title: '文风', fields: [
     { k: 'style.perspective', label: '视角', type: 'select', options: PERSPECTIVES,
-      hint: '谁的眼睛在看这个故事。中途改会让读者晕，定了就别换' },
-    { k: 'style.tone', label: '基调', type: 'text', hint: '整本书读起来什么感觉',
+      hint: '谁的眼睛在看这个故事。中途改会让读者晕，定了就别换。' },
+    { k: 'style.tone', label: '基调', type: 'text', hint: '整本书读起来什么感觉。',
       eg: '轻松搞笑、冷峻克制' },
-    { k: 'style.taboo', label: '禁忌', type: 'strlist',
-      hint: '绝对不写的东西，一条一句。写正文时会拿它挡一道',
+    { k: 'style.taboo', label: '禁忌', type: 'strlist', addText: '加一条禁忌',
+      hint: '绝对不写的东西，一条一句。写正文时会拿它挡一道。',
       eg: '不写主角失忆 / 不出现现代科技' },
   ] },
   { title: '世界观', fields: [
-    { k: 'world.era', label: '时代', type: 'text', hint: '故事发生在什么样的年月里',
+    { k: 'world.era', label: '时代', type: 'text', hint: '故事发生在什么样的年月里。',
       eg: '天元三百年，宗门割据' },
-    { k: 'world.rules', label: '世界硬规则', type: 'strlist',
+    { k: 'world.scope', label: '地理范围', type: 'text',
+      hint: '故事主要在哪一片地方发生。它决定场景调度能有多大余地。' },
+    { k: 'world.places', label: '地点', type: 'objlist', key: 'name',
+      hint: '故事里会反复出现的地方。说明只写跟剧情有关的那一点，不写风景。',
+      addText: '加一个地点',
+      fields: [['name', '名称'], ['note', '说明']] },
+    { k: 'world.rules', label: '世界硬规则', type: 'strlist', addText: '加一条规则',
       hint: '这个世界不能破的规矩，一条一句。它是世界观的地基——'
         + '以后每一章都会被拿去对照，破了就是吃设定。',
       eg: '一切施法消耗的是体温 / 知道一个存在完整的真名就能支配它' },
-    { k: 'world.places', label: '地点', type: 'objlist', key: 'name',
-      hint: '故事里会反复出现的地方。说明只写跟剧情有关的那一点，不写风景',
-      fields: [['name', '名称'], ['note', '说明']] },
   ] },
   { title: '力量体系', fields: [
-    { k: 'power.system', label: '体系名', type: 'text', hint: '这套力量叫什么',
-      eg: '横练' },
-    { k: 'power.tiers', label: '等级（由低到高）', type: 'strlist',
-      hint: '一条一级，从最低排到最高。主角在哪一级、要爬多久，靠它算',
-      eg: '凡人 → 皮肉 → 筋骨 → 内腑 → 换血' },
+    { k: 'power.system', label: '力量来源', type: 'text',
+      hint: '这股力量从哪儿来、叫什么。写正文时模型照它保持说法一致。',
+      eg: '横练 / 妮姬核心 · 与指挥官的同步率' },
+    { k: 'power.cost', label: '代价', type: 'text',
+      hint: '用一次要付什么。有代价的力量才紧张。' },
+    { k: 'power.tiers', label: '等级阶梯', type: 'tiers',
+      hint: '由低到高，一格一级。阶梯是给读者看的刻度，不用每级都写满。' },
+    { k: 'power.rules', label: '体系规则', type: 'strlist', addText: '加一条体系规则',
+      hint: '这套力量的硬边界：上限在哪、越界会怎样。一条一句。',
+      eg: '同步率上限 92%，突破即失控' },
   ] },
   { title: '能力体系', fields: [
+    { k: 'ability.category', label: '能力分类', type: 'text',
+      hint: '能力怎么分类，决定了打起来谁克谁。', eg: '射击型 / 支援型 / 特异型' },
+    { k: 'ability.acquire', label: '获取方式', type: 'strlist', addText: '加一种方式',
+      hint: '一个人怎么拿到能力。一条一种，写清代价和门槛。' },
     { k: 'abilities', label: '', type: 'objlist', key: 'name',
       hint: '一个人会的一手本事，一条一个。「等级」填它属于哪一级；'
-        + '「持有者」填谁会——留空就表示还没人用过',
+        + '「持有者」填谁会——留空就表示还没人用过。',
       fields: [['name', '名称'], ['tier', '等级'], ['holder', '持有者'], ['effect', '效果']] },
   ] },
   { title: '势力', fields: [
-    { k: 'factions', label: '', type: 'objlist', key: 'name',
-      hint: '互相较劲的几方。「立场」写它跟主角什么关系（庇护 / 利用 / 敌对），一句话就行',
+    { k: 'factions', label: '', type: 'objlist', key: 'name', addText: '加一个势力',
+      hint: '互相较劲的几方。「立场」写它跟主角什么关系（庇护 / 利用 / 敌对），一句话就行。',
       fields: [['name', '名称'], ['stance', '立场'], ['leader', '首领']] },
   ] },
   { title: '人物', fields: [
-    { k: 'characters', label: '', type: 'objlist', key: 'name',
-      hint: '「定位」＝他在故事里担什么角色（主角 / 导师 / 对手 / 损友）；'
-        + '「动机」＝他要什么；'
-        + '「弧光」＝他从开头到结尾变成什么样的人，起点和终点各写一半。',
-      fields: [['name', '名字'], ['role', '定位'], ['identity', '身份'],
-               ['personality', '性格'], ['motive', '动机'], ['arc', '弧光'],
-               ['faction', '所属势力']],
-      listFields: [['abilities', '能力']], withRelations: true },
+    { k: 'characters', label: '', type: 'cast', key: 'name',
+      hint: '「角色」标签点一下就切主角 / 配角；「一句话」写他图什么；'
+        + '下面那一行才是全文最值钱的几个格：身份、性格、弧光（他从开头到结尾变成什么样的人）。',
+      roleField: 'role' },
   ] },
   { title: '术语表', fields: [
-    { k: 'terms', label: '', type: 'objlist', key: 'term',
-      hint: '自造词的意思，比如「零层」「换血」。读者第一次撞见它能不能读懂，就靠这一行',
+    { k: 'terms', label: '', type: 'objlist', key: 'term', addText: '加一个术语',
+      hint: '自造词的意思，比如「零层」「换血」。读者第一次撞见它能不能读懂，就靠这一行。',
       fields: [['term', '术语'], ['meaning', '含义']] },
   ] },
   { title: '主题与象征', fields: [
-    { k: 'themes', label: '主题', type: 'strlist',
-      hint: '这本书在反复说什么，一条一句。抽象也可以——审稿时会拿它看这一章有没有离题',
-      eg: '规矩与人的代价 / 名字即身份' },
+    { k: 'themes', label: '主题', type: 'strlist', addText: '加一条主题',
+      hint: '这本书到底在说什么。一句话，抽象也可以——审稿时会拿它看这一章有没有离题。',
+      eg: '规矩与人的代价 / 被消耗的命运里人怎么保留自己' },
+    { k: 'motifs', label: '反复出现的意象', type: 'strlist', addText: '加一个意象',
+      hint: '会一遍遍回来的东西：一件物、一个动作、一句口头禅。读者记住的往往是这些。',
+      eg: '砂砾 / 补给配给券 / 被擦掉的编号' },
   ] },
 ];
 
@@ -2440,32 +2455,40 @@ function cSet(obj, path, value) {
   node[keys[keys.length - 1]] = value;
 }
 
+/* 一个字段 = 标签 + 控件 + 说明。说明是必写的：作者第一句问的永远是
+   「这是什么、为什么要写、怎么写」，写 hint 的三条自查就在这儿。 */
 function cField(spec, path, value) {
   const id = `f-${path}`;
-  const common = `id="${id}" data-set="${path}" style="width:100%"`;
+  const common = `id="${id}" data-set="${path}"`;
+  const req = spec.required ? '<span class="req" aria-hidden="true">*</span>' : '';
   let control = '';
   if (spec.type === 'int') {
     control = `<input type="number" ${common} value="${value ?? ''}">`;
   } else if (spec.type === 'select') {
     // 空选项是必须的：没有它，未填的 select 会默认选中第一项，
-    // 一保存就把「章末钩子类型」静默填成「突然揭示」——作者没选过，却有了值。
+    // 一保存就把「视角」静默填成「第一人称」——作者没选过，却有了值。
     control = `<select ${common}>${['', ...(spec.options || [])]
       .map((o) => `<option${o === value ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
   } else if (spec.type === 'range') {
     const lo = Array.isArray(value) ? (value[0] ?? '') : '';
     const hi = Array.isArray(value) ? (value[1] ?? '') : '';
-    control = `<span class="row"><input type="number" data-set="${path}.0" value="${lo}" style="width:80px">
-      <span class="muted">～</span>
-      <input type="number" data-set="${path}.1" value="${hi}" style="width:80px"></span>`;
+    control = `<span class="range" role="group" aria-labelledby="l-${path}">
+      <input type="number" data-set="${path}.0" value="${lo}" aria-label="下限">
+      <span class="dash" aria-hidden="true">~</span>
+      <input type="number" data-set="${path}.1" value="${hi}" aria-label="上限">
+      <span class="muted">字</span></span>`;
   } else {
-    control = `<input ${common} value="${esc(cellText(value))}">`;
+    control = `<input type="text" ${common} value="${esc(cellText(value))}">`;
   }
-  return `<label class="cfield" data-field="${esc(path)}"${spec.wide ? ' data-wide="1"' : ''}>
-    <span class="muted" style="font-size:12px">${esc(spec.label)}</span><br>
+  const label = spec.label
+    ? `<label class="f-label" for="${id}" id="l-${path}">${esc(spec.label)}${req}</label>`
+    : `<span class="f-label" id="l-${path}">${req}</span>`;
+  return `<div class="f${spec.wide ? ' span2' : ''}" data-field="${esc(path)}">
+    ${label}
     ${control}
-    ${spec.hint ? `<br><span class="chint">${esc(spec.hint)}</span>` : ''}
-    ${spec.eg ? `<br><span class="chint">例：${esc(spec.eg)}</span>` : ''}
-  </label>`;
+    ${spec.hint ? `<p class="f-hint">${esc(spec.hint)}</p>` : ''}
+    ${spec.eg ? `<p class="f-hint f-eg">${esc(spec.eg)}</p>` : ''}
+  </div>`;
 }
 
 /* 表单里的「列表」字段必须容忍脏数据。
@@ -2493,17 +2516,160 @@ function cellText(value) {
   return String(value);
 }
 
+/* 字符串列表（禁忌 / 硬规则 / 意象…）：一条一行，行尾一个删，底下虚线一个加。 */
 function cStrList(spec, path, list) {
-  const rows = asList(list).map((item, i) => `
-    <div class="row" style="margin-bottom:6px">
-      <input data-set="${path}.${i}" value="${esc(cellText(item))}" style="flex:1">
-      <button class="btn ghost" data-del-list="${path}.${i}">删</button>
+  const items = asList(list);
+  const rows = items.map((item, i) => `
+    <div class="li">
+      <input type="text" data-set="${path}.${i}" value="${esc(cellText(item))}"
+        aria-label="${esc(spec.label || '条目')}">
+      <button class="del" type="button" data-del-list="${path}.${i}" aria-label="删除这一条">✕</button>
     </div>`).join('');
-  return `<div class="cfield fspan" data-field="${esc(path)}" style="margin-bottom:10px">
-    ${spec.label ? `<span class="muted" style="font-size:12px">${esc(spec.label)}</span>` : ''}
-    ${spec.hint ? `<div class="chint">${esc(spec.hint)}</div>` : ''}
-    ${rows || '<div class="muted" style="font-size:12px">（空）</div>'}
-    <button class="btn ghost" data-add-list="${path}">+ 加一条</button>
+  return `<div class="f span2" data-field="${esc(path)}">
+    ${spec.label ? `<span class="f-label">${esc(spec.label)}</span>` : ''}
+    ${spec.hint ? `<p class="f-hint">${esc(spec.hint)}</p>` : ''}
+    <div class="list">${rows || '<p class="f-hint muted">（还没有条目）</p>'}</div>
+    <button class="add" type="button" data-add-list="${path}">
+      <span aria-hidden="true">+</span> ${esc(spec.addText || '加一条')}</button>
+  </div>`;
+}
+
+/* 等级阶梯。设计页里它是「只读骨架预览」——可这一排本来就是作者要填的东西
+   （power.tiers），画成只读等于把可编辑的字段变成装饰。所以留同样的形态与
+   衬线罗马数字，但每格是能改的输入框：一看就懂，也真的能用。
+
+   设计页里有一格是点亮的（.sk-i.on，表示「主角现在走到第几级」）。这一格**没有复刻**：
+   设定集这一层声明的是整本书的阶梯，它不记「现在在哪一级」——那个位置属于正文，
+   不在这里的字段里。曾经写过 `i === 0 && !items.length ? ' on' : ''`，可它在一个
+   非空数组的 .map() 里求值，条件恒为假、那个类从来没出现过（2026-10-01 清掉）。
+   与其随便点亮第一格假装有「当前位置」，不如不点亮。要恢复这个高亮，
+   先给阶梯加一个真正的当前级字段。 */
+const TIER_NUMERALS = ['Ⅰ', 'Ⅱ', 'Ⅲ', 'Ⅳ', 'Ⅴ', 'Ⅵ', 'Ⅶ', 'Ⅷ', 'Ⅸ', 'Ⅹ'];
+
+function cTiers(spec, path, list) {
+  const items = asList(list);
+  const cells = items.map((item, i) => `
+    <div class="sk-i">
+      <div class="n">${TIER_NUMERALS[i] || i + 1}
+        <button type="button" data-del-list="${path}.${i}" aria-label="删掉这一级">✕</button></div>
+      <input type="text" data-set="${path}.${i}" value="${esc(cellText(item))}"
+        aria-label="第 ${i + 1} 级">
+    </div>`).join('');
+  return `<div class="f span2" data-field="${esc(path)}">
+    ${spec.label ? `<span class="f-label">${esc(spec.label)}</span>` : ''}
+    ${spec.hint ? `<p class="f-hint">${esc(spec.hint)}</p>` : ''}
+    <div class="sk">${cells || '<div class="sk-i"><div class="n">—</div><div class="t muted">还没分级</div></div>'}</div>
+    <button class="add" type="button" data-add-list="${path}" style="margin-top:8px">
+      <span aria-hidden="true">+</span> 加一级</button>
+  </div>`;
+}
+
+/* 人物卡。第一行是设计页那一行（角色标签 / 名字 / 一句话 / 删），
+   角色标签点一下就在主角 / 配角之间切——校验器要求「主角恰好一个」，
+   所以这个标签不是装饰，它是改 role 的地方。
+   下面那行放校验器真正要的另外几个格（身份 / 性格 / 弧光 / 所属 / 能力）：
+   一行放不下，但也不能收进「更多」里——弧光是最该被看见的一格。 */
+function cCast(spec, path, list) {
+  const items = asList(list);
+  const rows = items.map((entry, i) => {
+    const isRow = entry != null && typeof entry === 'object' && !Array.isArray(entry);
+    const row = isRow ? entry : {};
+    const role = String(row.role || '配角').trim() || '配角';
+    const lead = role === '主角';
+    const rels = asList(row.relations);
+    const relRows = rels.map((r, j) => {
+      const rel = r != null && typeof r === 'object' && !Array.isArray(r) ? r : {};
+      return `<div class="li">
+        <span class="li-k">关系</span>
+        <input type="text" data-set="${path}.${i}.relations.${j}.to" value="${esc(cellText(rel.to))}"
+          placeholder="对谁" aria-label="关系对象">
+        <input type="text" data-set="${path}.${i}.relations.${j}.type" value="${esc(cellText(rel.type))}"
+          placeholder="什么关系（师徒 / 敌对 / 上下级）" aria-label="关系类型">
+        <button class="del" type="button" data-del-rel="${path}.${i}.relations.${j}"
+          aria-label="删掉这条关系">✕</button>
+      </div>`;
+    }).join('');
+    return `<div class="cast-item" data-field="${esc(path)}.${i}">
+      <div class="cast-row">
+        <button class="role${lead ? ' lead' : ''}" type="button"
+          data-role="${path}.${i}" title="点一下切主角 / 配角">${esc(role)}</button>
+        <input type="text" data-set="${path}.${i}.${esc(spec.key)}"
+          value="${esc(isRow || entry == null ? cellText(row[spec.key]) : String(entry))}"
+          placeholder="名字" aria-label="名字">
+        <input type="text" data-set="${path}.${i}.motive" value="${esc(cellText(row.motive))}"
+          placeholder="一句话：他要什么" aria-label="动机">
+        <button class="del" type="button" data-del-obj="${path}.${i}" aria-label="删掉这个人物">✕</button>
+      </div>
+      <div class="cast-more">
+        <div class="grid g3">
+          <div class="f"><span class="sub-label">身份</span>
+            <input type="text" data-set="${path}.${i}.identity" value="${esc(cellText(row.identity))}"></div>
+          <div class="f"><span class="sub-label">性格</span>
+            <input type="text" data-set="${path}.${i}.personality" value="${esc(cellText(row.personality))}"></div>
+          <div class="f"><span class="sub-label">所属势力</span>
+            <input type="text" data-set="${path}.${i}.faction" value="${esc(cellText(row.faction))}"></div>
+          <div class="f span2" style="grid-column:span 2"><span class="sub-label">弧光（从什么样变成什么样）</span>
+            <input type="text" data-set="${path}.${i}.arc" value="${esc(cellText(row.arc))}"></div>
+          <div class="f"><span class="sub-label">能力（、分隔）</span>
+            <input type="text" data-set="${path}.${i}.abilities.joined"
+              value="${esc(listText(row.abilities))}"></div>
+        </div>
+        <div class="list" style="margin-top:8px">${relRows}</div>
+        <button class="add" type="button" data-add-rel="${path}.${i}.relations" style="margin-top:8px">
+          <span aria-hidden="true">+</span> 加一条关系</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  // 空表不是「一片空白」，是「下一步该干什么」。第一张卡默认就立成主角：
+  // 空表时作者要的九成是主角，少点一次是一次。
+  const blank = `<div class="blank">
+      <div class="t">还没有人物</div>
+      <p class="muted" style="margin:0 0 10px">至少先立一个主角。名字可以先空着，气质有了就行。</p>
+      <button class="btn sm" type="button" data-add-lead="${path}">
+        <span aria-hidden="true">+</span> 添加第一个人物</button>
+    </div>`;
+
+  return `<div class="f span2" data-field="${esc(path)}">
+    ${spec.hint ? `<p class="f-hint">${esc(spec.hint)}</p>` : ''}
+    <div class="cast">${rows || blank}</div>
+    ${rows ? `<button class="add" type="button" data-add-obj="${path}"
+      data-key="${esc(spec.key)}" data-add-role="配角" style="margin-top:10px">
+      <span aria-hidden="true">+</span> 加一个人物</button>` : ''}
+    ${creationState.kind === 'setting' && KB_FIELD_PATHS.includes(path)
+      ? `<button class="add" type="button" data-tools-open="kb" style="margin:10px 0 0 8px"
+        title="从已入库作品的实体卡片里勾，直接填进这一节（不调模型、不花钱）">从素材库取人物卡</button>` : ''}
+  </div>`;
+}
+
+/* 单行条目（地点 / 势力 / 术语）：一行一条，字段横排，行尾删。
+   设计页里这几节就是这种「名称 —— 说明」的行；这里只是把说明也做成能改的格子，
+   省得作者为了改一个字先进详情再退出来。 */
+function cObjRows(spec, path, list) {
+  const items = asList(list);
+  const cols = (spec.fields || []).length + 1;
+  const rows = items.map((entry, i) => {
+    const isRow = entry != null && typeof entry === 'object' && !Array.isArray(entry);
+    const row = isRow ? entry : {};
+    const cells = (spec.fields || []).map(([k, label]) => `
+      <input type="text" data-set="${path}.${i}.${k}"
+        value="${esc(!isRow && k === spec.key ? String(entry ?? '') : cellText(row[k]))}"
+        placeholder="${esc(label)}" aria-label="${esc(label)}">`).join('');
+    return `<div class="erow${(spec.fields || []).length > 2 ? ' wide' : ''}">
+      ${cells}
+      <button class="del" type="button" data-del-obj="${path}.${i}" aria-label="删掉这一条">✕</button>
+    </div>`;
+  }).join('');
+  return `<div class="f span2" data-field="${esc(path)}">
+    ${spec.hint ? `<p class="f-hint">${esc(spec.hint)}</p>` : ''}
+    <div class="entry">${rows || '<p class="f-hint muted">（还没有条目）</p>'}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+      <button class="add" type="button" data-add-obj="${path}" data-key="${esc(spec.key)}">
+        <span aria-hidden="true">+</span> ${esc(spec.addText || '加一条')}</button>
+      ${creationState.kind === 'setting' && KB_FIELD_PATHS.includes(path)
+        ? `<button class="add" type="button" data-tools-open="kb"
+        title="从已入库作品的实体卡片里勾，直接填进这一节（不调模型、不花钱）">从素材库导入</button>` : ''}
+    </div>
   </div>`;
 }
 
@@ -2528,50 +2694,54 @@ function cObjList(spec, path, list) {
       const isInt = intFields.includes(k);
       const shown = !isRow && k === spec.key ? scalarText : cellText(row[k]);
       return `
-      <label style="display:block;flex:1;min-width:120px">
-        <span class="muted" style="font-size:11px">${esc(label)}</span>
+      <div class="f">
+        <span class="sub-label">${esc(label)}</span>
         <input ${isInt ? 'type="number" data-int="1"' : ''} data-set="${path}.${i}.${k}"
-               value="${esc(shown)}" style="width:100%">
-      </label>`;
+               value="${esc(shown)}" aria-label="${esc(label)}">
+      </div>`;
     }).join('');
     const lists = (spec.listFields || []).map(([k, label]) => `
-      <label style="display:block;flex:1;min-width:140px">
-        <span class="muted" style="font-size:11px">${esc(label)}（、分隔）</span>
-        <input data-set="${path}.${i}.${k}.joined"
-               value="${esc(listText(row[k]))}" style="width:100%">
-      </label>`).join('');
+      <div class="f">
+        <span class="sub-label">${esc(label)}（、分隔）</span>
+        <input data-set="${path}.${i}.${k}.joined" value="${esc(listText(row[k]))}"
+          aria-label="${esc(label)}">
+      </div>`).join('');
     // 关系原来是一个 `对象|关系` 的文本框：得记住分隔符，而且看不见到底有几条。
-    // 改成网格：一行一条，对象和关系各一个框，能加能删。
+    // 改成一行一条，对象和关系各一个框，能加能删。
     const rels = spec.withRelations ? `
-      <div style="flex-basis:100%;margin-top:6px">
-        <span class="muted" style="font-size:11px">关系</span>
+      <div style="margin-top:8px">
+        <span class="sub-label">关系</span>
         ${asList(row.relations).map((r, j) => {
           const rel = r != null && typeof r === 'object' && !Array.isArray(r) ? r : {};
           return `
-          <div class="row" style="margin:4px 0;gap:6px">
+          <div class="li" style="margin:4px 0">
             <input data-set="${path}.${i}.relations.${j}.to" value="${esc(cellText(rel.to))}"
-              placeholder="对谁" style="flex:1">
+              placeholder="对谁" aria-label="关系对象">
             <input data-set="${path}.${i}.relations.${j}.type" value="${esc(cellText(rel.type))}"
-              placeholder="什么关系（师徒 / 敌对 / 上下级）" style="flex:1">
-            <button class="btn ghost" data-del-rel="${path}.${i}.relations.${j}">删</button>
+              placeholder="什么关系（师徒 / 敌对 / 上下级）" aria-label="关系类型">
+            <button class="del" type="button" data-del-rel="${path}.${i}.relations.${j}"
+              aria-label="删掉这条关系">✕</button>
           </div>`;
         }).join('')}
-        <button class="btn ghost" data-add-rel="${path}.${i}.relations">+ 加一条关系</button>
+        <button class="add" type="button" data-add-rel="${path}.${i}.relations">
+          <span aria-hidden="true">+</span> 加一条关系</button>
       </div>` : '';
-    return `<div style="border:1px solid var(--border);border-radius:10px;padding:10px;margin-bottom:10px">
-      <div class="row wrap" style="gap:10px">${inputs}${lists}${rels}</div>
-      <div class="row" style="justify-content:flex-end;margin-top:6px">
-        <button class="btn ghost" data-del-obj="${path}.${i}">删掉这一条</button>
+    return `<div class="ecard" data-field="${esc(path)}.${i}">
+      <div class="grid g3">${inputs}${lists}</div>
+      ${rels}
+      <div class="ecard-foot">
+        <button class="btn ghost sm" type="button" data-del-obj="${path}.${i}">删掉这一条</button>
       </div>
     </div>`;
   }).join('');
-  return `<div class="cfield fspan" data-field="${esc(path)}" style="margin-bottom:12px">
-    ${spec.hint ? `<div class="chint" style="margin-bottom:6px">${esc(spec.hint)}</div>` : ''}
-    ${rows || '<div class="muted" style="font-size:12px">（还没有条目）</div>'}
-    <div class="row">
-      <button class="btn ghost" data-add-obj="${path}" data-key="${esc(spec.key)}">+ 加一条</button>
+  return `<div class="f span2" data-field="${esc(path)}">
+    ${spec.hint ? `<p class="f-hint">${esc(spec.hint)}</p>` : ''}
+    <div style="margin-bottom:10px">${rows || '<p class="f-hint muted">（还没有条目）</p>'}</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start">
+      <button class="add" type="button" data-add-obj="${path}" data-key="${esc(spec.key)}">
+        <span aria-hidden="true">+</span> ${esc(spec.addText || '加一条')}</button>
       ${creationState.kind === 'setting' && KB_FIELD_PATHS.includes(path)
-        ? `<button class="btn ghost" data-tools-open="kb"
+        ? `<button class="add" type="button" data-tools-open="kb"
         title="从已入库作品的实体卡片里勾，直接填进这一节（不调模型、不花钱）">从素材库导入</button>` : ''}
     </div>
   </div>`;
@@ -2786,8 +2956,11 @@ function creationNextStep(d) {
   };
 }
 
-/* 三层各自的状态。卡片本身可点——它们以前是死的，只能看。 */
-function creationLayerCards() {
+/* 创作流水线：进度总览 + 层级切换**合成一条**。
+   原界面把「下一步卡 + 三张层级卡 + 全书概览」三块并排摆着，三处讲的是同一件事
+   （三层进度），读者要读三遍。这里合并成一条可点的流水线：站点本身是按钮，
+   点它就切层；圆点承担状态色，右边那格给一句人话（几处待修 / 已列几章）。 */
+function creationStations() {
   const d = creationState.data || {};
   const st = d.setting || {};
   const counts = d.counts || {};
@@ -2799,46 +2972,44 @@ function creationLayerCards() {
   const chapterErrors = (d.chapters || []).filter((c) => (c.errors || 0) > 0).length;
   const badVol = vols.find((v) => (v.errors || 0) > 0) || vols[0] || {};
   const firstChapter = ((d.chapters || [])[0] || {}).chapter_id || '';
-
-  const card = (no, name, meta, stateLabel, stateCls, kind, key, current, go) => `
-    <a href="#" class="lcard" data-goto-kind="${kind}" data-goto-key="${esc(key)}"
-       ${current ? 'data-current="1"' : ''}>
-      <div class="lcard-head"><b>${no} ${esc(name)}</b>
-        <span class="chip ${stateCls}">${esc(stateLabel)}</span></div>
-      <div class="lcard-meta muted">${meta}</div>
-      <div class="lcard-go">${current ? '正在编辑' : esc(go || '进去 →')}</div>
-    </a>`;
-
-  const settingMeta = st.exists
-    ? `${st.characters || 0} 个人物 · ${(st.warnings || []).length} 条提示`
-    : '还没有 setting.yaml';
-  const volMeta = vols.length
-    ? `${vols.length} 卷 · 已列 ${chapters} 章`
-    : '还没有分卷文件';
-  // ③ 层是一章一份文件，没有章就没有可打开的地址。
-  // 空章号发给后端只会换回一句「章节 id 不合约定（应为 v001-c0001）：''」——
-  // 所以这一格在没列章之前指向卷表，而不是拼一个非法链接出来。
+  // ③ 层是一章一份文件，没有章就没有可打开的地址。空章号发给后端只会换回
+  // 「章节 id 不合约定（应为 v001-c0001）：''」——所以没列章之前这一站点指向卷表。
   const briefReady = !!chapters;
 
-  return `<div class="layer-grid">
-    ${card('①', '设定集', settingMeta,
-      !st.exists ? '还没写' : settingErrors ? `${settingErrors} 项待修` : '已就绪',
-      !st.exists ? '' : settingErrors ? 'bad' : 'ok',
+  const mk = (n, name, state, meta, metaCls, kind, key, active) => `
+    <button class="station" type="button" data-goto-kind="${esc(kind)}"
+      data-goto-key="${esc(key)}" data-state="${state}"
+      ${active ? 'aria-current="true"' : 'aria-current="false"'}>
+      <span class="st-dot num" aria-hidden="true">${n}</span>
+      <span class="st-name">${esc(name)}</span>
+      <span class="st-meta ${metaCls} num">${esc(meta)}</span>
+    </button>`;
+
+  const s1state = !st.exists ? 'todo' : settingErrors ? 'blocked' : 'done';
+  const s1meta = !st.exists ? '还没写' : settingErrors ? `${settingErrors} 处待修` : '已就绪';
+  const s2state = !vols.length ? 'todo' : volErrors ? 'blocked' : 'done';
+  const s2meta = !vols.length ? '还没建卷'
+    : volErrors ? `${volErrors} 处待修` : `${vols.length} 卷 · 已列 ${chapters} 章`;
+  const s3state = !briefReady ? 'todo'
+    : (briefs < chapters || chapterErrors) ? 'blocked' : 'done';
+  const s3meta = !briefReady ? '等卷表列章'
+    : briefs < chapters ? `${chapters - briefs} 章待填`
+    : chapterErrors ? `${chapterErrors} 章待修` : `${briefs} / ${chapters} 章已填`;
+
+  const done1 = s1state === 'done';
+  const done2 = done1 && s2state === 'done';
+
+  return `<nav class="pipe" aria-label="创作流水线">
+    ${mk(1, '设定集', s1state, s1meta, settingErrors ? 'bad' : (st.exists ? 'ok' : ''),
       'setting', '', creationState.kind === 'setting')}
-    ${card('②', '分卷目录', volMeta,
-      !vols.length ? '还没写' : volErrors ? `${volErrors} 项待修` : '已就绪',
-      !vols.length ? '' : volErrors ? 'bad' : 'ok',
+    <span class="link${done1 ? ' done' : ''}" aria-hidden="true"></span>
+    ${mk(2, '分卷目录', s2state, s2meta, volErrors ? 'bad' : (vols.length ? 'ok' : ''),
       'volume', String(badVol.vol ?? 1), creationState.kind === 'volume')}
-    ${card('③', '逐章创作指令', `${briefs} / ${chapters} 章已填`,
-      !briefReady ? '等卷表先列章'
-        : briefs < chapters ? `${chapters - briefs} 章待填`
-        : chapterErrors ? `${chapterErrors} 章待修` : '已就绪',
-      !briefReady ? '' : (briefs < chapters || chapterErrors) ? 'warn' : 'ok',
-      briefReady ? 'brief' : 'volume',
-      briefReady ? firstChapter : String(badVol.vol ?? 1),
-      creationState.kind === 'brief',
-      briefReady ? '进去 →' : '先去卷里列章 →')}
-  </div>`;
+    <span class="link${done2 ? ' done' : ''}" aria-hidden="true"></span>
+    ${mk(3, '逐章创作指令', s3state, s3meta, (briefReady && briefs >= chapters && !chapterErrors)
+      ? 'ok' : (briefReady ? 'warn' : ''), briefReady ? 'brief' : 'volume',
+      briefReady ? firstChapter : String(badVol.vol ?? 1), creationState.kind === 'brief')}
+  </nav>`;
 }
 
 /* 作者正站在某一层上编辑时，全局的「下一步」可能指向别的层（比如他正在填第 1 卷，
@@ -2855,11 +3026,11 @@ function creationCurrentLayerNote() {
   const parts = [];
   if (errors.length) parts.push(`<b>${errors.length} 项阻断</b>`);
   if (warnings.length) parts.push(`${warnings.length} 条提示`);
-  return `<div class="cnext-layer">
-    <span class="muted">这一层（${esc(creationEditorTitle())}）还有 ${parts.join('、')}</span>
-    ${firstFix ? `<button class="btn ghost" data-fix-field="${esc(firstFix)}">去修第一项</button>` : ''}
-    <button class="btn ghost" data-scroll-issues="1">看完整清单</button>
-  </div>`;
+  return `<p class="muted" style="margin:10px 0 0">
+    这一层（${esc(creationEditorTitle())}）还有 ${parts.join('、')}。
+    ${firstFix ? `<button class="btn ghost sm" data-fix-field="${esc(firstFix)}"
+      style="margin-left:6px">去修第一项</button>` : ''}
+  </p>`;
 }
 
 /* ③ 层的桥：卷表列了章、但指令还没建起来。
@@ -2871,9 +3042,10 @@ function creationSeedHint() {
   const counts = (creationState.data || {}).counts || {};
   const missing = Math.max(0, (counts.chapters || 0) - (counts.briefs || 0));
   if (!missing) return '';
-  return `<button class="btn ghost" data-seed-briefs="1">按卷表播种 ${missing} 章指令（不花钱）</button>`;
+  return `<button class="btn" data-seed-briefs="1">按卷表播种 ${missing} 章指令（不花钱）</button>`;
 }
 
+/* 下一步：整页只有这一个主行动。三层是一条链，任何时刻只有一件事该做。 */
 function creationRenderGuide() {
   const step = creationNextStep(creationState.data || {});
   const primary = step.action === 'seed-briefs'
@@ -2881,23 +3053,57 @@ function creationRenderGuide() {
     : `<button class="btn primary" data-goto-kind="${esc(step.kind)}"
          data-goto-key="${esc(step.key)}">${esc(step.label)}</button>`;
   const seedHint = step.action === 'seed-briefs' ? '' : creationSeedHint();
-  return `<div id="creation-guide">
-    <div class="card cnext">
-      <div class="row" style="justify-content:space-between;align-items:baseline">
-        <span class="cnext-tag">下一步</span>
-        <span class="muted" style="font-size:12px">① 设定集 → ② 分卷目录 → ③ 逐章创作指令</span>
-      </div>
-      <div class="cnext-title">${esc(step.title)}</div>
-      <div class="muted cnext-why">${esc(step.why)}</div>
-      <div class="row wrap" style="margin-top:12px">${primary}${seedHint}</div>
+  return `<section class="next" id="creation-guide" aria-labelledby="next-title">
+    <div class="next-body">
+      <span class="next-tag">下一步</span>
+      <h2 id="next-title">${esc(step.title)}</h2>
+      <p>${esc(step.why)}</p>
       ${creationCurrentLayerNote()}
     </div>
-    ${creationLayerCards()}
+    <div class="next-act">${primary}${seedHint}</div>
+  </section>`;
+}
+
+/* 每条校验信息落在哪个分区。就地贴上去，作者不用跑到页面顶部去对照
+   「第 3 条阻断说的是哪个字段」。认不出字段的（少数跨节的、卷层的章号断档）
+   归到 other，在汇总条里点名，不假装它属于某一节。
+
+   ⚠️ 卷号是 1-based 的下标，示例卷名在「卷头」那一节的 fields 里。 */
+function creationIssuesBySection(kind) {
+  const buckets = { bySection: {}, other: { errors: [], warnings: [] } };
+  const { errors = [], warnings = [] } = creationState.issues || {};
+  const add = (msg, level) => {
+    const hit = creationLocateField(kind, msg);
+    if (!hit) { buckets.other[level].push(msg); return; }
+    const key = String(hit.sectionIndex);
+    const b = (buckets.bySection[key] = buckets.bySection[key]
+      || { errors: [], warnings: [] });
+    b[level].push({ msg, field: hit.spec.k });
+  };
+  errors.forEach((m) => add(m, 'errors'));
+  warnings.forEach((m) => add(m, 'warnings'));
+  return buckets;
+}
+
+/* 就地阻断块（设计页里那一块贴在人物分区里的红条）。
+   「去修」按钮由 creationBindIssues 统一挂 onclick。 */
+function creationLocalBlock(msg, level, field) {
+  const fix = field
+    ? `<button class="btn sm${level === 'errors' ? ' primary' : ''}" data-fix-field="${esc(field)}">
+        去修这一项</button>`
+    : '';
+  return `<div class="local ${level === 'errors' ? 'bad' : 'warn'}">
+    <span class="ic" aria-hidden="true">${level === 'errors' ? '✕' : '!'}</span>
+    <div class="grow">
+      <b>${esc(msg)}</b>
+      ${fix ? `<div class="fix">${fix}</div>` : ''}
+    </div>
   </div>`;
 }
 
-/* 校验结果。表单模式下以前**完全看不到**——只有切到「原文」才显示，
-   而默认就是表单模式。于是作者只看到 ❌ 和「1 项阻断」，不知道是哪一项。 */
+/* 校验汇总。表单模式下以前**完全看不到**校验结果——只有切到「原文」才显示，
+   而默认就是表单模式。于是作者只看到 ❌ 和「1 项阻断」，不知道是哪一项。
+   现在：细节就地贴在各自的分区里，这里只报总数，不重复念一遍。 */
 function creationRenderIssues() {
   const kind = creationState.kind;
   const { errors = [], warnings = [], exists = true } = creationState.issues || {};
@@ -2905,32 +3111,40 @@ function creationRenderIssues() {
   // 「没有阻断项」——而作者看到的是一张空表单，很容易以为「这一章已经没问题了」。
   // 说清楚：文件还没建，填完保存才会建出来。
   if (!exists) {
-    return `<div id="creation-issues" style="margin-bottom:12px">
-      ${notice('info', `这一份还没有文件——下面填完点「${
-        esc(SAVE_LABELS[kind] || '保存')}」，就会按这份内容建出来。`)}</div>`;
+    return `<div class="summary" id="creation-issues">
+      <span class="lbl">这一份</span>
+      <span class="pill info">还没有文件</span>
+      <span class="grow"></span>
+      <span class="muted">下面填完点「${esc(SAVE_LABELS[kind] || '保存')}」，它就会按这份内容建出来</span>
+    </div>`;
   }
   if (!errors.length && !warnings.length) {
-    return `<div id="creation-issues" style="margin-bottom:12px">
-      ${notice('ok', '这一份没有阻断项，也没有要提醒的地方。')}</div>`;
+    return `<div class="summary" id="creation-issues">
+      <span class="lbl">这一份</span>
+      <span class="pill ok">没有阻断项</span>
+      <span class="grow"></span>
+      <span class="muted">也没有要提醒的地方</span>
+    </div>`;
   }
-  const li = (msg, cls) => {
-    const hit = creationLocateField(kind, msg);
-    const fix = hit
-      ? `<button class="btn ghost" style="font-size:11px;padding:1px 8px;margin-left:6px"
-           data-fix-field="${esc(hit.spec.k)}">去修</button>`
-      : '';
-    return `<li style="margin:3px 0">${esc(msg)}${fix}</li>`;
-  };
-  const block = (title, list, cls, open) => (list.length
-    ? `<details class="issues ${cls}" ${open ? 'open' : ''}>
-         <summary>${title}</summary>
-         <ul style="margin:6px 0 0 18px">${list.slice(0, 30).map(li).join('')}</ul>
-         ${list.length > 30 ? `<p class="muted" style="margin:6px 0 0">还有 ${list.length - 30} 条，切「原文」看全部。</p>` : ''}
-       </details>`
-    : '');
-  return `<div id="creation-issues" style="margin-bottom:12px">
-    ${block(`阻断 ${errors.length} 项 — 不改就开不了工`, errors, 'bad', true)}
-    ${block(`提示 ${warnings.length} 项 — 不改也能往下走`, warnings, 'warn', false)}
+  const by = creationIssuesBySection(kind);
+  const otherTotal = by.other.errors.length + by.other.warnings.length;
+  const other = otherTotal
+    ? `<details class="muted" style="flex-basis:100%">
+        <summary>有 ${otherTotal} 条没法归到某个字段（${by.other.errors.length
+          ? `阻断 ${by.other.errors.length}` : ''}${by.other.errors.length && by.other.warnings.length ? '、' : ''}${
+          by.other.warnings.length ? `提示 ${by.other.warnings.length}` : ''}）</summary>
+        <ul style="margin:6px 0 0 18px">${by.other.errors.concat(by.other.warnings)
+          .slice(0, 20).map((m) => `<li>${esc(m)}</li>`).join('')}</ul>
+      </details>`
+    : '';
+  return `<div class="summary" id="creation-issues">
+    <span class="lbl">这一份</span>
+    ${errors.length ? `<span class="pill bad num">阻断 ${errors.length}</span>` : ''}
+    ${warnings.length ? `<span class="pill warn num">提示 ${warnings.length}</span>` : ''}
+    <span class="grow"></span>
+    <span class="muted">${errors.length
+      ? '阻断项已经贴在各自的分区里，改完自动消失' : '这些只是提醒，不挡着你往下走'}</span>
+    ${other}
   </div>`;
 }
 
@@ -3000,17 +3214,12 @@ async function creationSeedBriefs(vol) {
   }
   creationState.data = await getJSON(
     `/api/works/${encodeURIComponent(creationState.name)}/creation`);
-  const side = document.querySelector('[data-sidebar]');
-  if (side) side.outerHTML = creationRenderSidebar();
-  const guide = document.getElementById('creation-guide');
-  if (guide) {
-    guide.outerHTML = creationRenderGuide();
-    creationBindGuide();
-  }
+  creationRepaint();
 }
 
-/* 保存之后只重画「状态」那几块，不重画表单：刚点完保存就把表单整个重建，
-   光标和滚动位置全丢，作者会以为界面抽了一下。 */
+/* 保存之后重画一次：校验结果变了没有、哪条阻断消掉了，是作者最该看到的反馈。
+   ⚠️ 重画会重建表单，光标和滚动位置会丢——所以保存走这里，
+   而打字、加删字段走 creationRepaint（只读内存，不重新读盘）。 */
 async function creationRefreshPanels() {
   const base = `/api/works/${encodeURIComponent(creationState.name)}/creation`;
   try {
@@ -3024,17 +3233,18 @@ async function creationRefreshPanels() {
       seeded: !!read.seeded,
     };
     creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
+    creationState.read = read;
   } catch { /* 同上 */ }
-  const guide = document.getElementById('creation-guide');
-  if (guide) {
-    guide.outerHTML = creationRenderGuide();
-    creationBindGuide();
+  // ⚠️ 逐章指令这一层：刚存完，那份计划（能不能写、缺什么、多少钱）就已经失效了。
+  // 不清掉的话，重画出来的卡片会照着**存盘前**那份计划再写一遍
+  // 「还没有 v001-c0001 的创作任务指令」——作者明明刚存过，按钮还是灰的
+  // （界面测试抓到的就是这一瞬：保存按钮已经消失、卡片还在报缺指令）。
+  // 置空之后卡片显示「正在算计划…」，由 creationBindDraft 重新取一份。
+  if (creationState.kind === 'brief') {
+    creationState.prosePlan = null;
+    creationState.prose = null;
   }
-  const side = document.querySelector('[data-sidebar]');
-  if (side) side.outerHTML = creationRenderSidebar();
-  const issues = document.getElementById('creation-issues');
-  if (issues) issues.innerHTML = creationRenderIssues();
-  creationBindIssues();
+  creationRepaint();
 }
 
 function creationBindIssues() {
@@ -3043,22 +3253,20 @@ function creationBindIssues() {
   });
 }
 
+/* 切层：流水线那几个站点 + 「下一步」那颗主按钮，都走这里。
+   站点在流水线上、按钮在 .next 里，两处共用 data-goto-kind，
+   所以选择器不能再限定在 #creation-guide 里面（原来就限定了，于是
+   站点点不动——它们看着像按钮，点下去什么都不发生）。 */
 function creationBindGuide() {
-  document.querySelectorAll('#creation-guide [data-goto-kind]').forEach((el) => {
+  document.querySelectorAll('[data-goto-kind]').forEach((el) => {
     el.onclick = (e) => {
       e.preventDefault();
       creationGoto(el.dataset.gotoKind, el.dataset.gotoKey || '');
     };
   });
-  const seed = document.querySelectorAll('#creation-guide [data-seed-briefs]');
-  seed.forEach((el) => { el.onclick = () => creationSeedBriefs(''); });
-  const jump = document.querySelector('#creation-guide [data-scroll-issues]');
-  if (jump) {
-    jump.onclick = () => {
-      const box = document.getElementById('creation-issues');
-      if (box) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    };
-  }
+  document.querySelectorAll('[data-seed-briefs]').forEach((el) => {
+    el.onclick = () => creationSeedBriefs('');
+  });
   creationBindIssues();
 }
 
@@ -3076,57 +3284,140 @@ function creationNotSaved() {
 }
 
 
+/* 一个字段该用哪个控件。加字段只加一行表单表，这里不用动。 */
+function creationFieldControl(spec, value) {
+  if (spec.type === 'strlist') return cStrList(spec, spec.k, value);
+  if (spec.type === 'tiers') return cTiers(spec, spec.k, value);
+  if (spec.type === 'cast') return cCast(spec, spec.k, value);
+  if (spec.type === 'objlist') {
+    // 三个格子以内的条目横排一行就放得下；字段更多的摊成卡片。
+    const n = (spec.fields || []).length;
+    const simple = n <= 3 && !spec.listFields && !spec.withRelations;
+    return simple ? cObjRows(spec, spec.k, value) : cObjList(spec, spec.k, value);
+  }
+  return cField(spec, spec.k, value);
+}
+
 function creationRenderForm(draft) {
   const table = FORM_TABLES[creationState.kind] || SETTING_FORM;
+  const by = creationIssuesBySection(creationState.kind);
   const sections = table.map((section, i) => {
-    const body = section.fields.map((spec) => {
-      const value = cGet(draft, spec.k);
-      if (spec.type === 'strlist') return cStrList(spec, spec.k, value);
-      if (spec.type === 'objlist') return cObjList(spec, spec.k, value);
-      return cField(spec, spec.k, value);
-    }).join('');
-    return `<div class="card sec-card" id="sec-c-${i}" style="margin-bottom:12px">
-      <h3 style="margin:0 0 10px">${esc(section.title)}</h3>
-      <div class="fgrid">${body}</div></div>`;
+    const body = section.fields.map((spec) => creationFieldControl(spec, cGet(draft, spec.k)))
+      .join('');
+    // 校验信息就地贴在出问题的分区里，而不是全堆到页面顶上——
+    // 作者要一眼看出「哪一格错了」，不是先读一屏清单再回来找。
+    const bucket = by.bySection[String(i)] || { errors: [], warnings: [] };
+    const locals = bucket.errors.map((x) => creationLocalBlock(x.msg, 'errors', x.field))
+      .concat(bucket.warnings.map((x) => creationLocalBlock(x.msg, 'warnings', x.field)))
+      .join('');
+    const badge = bucket.errors.length
+      ? `<span class="badge bad num">阻断 ${bucket.errors.length}</span>`
+      : bucket.warnings.length
+        ? `<span class="badge warn num" title="${bucket.warnings.length} 条提示">${bucket.warnings.length}</span>`
+        : '';
+    return `<section class="sec${bucket.errors.length ? ' has-bad' : ''}" id="sec-c-${i}"
+      aria-labelledby="h-c-${i}">
+      <div class="sec-head">
+        <h2 id="h-c-${i}">${esc(section.title)}</h2>
+        <span class="grow"></span>${badge}
+      </div>
+      <div class="sec-body">
+        ${locals}
+        <div class="grid ${esc(section.grid || 'g2')}">${body}</div>
+      </div>
+    </section>`;
   }).join('');
 
-  // 九个分区、几千像素的表单，得有个目录，不然滚到底就找不到「人物」在哪
-  const index = table.length > 1
-    ? inPageAnchors(table.map((s, i) => [`sec-c-${i}`, s.title]))
-    : '';
-
-  // 保存按钮原来只在表单最顶上，而表单有 3500px 高：
-  // 改完最后一个分区，得先滚回顶部才能保存。改成吸顶，跟到底。
   // 「这张表到底是干什么的」——作者第一句问的就是这个（2026-09-29）。
   // 九个分区、三千多像素的表，没有一句话交代它是什么、谁来读、能不能不填，
   // 新人只会觉得这是又一份要填的行政表格，然后开始怀疑整个工具。
-  const lead = `<p class="lead" style="margin:0 0 10px">${esc(FORM_LEAD[creationState.kind] || FORM_LEAD.setting)}</p>`;
+  const lead = `<details class="sec" style="box-shadow:none">
+    <summary style="padding:12px 20px;font-size:13px;color:var(--ink-2)">
+      这张表是干什么的、能不能不填完？</summary>
+    <div class="sec-body" style="padding-top:0">
+      <p class="muted" style="margin:0">${esc(FORM_LEAD[creationState.kind] || FORM_LEAD.setting)}</p>
+    </div>
+  </details>`;
 
-  return `<div class="ctoolbar">
-    <div class="row">
-      <button class="btn" id="tab-form" ${creationState.mode === 'form' ? 'disabled' : ''}>表单</button>
-      <button class="btn" id="tab-raw" ${creationState.mode === 'raw' ? 'disabled' : ''}>原文</button>
-      <span class="muted" style="font-size:12px">${esc(creationEditorTitle())}</span>
-      <span class="muted" style="font-size:12px" id="draft-flag">
-        ${creationNotSaved()
-          ? '有未保存的改动（这一份是从卷表和设定集预填的，还没建文件）'
-          : creationState.dirty ? '有未保存的改动' : '没有未保存的改动'}</span>
-    </div>
-    <div class="row">
-      ${creationHasKb() ? `<button class="btn" data-tools-open="kb"
-        title="从已入库作品的实体卡片里勾素材，直接填进上面的表单（不调模型、不花钱）">
-        素材库${creationToolsBadge('kb')}</button>` : ''}
-      <button class="btn" data-tools-open="assist"
-        title="让模型提几条建议，你逐条留/改/丢；也可以一句「配齐」把几类设定一次提足">
-        问助手${creationToolsBadge('assist')}</button>
-      <span class="ctoolbar-sep" aria-hidden="true"></span>
-      <button class="btn primary" id="creation-save">${esc(SAVE_LABELS[creationState.kind] || '保存')}</button>
-    </div>
-  </div>
-  ${creationRenderIssues()}
-  ${lead}
-  ${index}
-  ${sections}`;
+  return `${creationRenderIssues()}
+    ${sections}
+    ${lead}`;
+}
+
+/* 未保存状态那一句话。⚠️「还没建文件」那半句是界面测试和作者都靠它认路的，
+   别改字：逐章指令的骨架是后端拿卷表和设定集拼的，磁盘上还没有这个文件，
+   不说清的话作者会以为已经存过了，改两笔就走——这一章等于没建。
+   未保存这件事交给顶栏那颗胶囊说，保存按钮的文案不跟着变：
+   按钮突然改字会让人以为功能变了。 */
+function creationSetDirty() {
+  const pill = document.getElementById('draft-flag');
+  if (!pill) return;
+  const seeded = creationNotSaved();
+  const dirty = !!creationState.dirty;
+  pill.classList.toggle('on', dirty || seeded);
+  // ⚠️ 只改文本、只补/摘那一颗「还没建文件」角标，**不重建整颗胶囊**。
+  // 原来每次 input 都走 pill.innerHTML = …，两个后果：
+  //   ① 设计页那两条 .2s 过渡（底色、圆点）永远播不出来——旧节点被换掉，
+  //      新节点一插进来就是终态；
+  //   ② 胶囊是 role="status" aria-live="polite"，每敲一个字就重写一次内容，
+  //      读屏软件会把状态念一遍又一遍。
+  let text = document.getElementById('save-text');
+  if (!text) {
+    pill.textContent = '';
+    const dot = document.createElement('i');
+    dot.setAttribute('aria-hidden', 'true');
+    pill.appendChild(dot);
+    text = document.createElement('span');
+    text.id = 'save-text';
+    pill.appendChild(text);
+  }
+  const want = dirty ? '有未保存的改动' : '没有未保存的改动';
+  if (text.textContent !== want) text.textContent = want;
+  const badge = pill.querySelector('.badge');
+  if (seeded && !badge) {
+    const b = document.createElement('span');
+    b.className = 'badge warn';
+    b.textContent = '还没建文件';
+    pill.appendChild(b);
+  } else if (!seeded && badge) {
+    badge.remove();
+  }
+}
+
+/* 轻提示：落盘、素材导入、提案接受这类「做完了」的事走它，2.2 秒自己走。
+   校验结果、错误这类要留着看的东西不走它——用页面里的 notice 块，
+   一闪而过的红字等于没报错。
+
+   ⚠️ 提示的内容存在 state 里，不是只写进 DOM。
+   因为「已保存」这句话说完之后紧接着就是一次重画（分区徽章、流水线、汇总 pill
+   都得跟着刷新），而重画是整块换掉 #creation-root——提示节点连同它的 data-show
+   一起没了。作者点一下保存，看到的是一片安静（实测 2026-10-01）。
+   存进 state、重画时按剩余时间还原，提示就能跨过重画活着。 */
+function creationToastAlive() {
+  return !!(creationState.toast && creationState.toast.until > Date.now());
+}
+
+function creationPaintToast() {
+  const box = document.getElementById('toast');
+  const text = document.getElementById('toast-text');
+  if (!box || !text) return;
+  if (!creationToastAlive()) {
+    box.removeAttribute('data-show');
+    text.textContent = '';
+    return;
+  }
+  text.textContent = creationState.toast.msg;
+  box.setAttribute('data-show', '');
+}
+
+function creationSay(msg) {
+  creationState.toast = { msg, until: Date.now() + 2200 };
+  creationPaintToast();
+  clearTimeout(creationSay.timer);
+  creationSay.timer = setTimeout(() => {
+    creationState.toast = null;
+    creationPaintToast();
+  }, 2200);
 }
 
 function creationRenderAssist() {
@@ -3177,81 +3468,87 @@ function creationRenderAssist() {
       </details>`
     : '';
 
-  // 一次可能几十条（配齐），所以是一张表：逐行「留/改/丢」，不是几十个勾选框。
-  // 表格里直接改「内容」，改完的值会覆盖模型原值——批量生成最容易出问题的就是名字，
-  // 让作者在表里改掉，比接受完再去表单里一行行找快得多。
+  // 提案卡：一条一卡，卡片上直接「接受 / 改一改 / 丢掉」。
+  // 原来是一张表 + 一列勾选框 + 底部一个「接受勾选的」：一次几十条的时候表格更快，
+  // 可作者的真实动作是逐条看——看一条、决定一条。所以按条给按钮，
+  // 顺手的批量入口（全选 / 全不选 / 接受勾选的）留在上面，四十条时还能一次收。
+  const props = creationState.proposals.map((p, i) => {
+    if (p.done) {
+      return `<div class="prop keep">
+        <div class="k">${esc(p.section_label)} · ${esc(p.op)}
+          <span class="badge ok">已进草稿</span></div>
+        <div class="v">${esc(p.text)}</div></div>`;
+    }
+    return `<div class="prop${p.keep ? ' keep' : ''}" data-prop-card="${i}">
+      <div class="k">
+        <input type="checkbox" data-prop="${i}" ${p.keep ? 'checked' : ''}
+          aria-label="勾选这一条，和别的提案一起接受">
+        ${esc(p.section_label)} · ${esc(p.op)}</div>
+      <div class="v"><input type="text" data-prop-text="${i}" value="${esc(p.text)}"
+        title="${esc(p.full || '')}" aria-label="这一条的内容"></div>
+      ${p.reason ? `<div class="muted" style="margin-top:6px">没进：${esc(p.reason)}</div>` : ''}
+      <div class="act">
+        <button class="btn sm primary" type="button" data-prop-ok="${i}">接受</button>
+        <button class="btn sm" type="button" data-prop-edit="${i}">改一改</button>
+        <button class="btn sm ghost" type="button" data-prop-drop="${i}">丢掉</button>
+      </div>
+    </div>`;
+  }).join('');
+
   const proposals = creationState.proposals.length
-    ? `<div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:10px">
-        <div class="row" style="justify-content:space-between;margin-bottom:6px">
-          <span class="muted" style="font-size:12px">
-            提案 ${creationState.proposals.length} 条 · 勾中的才进草稿，「内容」可直接改</span>
-          <span class="row">
-            <button class="btn ghost" id="prop-all">全选</button>
-            <button class="btn ghost" id="prop-none">全不选</button>
-            <button class="btn primary" id="assist-accept">接受勾选的</button>
+    ? `<div class="blk">
+        <div class="row" style="justify-content:space-between;margin-bottom:10px">
+          <span class="muted num">提案 ${creationState.proposals.length} 条 ·
+            逐条接受，或勾一批一起收</span>
+          <span class="row" style="gap:6px">
+            <button class="btn sm" type="button" id="prop-all">全选</button>
+            <button class="btn sm" type="button" id="prop-none">全不选</button>
+            <button class="btn sm primary" type="button" id="assist-accept">接受勾选的</button>
           </span>
         </div>
-        <div style="max-height:420px;overflow:auto;border:1px solid var(--border);border-radius:8px">
-          <table style="width:100%;border-collapse:collapse;font-size:13px">
-            <thead><tr class="muted" style="font-size:11px;text-align:left">
-              <th style="padding:6px;width:34px">留</th>
-              <th style="padding:6px;width:84px">类别</th>
-              <th style="padding:6px;width:52px">动作</th>
-              <th style="padding:6px">内容</th>
-            </tr></thead>
-            <tbody>${creationState.proposals.map((p) => `
-              <tr style="border-top:1px solid var(--border)">
-                <td style="padding:4px 6px">
-                  <input type="checkbox" data-prop="${p.index}" ${p.keep ? 'checked' : ''}></td>
-                <td style="padding:4px 6px">${esc(p.section_label)}</td>
-                <td style="padding:4px 6px">${esc(p.op)}</td>
-                <td style="padding:4px 6px">
-                  <input data-prop-text="${p.index}" value="${esc(p.text)}" style="width:100%"
-                    title="${esc(p.full || '')}"></td>
-              </tr>`).join('')}</tbody>
-          </table>
-        </div>
+        <div style="max-height:460px;overflow:auto">${props}</div>
         <div id="assist-applied" class="muted" style="font-size:12px;margin-top:6px"></div>
       </div>` : '';
 
   const chat = creationState.chat.map((m) => `
-    <div style="margin-bottom:8px">
-      <span class="muted" style="font-size:11px">${m.role === 'user' ? '你' : '助手'}</span>
-      <div style="white-space:pre-wrap;font-size:13px">${esc(m.content)}</div>
-    </div>`).join('');
+    <div class="bubble ${m.role === 'user' ? 'me' : 'ai'}">${esc(m.content)}</div>`).join('');
 
-  return `<div class="card" id="creation-assist-card">
-    <h3 style="margin:0 0 4px">和助手对话起草</h3>
-    <p class="muted" style="margin:0 0 10px;font-size:12px">
-      助手只提「建议加/改哪几条」，<b>不会整份重写</b>。你逐条勾选，接受后进上面的表单草稿，
-      再自己点保存才落盘。
-    </p>
-    <div class="muted" style="font-size:12px;margin-bottom:8px">
+  return `<div class="blk" id="creation-assist-card">
+    <h3>问助手</h3>
+    <p class="lead">助手只提「建议加 / 改哪几条」，<b>不会整份重写</b>。你逐条留、改、丢，
+      接受之后进表单草稿，再自己点保存才落盘。</p>
+    <div class="muted num" style="margin-bottom:10px">
       本次调用：${esc(plan.model || '—')} · 预计输入 ${num(plan.est_input_tokens || 0)} token · ${cost}
     </div>
-    <div style="margin-bottom:10px">
-      <div class="muted" style="font-size:12px;margin-bottom:4px">
-        素材依据：注入多少（实测全素材约 4 倍输入成本，产出未见明显更好，所以默认中间档）
-      </div>
-      ${levelBoxes}
-    </div>
-    <div style="margin-bottom:10px">
-      <div class="muted" style="font-size:12px;margin-bottom:4px">
-        从哪几本取${level === 'none' ? '（当前档位不注入，勾选不生效）' : ''}
-      </div>
-      <div class="row wrap">${refBoxes}</div>
-    </div>
-    ${previewBox}
-    ${chat ? `<div style="border-top:1px solid var(--border);padding-top:10px;margin-bottom:10px">${chat}</div>` : ''}
+    ${chat ? `<div style="margin-bottom:12px">${chat}</div>` : ''}
     ${proposals}
-    <textarea id="assist-msg" placeholder="${esc(ASSIST_HINTS[creationState.kind] || ASSIST_HINTS.setting)}"
-      style="width:100%;min-height:70px;padding:8px;border-radius:10px;
-             border:1px solid var(--border-strong);background:var(--surface);color:var(--text)"></textarea>
-    <div class="row" style="justify-content:flex-end;margin-top:8px">
-      ${creationState.kind === 'setting' ? '<button class="btn" id="creation-wizard">开局向导</button>' : ''}
-      ${creationState.kind === 'setting' ? '<button class="btn" id="assist-bulk">配齐…</button>' : ''}
-      ${creationState.kind === 'volume' ? '<button class="btn" id="volume-bulk">配齐章表…</button>' : ''}
-      <button class="btn primary" id="assist-send">问助手（${cost}）</button>
+    ${previewBox}
+    <details class="blk" style="box-shadow:none">
+      <summary style="cursor:pointer;font-size:12.5px;color:var(--ink-2)">
+        素材依据（注入多少 · 从哪几本取）</summary>
+      <div style="margin-top:10px">
+        <div class="muted" style="margin-bottom:4px">
+          注入多少：实测全素材约 4 倍输入成本，产出未见明显更好，所以默认中间档。
+        </div>
+        ${levelBoxes}
+      </div>
+      <div style="margin-top:10px">
+        <div class="muted" style="margin-bottom:4px">
+          从哪几本取${level === 'none' ? '（当前档位不注入，勾选不生效）' : ''}
+        </div>
+        <div class="qlist">${refBoxes}</div>
+      </div>
+    </details>
+    <div class="composer">
+      <textarea id="assist-msg"
+        placeholder="${esc(ASSIST_HINTS[creationState.kind] || ASSIST_HINTS.setting)}"
+        aria-label="要问助手什么"></textarea>
+    </div>
+    <div class="row wrap" style="justify-content:flex-end;margin-top:8px;gap:6px">
+      ${creationState.kind === 'setting' ? '<button class="btn sm" type="button" id="creation-wizard">开局向导</button>' : ''}
+      ${creationState.kind === 'setting' ? '<button class="btn sm" type="button" id="assist-bulk">配齐…</button>' : ''}
+      ${creationState.kind === 'volume' ? '<button class="btn sm" type="button" id="volume-bulk">配齐章表…</button>' : ''}
+      <button class="btn sm primary" type="button" id="assist-send">问助手（${cost}）</button>
     </div>
     <div id="assist-note" style="margin-top:8px"></div>
   </div>`;
@@ -3344,8 +3641,7 @@ async function openOpeningWizard() {
       if (box) box.value = value;
     });
     creationState.dirty = true;
-    const flag = document.getElementById('draft-flag');
-    if (flag) flag.textContent = '有未保存的改动';
+    creationSetDirty();
   };
 
   const msg = [
@@ -3355,7 +3651,9 @@ async function openOpeningWizard() {
     extra ? `· 额外要求：${extra}` : '',
     '',
     '每条提案的 section 必须原样照抄下面的键名，不要翻译成英文，也不要另起名字：',
-    '· world.era＝时代　power_system＝力量体系名　tiers＝等级（由低到高）　tone＝基调　themes＝主题',
+    '· world.era＝时代　world_scope＝地理范围　power_system＝力量来源　power_cost＝力量代价',
+    '· power_rules＝力量体系规则　tiers＝力量体系等级（由低到高）　tone＝基调　themes＝主题',
+    '· motifs＝反复出现的意象　ability_category＝能力分类　ability_acquire＝能力获取方式',
     '· characters＝主角（role 必须写「主角」，motive 写他开局图什么）'
       + '+ 至少一个对手 + 一个盟友；arc 写「从什么样变成什么样」，'
       + '这是要走完的路，不是他开局就有的样子',
@@ -3400,6 +3698,9 @@ const BULK_CATS = [
   ['abilities', '能力', true], ['tiers', '力量体系等级', true],
   ['terms', '术语', false], ['characters', '人物', false],
   ['places', '地点', false], ['themes', '主题与象征', false],
+  ['power_rules', '力量体系规则', false], ['power_cost', '力量代价', false],
+  ['ability_category', '能力分类', false], ['ability_acquire', '能力获取方式', false],
+  ['world_scope', '地理范围', false], ['motifs', '反复出现的意象', false],
 ];
 
 /* ⚠️ 上面这些标签**必须跟后端白名单里的 label 一字不差**。
@@ -3560,45 +3861,40 @@ function creationRenderKbPanel() {
   const plan = creationState.assistPlan || {};
   const works = (plan.refs_available || []).filter((r) => r.kb_ready);
   if (!works.length) {
-    return `<div class="card" id="creation-kb-card">
-      <h3 style="margin:0 0 4px">从知识库取素材</h3>
-      <p class="muted" style="margin:0;font-size:12px">
-        书架里还没有能供素材的作品。这一栏翻的是 K1 实体卡片，
-        所以要先对一本已入库作品跑<b>实体统计</b>（人物/势力/能力/地点就从这儿来），
-        再点一次「构建知识库」。只跑标注跑不出这一栏。
-      </p></div>`;
+    return `<div class="blk" id="creation-kb-card">
+      <h3>素材库</h3>
+      <p class="lead">书架里还没有能供素材的作品。这一栏翻的是 K1 实体卡片，
+        所以要先对一本已入库作品跑<b>实体统计</b>（人物 / 势力 / 能力 / 地点就从这儿来），
+        再点一次「构建知识库」。只跑标注跑不出这一栏。</p></div>`;
   }
   const kb = creationState.kb;
   const options = works.map((r) => `<option value="${esc(r.name)}"
       ${kb.ref === r.name ? 'selected' : ''}>${esc(r.label)}（${num(r.chapters)} 章）</option>`).join('');
   const tabs = KB_SECTIONS.map(([key, label]) =>
-    `<button class="btn ${kb.section === key ? 'primary' : 'ghost'}" data-kb-section="${key}">
+    `<button class="btn sm ${kb.section === key ? 'primary' : ''}" type="button" data-kb-section="${key}">
        ${label}${kb.counts && kb.counts[key] != null ? ` ${num(kb.counts[key])}` : ''}</button>`).join('');
   const rows = (kb.rows || []).map((row) => `
-    <label class="row" style="align-items:flex-start;gap:8px;margin-bottom:4px">
+    <label class="q">
       <input type="checkbox" data-kb-key="${esc(row.key)}" ${kb.picked[row.key] ? 'checked' : ''}>
-      <span style="font-size:13px">${esc(row.key)}
-        <span class="muted" style="font-size:11px">${esc(kbDetail(row))}</span></span>
+      <span class="grow">${esc(row.key)}
+        <span class="src">${esc(kbDetail(row))}</span></span>
     </label>`).join('');
 
-  return `<div class="card" id="creation-kb-card">
-    <h3 style="margin:0 0 4px">从知识库取素材</h3>
-    <p class="muted" style="margin:0 0 10px;font-size:12px">
-      素材依据，你来定收哪些。<b>不调模型、不花钱</b>：勾中的条目直接进上面的表单草稿，
-      再自己点「保存设定集」才落盘。知识库里没有的字段（比如人物的动机）会留空给你填。
-    </p>
-    <select id="kb-ref" aria-label="素材来源" style="width:100%;margin-bottom:8px">${options}</select>
-    <div class="row wrap" style="margin-bottom:8px">${tabs}</div>
-    ${kb.loading ? '<div class="muted" style="font-size:12px">读知识库…</div>' : ''}
-    ${(kb.rows && kb.rows.length) ? `<div style="max-height:280px;overflow:auto;
-        border:1px solid var(--border);border-radius:8px;padding:8px">
-        <div class="row" style="justify-content:flex-end;margin-bottom:6px">
-          <button class="btn ghost" id="kb-all">全选</button>
-          <button class="btn ghost" id="kb-none">全不选</button>
-        </div>${rows}</div>
-      <div class="row" style="justify-content:flex-end;margin-top:8px">
-        <button class="btn primary" id="kb-import">收进我的设定集</button>
-      </div>` : (kb.loaded ? '<div class="muted" style="font-size:12px">这一类是空的。</div>' : '')}
+  return `<div class="blk" id="creation-kb-card">
+    <h3>素材库</h3>
+    <p class="lead">素材依据，你来定收哪些。<b>不调模型、不花钱</b>：勾中的条目直接进表单草稿，
+      再自己点「保存设定集」才落盘。知识库里没有的字段（比如人物的动机）会留空给你填。</p>
+    <select id="kb-ref" aria-label="素材来源" style="margin-bottom:8px">${options}</select>
+    <div class="row wrap" style="margin-bottom:8px;gap:6px">${tabs}</div>
+    ${kb.loading ? '<div class="muted">读知识库…</div>' : ''}
+    ${(kb.rows && kb.rows.length) ? `<div class="qlist" style="max-height:300px;overflow:auto">${rows}</div>
+      <div class="row" style="justify-content:space-between;margin-top:10px">
+        <span class="row" style="gap:6px">
+          <button class="btn sm" type="button" id="kb-all">全选</button>
+          <button class="btn sm" type="button" id="kb-none">全不选</button>
+        </span>
+        <button class="btn sm primary" type="button" id="kb-import">收进我的设定集</button>
+      </div>` : (kb.loaded ? '<div class="muted">这一类是空的。</div>' : '')}
     <div id="kb-note" style="margin-top:8px"></div>
   </div>`;
 }
@@ -3698,13 +3994,11 @@ function creationRenderDraft() {
     : '';
   const blockers = (plan.blocker ? [plan.blocker] : []).concat(plan.warnings || []);
 
-  return `<div class="card" id="creation-draft-host" style="margin-top:12px">
-    <h3 style="margin:0 0 4px">写这一章</h3>
-    <p class="muted" style="margin:0 0 10px;font-size:12px">
-      按上面的指令 + 设定集 + 本卷目录写正文。<b>一次只出一章</b>，写完就停——
-      连吐十章，第一章不满意后面九章全废。
-    </p>
-    <div class="muted" style="font-size:12px;margin-bottom:8px">
+  return `<div class="blk" id="creation-draft-host">
+    <h3>写这一章</h3>
+    <p class="lead">按上面的指令 + 设定集 + 本卷目录写正文。<b>一次只出一章</b>，写完就停——
+      连吐十章，第一章不满意后面九章全废。</p>
+    <div class="muted num" style="margin-bottom:8px">
       ${plan.model ? `本次调用：${esc(plan.model)} · 输入约 ${num(plan.est_input_tokens || 0)} token`
         + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token · ${cost}`
         + `（目标 ${words} 字）` : '正在算计划…'}
@@ -3736,7 +4030,7 @@ function creationRenderDraftResult() {
   const stats = d.stats || {};
   const meta = d.meta || {};
   const usage = meta.usage || {};
-  return `<div class="card" style="margin-top:12px">
+  return `<div class="blk">
     <div class="spread" style="margin-bottom:10px">
       <div>
         <h3 style="margin:0 0 2px">${esc(creationState.key)} 正文</h3>
@@ -3765,24 +4059,14 @@ function creationRenderDraftResult() {
   </div>`;
 }
 
-/* 保存指令之后必须重算这张卡。
-
-   计划是缓存的（creationBindDraft 只在 prosePlan 为空时去取），而保存表单那条路
-   只重画引导块、侧栏和校验清单——不碰这张卡。于是指令已经落盘，卡片还红着
-   「还没有…的创作任务指令」，按钮照样灰着：作者看到的是「保存了也写不了」。
+/* 保存指令之后这张卡要重算。做法不是「再单独刷一次卡」（原来有个
+   creationRefreshDraftCard 就是这个），而是**整页重画 + 把计划置空**：
+   creationRefreshPanels 见到 brief 层就把 prosePlan/prose 清掉，
+   重画时 creationBindDraft 顺势重取一份并再画一次。
+   单独刷卡的写法有两个毛病：计划接口打两次；而且保存按钮跟着重画先消失、
+   这张卡要等第二次请求回来才更新——中间那几百毫秒里卡片还红着
+   「还没有…的创作任务指令」，作者看到的是「保存了也写不了」（界面测试抓到的就是这一瞬）。
 */
-async function creationRefreshDraftCard() {
-  const host = document.getElementById('creation-draft-host');
-  if (!host) return;
-  creationState.prosePlan = null;
-  try {
-    creationState.prosePlan = await getJSON(
-      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
-      + `${encodeURIComponent(creationState.key)}/plan`);
-  } catch { return; }  // 取不到就维持原样，别把卡片打空
-  host.outerHTML = creationRenderDraft();
-  creationBindDraft();
-}
 
 function creationBindDraft() {
   if (creationState.kind !== 'brief' || !creationState.key) return;
@@ -3803,10 +4087,11 @@ function creationBindDraft() {
     saveBrief.onclick = async () => {
       saveBrief.disabled = true;
       saveBrief.textContent = '保存中…';
-      // 复用工具栏那个「保存本章指令」：校验、落盘、刷新面板都在那一条路上，
+      // 复用顶栏那个保存：校验、落盘、刷新面板都在那一条路上，
       // 在这里另写一遍落盘逻辑，两边迟早会不一致。
+      // 保存之后不用再单独刷这张卡：creationRefreshPanels 会把计划置空，
+      // creationBindDraft 顺势重取一份并重画（原来刷两遍，计划接口打两次）。
       await creationSaveForm();
-      await creationRefreshDraftCard();
     };
   }
   const go = document.getElementById('draft-go');
@@ -4028,13 +4313,12 @@ function creationRenderSuggest() {
     || (Array.isArray(v) && !v.length)
     || (v && typeof v === 'object' && !Array.isArray(v) && !Object.keys(v).length);
   if (!Object.keys(s || {}).some((k) => empty(draft[k]) && !empty(s[k]))) return '';
-  return `<div class="card" style="margin-bottom:12px;border-color:var(--accent)">
-    <h3 style="margin:0 0 6px">这一章缺核心情节，卷表里有</h3>
-    <p class="chint" style="margin:0 0 10px">
-      这份指令是在「预填」之前建的，所以核心情节一直是空的。点下面这个按钮，
-      把**空着的那几格**按卷表和设定集补上——你已经写过的内容一个字都不动。
+  return `<div class="blk" style="border-color:var(--brand);border-left-width:3px">
+    <h3>这一章缺核心情节，卷表里有</h3>
+    <p class="lead">这份指令是在「预填」之前建的，所以核心情节一直是空的。点下面这个按钮，
+      把<b>空着的那几格</b>按卷表和设定集补上——你已经写过的内容一个字都不动。
       补完还要自己点「保存本章指令」才落盘。</p>
-    <button class="btn primary" id="brief-fill">按卷表补全</button>
+    <button class="btn primary sm" type="button" id="brief-fill">按卷表补全</button>
   </div>`;
 }
 
@@ -4067,25 +4351,19 @@ function creationRenderEditor(read) {
       + creationRenderDraft()
       + creationRenderDraftResult();
   }
-  return `<div class="card">
-    <div class="spread" style="margin-bottom:10px">
-      <div class="row">
-        <button class="btn" id="tab-form">表单</button>
-        <button class="btn" id="tab-raw" disabled>原文</button>
-        <span class="muted" style="font-size:12px">${esc(creationEditorTitle())}</span>
-      </div>
-      <button class="btn primary" id="creation-save">保存原文</button>
+  return `<section class="sec">
+    <div class="sec-head">
+      <h2>原文</h2>
+      <span class="grow"></span>
+      <span class="muted">改的是文件原文，<b>手写注释会保留</b>；表单保存会重新生成 YAML、注释会没有。</span>
     </div>
-    <p class="muted" style="font-size:12px;margin:0 0 8px">
-      这里改的是文件原文，<b>手写注释会保留</b>；表单保存会重新生成 YAML、注释会没有。
-    </p>
-    <textarea id="creation-text" spellcheck="false"
-      style="width:100%;min-height:440px;font:13px/1.6 Consolas,Menlo,monospace;
-             padding:10px;border-radius:10px;border:1px solid var(--border-strong);
-             background:var(--surface);color:var(--text);resize:vertical"
-      >${esc(read.text || '')}</textarea>
-    <div id="creation-check" style="margin-top:10px">${creationRenderCheck(read.errors, read.warnings)}</div>
-  </div>`;
+    <div class="sec-body">
+      <textarea id="creation-text" spellcheck="false"
+        style="min-height:440px;font:13px/1.6 Consolas,Menlo,monospace"
+        >${esc(read.text || '')}</textarea>
+      <div id="creation-check" style="margin-top:10px">${creationRenderCheck(read.errors, read.warnings)}</div>
+    </div>
+  </section>`;
 }
 
 /* ── 本层工具（素材库 / 助手）──────────────────────────────
@@ -4102,18 +4380,35 @@ function creationRenderEditor(read) {
 function creationRenderTools() {
   // 「原文」模式下没有表单草稿，助手提的提案无处可落，索性整块收起来
   if (creationState.mode !== 'form') return '';
-  return `<aside class="cdrawer" id="creation-drawer" aria-label="本层工具"
-      ${creationState.toolsOpen ? '' : 'hidden'}>
-    <div class="cdrawer-head">
-      <strong>本层工具</strong>
-      <span class="muted cdrawer-hint">勾中的素材与提案都先进表单草稿，点保存才落盘</span>
-      <span class="ctoolbar-sep" aria-hidden="true"></span>
-      <button class="btn primary" id="creation-save-tools">${esc(SAVE_LABELS[creationState.kind] || '保存')}</button>
-      <button class="btn ghost" id="creation-tools-close">收起 ✕</button>
+  const kb = creationHasKb();
+  // 素材库只属于设定集层。站在卷表层时那一个页签不摆出来，
+  // 摆了就是「点进去只有一半工具」，比没有入口更让人困惑。
+  const pane = (creationState.toolsPane === 'kb' && kb) ? 'kb' : 'assist';
+  const open = creationState.toolsOpen;
+  // ⚠️ `hidden` 只在收起时写。两者都挂着的话，`[hidden]` 那条 display:none 会赢，
+  // 抽屉看着是开的（data-open 也在），点上面的「收起」却报「元素不可见」——
+  // 目视检查时就栽在这儿：页签切换、接受提案全都点不动。
+  // ponytail: 抽屉是整块重画的，所以只有滑出没有滑入（进场时元素是新的，
+  // 没有「起始态 → 终态」这一帧）。要滑入就得让 aside 常驻、只重画里面的内容，等到真有人提这个再说。
+  return `<div class="scrim" id="creation-scrim" ${open ? 'data-open' : 'hidden'}></div>
+  <aside class="drawer" id="creation-drawer" aria-label="本层工具" ${open ? 'data-open' : 'hidden'}>
+    <div class="drawer-head">
+      <div class="tabs" role="tablist" aria-label="工具切换">
+        ${kb ? `<button role="tab" type="button" data-pane="kb"
+          aria-selected="${pane === 'kb'}">素材库</button>` : ''}
+        <button role="tab" type="button" data-pane="assist"
+          aria-selected="${pane === 'assist'}">问助手</button>
+      </div>
+      <span class="grow"></span>
+      <button class="btn primary sm" id="creation-save-tools"
+        >${esc(SAVE_LABELS[creationState.kind] || '保存')}</button>
+      <button class="btn ghost sm" id="creation-tools-close" aria-label="收起工具抽屉">收起 ✕</button>
     </div>
-    <div class="cdrawer-body" id="creation-tools-body">
-      ${creationRenderKbPanel()}
-      ${creationRenderAssist()}
+    <div class="drawer-body">
+      <div class="pane${pane === 'kb' ? ' on' : ''}" id="pane-kb" role="tabpanel">
+        ${kb ? creationRenderKbPanel() : ''}</div>
+      <div class="pane${pane === 'assist' ? ' on' : ''}" id="pane-assist" role="tabpanel">
+        ${creationRenderAssist()}</div>
     </div>
   </aside>`;
 }
@@ -4129,20 +4424,29 @@ function creationHasKb() {
 function creationToolsBadge(which) {
   if (which === 'kb') {
     const n = Object.keys(creationState.kb.picked || {}).length;
-    return n ? `（已勾 ${n} 条）` : '';
+    return n ? `已勾 ${n} 条` : '';
   }
-  return creationState.proposals.length ? `（${creationState.proposals.length} 条待处理）` : '';
+  return creationState.proposals.length ? `${creationState.proposals.length} 条待处理` : '';
 }
 
-function creationToggleTools(open, scrollTo) {
-  const box = document.getElementById('creation-drawer');
+/* 顶栏按钮上的角标。抽屉关着的时候，「攒了 2 条提案」「勾了 5 条素材」
+   只有按钮上这一格能说出来——否则作者得点开才知道刚才那些东西还在不在。 */
+function toolBadge(which) {
+  const text = creationToolsBadge(which);
+  return text ? `<span class="badge">${esc(text)}</span>` : '';
+}
+
+function creationToggleTools(open, pane) {
   creationState.toolsOpen = !!open;
-  if (!box) return;
-  box.hidden = !open;
-  if (!open || !scrollTo) return;
-  const card = document.getElementById(
-    scrollTo === 'kb' ? 'creation-kb-card' : 'creation-assist-card');
-  if (card) card.scrollIntoView({ block: 'start' });
+  if (pane) creationState.toolsPane = pane === 'kb' ? 'kb' : 'assist';
+  // 换页签、开合都靠重画这一次：抽屉里两块内容各画各的，
+  // 手工 toggle class 迟早漏掉一处（比如「原文」模式下抽屉整块不该在）。
+  creationRefreshTools();
+  if (!open) return;
+  // 抽屉是整块重画出来的，重画完就已经是终态，所以这里只管焦点——
+  // 键盘 / 读屏用户打开抽屉后得有个落点，不然 Tab 会从页面顶上重新数起。
+  const close = document.getElementById('creation-tools-close');
+  if (close) close.focus();
 }
 
 function creationBindTools() {
@@ -4161,13 +4465,18 @@ function creationBindTools() {
   }
   const close = document.getElementById('creation-tools-close');
   if (close) close.onclick = () => creationToggleTools(false);
+  const scrim = document.getElementById('creation-scrim');
+  if (scrim) scrim.onclick = () => creationToggleTools(false);
+  document.querySelectorAll('#creation-drawer .tabs [data-pane]').forEach((b) => {
+    b.onclick = () => { creationState.toolsPane = b.getAttribute('data-pane'); creationToggleTools(true); };
+  });
   // 抽屉盖住了工具条右半边（保存按钮就在那儿），所以抽屉里得有一份能落盘的。
   // 走 withBusy 而不是裸调：两个按钮共用一次保存流程，不挡住重复点击就是两次写入。
   const save = document.getElementById('creation-save-tools');
   if (save) save.onclick = () => withBusy(save, '保存中…', () => creationSaveForm());
 }
 
-/* 切「表单 / 原文」时抽屉要跟着出现或消失，所以得整块重画一次。 */
+/* 切「表单 / 原文」、换页签、开合抽屉都走这一条：整块重画再重新绑定。 */
 function creationRefreshTools() {
   const host = document.getElementById('creation-tools-host');
   if (!host) return;
@@ -4177,55 +4486,163 @@ function creationRefreshTools() {
   creationBindKb();
 }
 
+/* 分区导航：既是这一页的目录，也是「哪几件事要处理」的清单。
+   ⚠️ 徽章只表示「这里有几件事要处理」，不是字段数。原来一个列表里混着
+   字段数和问题数（「文风 3」是字段、「人物 2」是问题），读者分不清哪个数字在说什么。
+   没有问题的分区不给徽章——留白本身就是「这区没事」。 */
 function creationRenderSidebar() {
+  const kind = creationState.kind;
+  const table = FORM_TABLES[kind] || SETTING_FORM;
   const d = creationState.data || {};
-  const rows = [];
-  rows.push(`<li><a href="#" data-ck="setting" data-key=""
-    class="${creationState.kind === 'setting' ? 'active' : ''}">设定集</a></li>`);
-  (d.volumes || []).forEach((v) => {
-    rows.push(`<li><a href="#" data-ck="volume" data-key="${v.vol}"
-      class="${creationState.kind === 'volume' && String(creationState.key) === String(v.vol) ? 'active' : ''}">
-      第 ${v.vol} 卷${v.title ? `　${esc(v.title)}` : ''}
-      ${v.errors ? `<span class="chip bad" style="margin-left:6px">${v.errors} 项</span>` : ''}</a></li>`);
-  });
+  const by = creationIssuesBySection(kind);
+  const { errors = [], warnings = [] } = creationState.issues || {};
+
+  const links = table.map((section, i) => {
+    const b = by.bySection[String(i)] || { errors: [], warnings: [] };
+    const badge = b.errors.length
+      ? `<span class="badge bad num" title="${b.errors.length} 处阻断">${b.errors.length}</span>`
+      : b.warnings.length
+        ? `<span class="badge warn num" title="${b.warnings.length} 条提示">${b.warnings.length}</span>`
+        : '';
+    return `<li><a href="#sec-c-${i}"><span class="nm">${esc(section.title)}</span>${badge}</a></li>`;
+  }).join('');
+
+  // 流水线能带你到第 1 卷、第一章；具体是哪一卷哪一章，还得有个列表。
+  // 这份列表在设定集层也留着——写着设定集突然想去某一章看看，不该先退出去。
+  const vols = (d.volumes || []).map((v) => `
+    <li><a href="#" data-ck="volume" data-key="${v.vol}"
+      ${kind === 'volume' && String(creationState.key) === String(v.vol)
+        ? 'aria-current="true"' : ''}>
+      <span class="nm">第 ${v.vol} 卷${v.title ? `　${esc(v.title)}` : ''}</span>
+      ${v.errors ? `<span class="badge bad num" title="${v.errors} 处阻断">${v.errors}</span>` : ''}</a></li>`);
   // 徽标要带单位：光一个「1」，作者分不清是 1 项待修还是 1 章已填。
   const chapters = (d.chapters || []).map((c) => {
-    const flag = !c.has_brief ? '<span class="muted">未填</span>'
-      : c.errors ? `<span class="chip bad">${c.errors} 项</span>`
-      : c.warnings ? `<span class="chip warn">${c.warnings} 条</span>` : '<span class="chip ok">ok</span>';
+    const flag = !c.has_brief ? '<span class="badge">未填</span>'
+      : c.errors ? `<span class="badge bad num" title="${c.errors} 项">${c.errors}</span>`
+      : c.warnings ? `<span class="badge warn num" title="${c.warnings} 条">${c.warnings}</span>`
+      : '<span class="badge ok">ok</span>';
     return `<li><a href="#" data-ck="brief" data-key="${c.chapter_id}"
-      class="${creationState.kind === 'brief' && creationState.key === c.chapter_id ? 'active' : ''}">
-      第${c.chapter_no}章 ${esc(c.title || '')} ${flag}</a></li>`;
+      ${kind === 'brief' && creationState.key === c.chapter_id ? 'aria-current="true"' : ''}>
+      <span class="nm">第${c.chapter_no}章 ${esc(c.title || '')}</span>${flag}</a></li>`;
   });
-  // 入口在吸顶工具条上只算「够得着」；这里再给一份带一句话解释的——
-  // 新用户不认识「素材库」「问助手」是什么意思，光看按钮名不敢点。
-  const tools = creationState.mode === 'form'
-    ? `<div class="cside-sec">
-        <div class="cside-title">本层工具</div>
-        ${creationHasKb() ? `<button class="cside-tool" data-tools-open="kb">
-          <b>素材库${creationToolsBadge('kb')}</b>
-          <small>从已入库作品勾素材，填进表单</small></button>` : ''}
-        <button class="cside-tool" data-tools-open="assist">
-          <b>问助手${creationToolsBadge('assist')}</b>
-          <small>让模型提建议，你逐条留 / 改 / 丢</small></button>
+  const places = [...vols, ...chapters].length
+    ? `<div class="secnav-more">
+        ${vols.length ? `<div class="t">分卷目录</div><ul class="secnav-list">${vols.join('')}</ul>` : ''}
+        ${chapters.length ? `<div class="t">逐章创作指令</div>
+          <ul class="secnav-list">${chapters.join('')}</ul>` : ''}
       </div>`
     : '';
 
-  return `<div class="card" data-sidebar style="padding:10px"><ul class="list" style="margin:0">${rows.join('')}</ul>
-    ${chapters.length ? `<div class="cside-sec">
-      <div class="cside-title">逐章创作任务指令</div>
-      <ul class="list" style="margin:0;max-height:300px;overflow:auto">${chapters.join('')}</ul></div>` : ''}
+  // 入口在顶栏上只算「够得着」；侧栏再给一份带数字的，
+  // 作者不用点开抽屉就知道刚才勾的素材、攒的提案还在不在。
+  const tools = creationState.mode === 'form'
+    ? `<div class="secnav-foot">
+        ${creationHasKb() ? `<button class="tool-btn" type="button" data-tools-open="kb">
+          <span class="ic" aria-hidden="true">◫</span>
+          <span class="grow">素材库</span>
+          <span class="k num">${creationToolsBadge('kb') || '从已入库作品取'}</span></button>` : ''}
+        <button class="tool-btn" type="button" data-tools-open="assist">
+          <span class="ic" aria-hidden="true">✦</span>
+          <span class="grow">问助手</span>
+          <span class="k num">${creationToolsBadge('assist') || '让它先提一版'}</span></button>
+      </div>`
+    : '';
+
+  const headBadge = errors.length
+    ? `<span class="badge bad num">${errors.length} 处待修</span>`
+    : warnings.length ? `<span class="badge warn num">${warnings.length} 条提示</span>`
+    : '<span class="badge ok">齐</span>';
+
+  return `<nav class="secnav" data-sidebar aria-label="${esc(creationLayerName())}分区">
+    <div class="secnav-head"><b>${esc(creationLayerName())}</b>${headBadge}</div>
+    <ul class="secnav-list" id="secnavList">${links}</ul>
+    ${places}
     ${tools}
-  </div>`;
+  </nav>`;
+}
+
+/* 这一层叫什么。三层名字只写这一处。 */
+function creationLayerName() {
+  const kind = creationState.kind;
+  if (kind === 'volume') return '分卷目录';
+  if (kind === 'brief') return '逐章创作指令';
+  return '设定集';
+}
+
+/* 分区导航里的跳转。两条路，都得拦下默认行为：
+
+   ① 分区锚点（href="#sec-c-3"）。⚠️ 这个应用的路由**就是看 location.hash 的**，
+      不拦的话点一下分区等于跳了一次路由，整页被换成书架/未找到——
+      而它看起来只是「点了一下左边的目录」（目视检查时栽在这儿）。
+      所以 href 留着（读屏和键盘 Enter 还是要一个链接），滚动自己做。
+   ② 切层的链接（data-ck）每次重画都会重新生成，得重新绑。 */
+function creationBindSidebar() {
+  document.querySelectorAll('#secnavList a[href^="#sec-"]').forEach((a) => {
+    a.onclick = (ev) => {
+      ev.preventDefault();
+      const sec = document.getElementById(a.getAttribute('href').slice(1));
+      if (!sec) return;
+      sec.scrollIntoView({ block: 'start' });
+      // 焦点跟过去：键盘用户跳完按 Tab 得从这一区接着走
+      sec.setAttribute('tabindex', '-1');
+      sec.focus({ preventScroll: true });
+      // 高亮要跟着走。平滑滚动期间 scroll 事件会一路刷新它，但不能只靠事件：
+      // 缩到最短距离时滚动可能一帧到位、一个 scroll 都不发，那高亮就停在上一区了。
+      // 所以自己先算一次，落位后再算一次。
+      creationSpy();
+      clearTimeout(creationBindSidebar.spyTimer);
+      creationBindSidebar.spyTimer = setTimeout(creationSpy, 340);
+    };
+  });
+  document.querySelectorAll('[data-sidebar] [data-ck]').forEach((el) => {
+    el.onclick = (ev) => {
+      ev.preventDefault();
+      creationGoto(el.getAttribute('data-ck'), el.getAttribute('data-key') || '');
+    };
+  });
+}
+
+/* 滚动高亮：读到哪一区，左边目录就点亮哪一条。
+   三层吸顶栏一共 156px 高，判据得拿它们让开，否则点亮的总是上一区。 */
+function creationSpy() {
+  const links = [...document.querySelectorAll('#secnavList a')];
+  if (!links.length) return;
+  const secs = links.map((a) => document.getElementById(a.getAttribute('href').slice(1)))
+    .filter(Boolean);
+  if (!secs.length) return;
+  const stick = 54 + 54 + 48 + 20;
+  let cur = secs[0];
+  secs.forEach((s) => { if (s.getBoundingClientRect().top - stick <= 0) cur = s; });
+  // 到底了就点亮最后一条：最后一区往往不够高，永远滚不到它自己的位置上
+  if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) {
+    cur = secs[secs.length - 1];
+  }
+  links.forEach((a) => {
+    a.setAttribute('aria-current',
+      a.getAttribute('href') === `#${cur.id}` ? 'true' : 'false');
+  });
+}
+
+function creationBindSpy() {
+  if (creationBindSpy.bound) { creationSpy(); return; }
+  creationBindSpy.bound = true;
+  let raf = null;
+  window.addEventListener('scroll', () => {
+    if (raf) return;
+    raf = requestAnimationFrame(() => { raf = null; creationSpy(); });
+  }, { passive: true });
+  creationSpy();
 }
 
 function creationEditorTitle() {
   const kind = creationState.kind;
-  if (kind === 'setting') return '设定集（人写的真源）';
+  // 面包屑里那一格。名字要短——左边已经有作品名了，
+  // 「设定集（人写的真源）」这种解释性的话留给页面里的引导文案说。
+  if (kind === 'setting') return '设定集';
   // 卷号在 URL 里是 001 这种（文件名格式），显示时去掉前导零
   const shown = String(creationState.key).replace(/^0+(?=\d)/, '');
-  if (kind === 'volume') return `第 ${shown} 卷 分卷目录`;
-  return `逐章创作任务指令 · ${creationState.key}`;
+  if (kind === 'volume') return `第 ${shown} 卷 · 分卷目录`;
+  return `逐章创作指令 · ${creationState.key}`;
 }
 
 function creationRenderCheck(errors, warnings) {
@@ -4240,6 +4657,119 @@ function creationRenderCheck(errors, warnings) {
   }
   if (!parts.length) parts.push(notice('ok', '这一份没问题。'));
   return parts.join('');
+}
+
+/* 整页画一遍：顶栏 → 作品条 → 流水线 → 编辑区 → 工具抽屉。
+   只读内存里的状态，不再去读一次盘——所以新增/删除一个字段之后可以立刻重画，
+   分区徽章、汇总 pill、流水线上的数字会一起跟着变。
+
+   ⚠️ 三层吸顶栏（站点顶栏 54 + 作品条 54 + 流水线 48）是这一页的骨架：
+   保存按钮、未保存状态、切层入口在任何滚动位置都得够得着。
+   原来保存按钮只在表单顶端，三千多像素的表改完最后一格要滚回顶上去。 */
+function creationRenderPage(read) {
+  const kind = creationState.kind;
+  const name = creationState.name;
+  const kb = creationHasKb();
+  const canRaw = kind === 'setting' || kind === 'volume' || kind === 'brief';
+  // 这一页自带三层吸顶栏（站点顶栏 / 作品条 / 流水线），它们得横着铺满整宽，
+  // 所以 main 在这一页去掉左右内边距（由 creation.css 的 body.cd-on main 负责，
+  // 内层的 .cd-main 自己收在 1560px 里）。
+  // 这里原来还挂了一个 cd-shell 类，但两份 CSS 里都没有它的规则——清掉，
+  // 免得下一个人去改一个根本不存在的样式。
+  document.body.classList.add('cd-on');
+  // 根元素也挂一份：平滑滚动（scroll-behavior）认的是滚动容器自己那一份，
+  // 而这一页滚的是视口，视口那份取自 html。只挂 body 的话，点左边的分区目录
+  // 仍然是瞬时跳——creation.css 里那条 html.cd-on 就是认这个类。
+  document.documentElement.classList.add('cd-on');
+  // 换了层（设定集 → 卷表 → 某章指令）就回到页首。同层重画（加删一个字段、
+  // 应用一条提案）**不动滚动位置**——作者正看着第七张卡，一按就被弹回页首是最烦的。
+  const pageKey = `${kind}:${creationState.key}`;
+  if (creationState.renderedFor !== pageKey) {
+    creationState.renderedFor = pageKey;
+    window.scrollTo(0, 0);
+  }
+  view.innerHTML = `<div class="cdt" id="creation-root">
+    <div class="workbar">
+      <div class="crumb">
+        <a href="#/shelf">书架</a><span class="sl" aria-hidden="true">/</span>
+        <a href="#/work/${encodeURIComponent(name)}">${esc(name)}</a>
+        <span class="sl" aria-hidden="true">/</span>
+        <h1>${esc(creationEditorTitle())}</h1>
+      </div>
+      <span class="grow"></span>
+      <span class="save-state" id="draft-flag" role="status" aria-live="polite"></span>
+      ${canRaw ? `<div class="seg" role="group" aria-label="编辑方式">
+        <button type="button" id="tab-form"
+          aria-current="${creationState.mode === 'form'}">表单</button>
+        <button type="button" id="tab-raw"
+          aria-current="${creationState.mode === 'raw'}">原文</button>
+      </div>` : ''}
+      ${kb ? `<button class="btn ghost sm" type="button" data-tools-open="kb"
+        title="从已入库作品的实体卡片里勾素材，直接填进表单（不调模型、不花钱）">
+        <span class="ic" aria-hidden="true">◫</span>素材库${toolBadge('kb')}</button>` : ''}
+      <button class="btn ghost sm" type="button" data-tools-open="assist"
+        title="让模型提几条建议，你逐条留 / 改 / 丢；也可以一句「配齐」把几类设定一次提足">
+        <span class="ic" aria-hidden="true">✦</span>问助手${toolBadge('assist')}</button>
+      <button class="btn primary sm" id="creation-save"
+        title="保存（Ctrl/⌘ + S）">${esc(SAVE_LABELS[kind] || '保存')}</button>
+    </div>
+    ${creationStations()}
+    <div class="cd-main">
+      ${creationRenderGuide()}
+      <div class="work">
+        ${creationRenderSidebar()}
+        <div class="editor" id="creation-editor">${creationRenderEditor(read)}</div>
+      </div>
+      ${creationRenderExtras()}
+    </div>
+    <div id="creation-tools-host">${creationRenderTools()}</div>
+    <div class="toast" id="toast" role="status" aria-live="polite"${
+      creationToastAlive() ? ' data-show' : ''}>
+      <span class="dot" aria-hidden="true"></span><span id="toast-text">${
+        creationToastAlive() ? esc(creationState.toast.msg) : ''}</span></div>
+  </div>`;
+  creationSetDirty();
+  creationBindSidebar();
+  creationBindSpy();
+}
+
+/* 从内存里的状态整页重画一遍，**不重新读盘**。
+   加删一个字段会同时改变分区徽章、汇总 pill、流水线上的数字，
+   只重画编辑区的话左边还挂着上一版的「2 处待修」，作者会以为刚才那一下没生效。 */
+function creationRepaint() {
+  const read = creationState.read
+    || { exists: false, text: '', errors: [], warnings: [], data: creationState.draft || {} };
+  creationRenderPage(read);
+  creationSetDirty();
+  creationBindGuide();
+  creationBindIssues();
+  if (!kindSupported(creationState.kind)) return;
+  if (creationState.mode === 'form') creationBindForm(read);
+  else creationBindRaw(read);
+  creationBindTools();
+  creationBindAssist();
+  creationBindDraft();
+  creationBindKb();
+}
+
+/* 创作台只服务这三层。别的层名（比如拼错的）不进来，也不摆一排点不动的按钮。 */
+function kindSupported(kind) {
+  return kind === 'setting' || kind === 'volume' || kind === 'brief';
+}
+
+/* 现状三块（伏笔账 / 人物动向 / 全书梗概）不在设计页里，但它们是真数据，
+   收成页面底部的一条折叠区：不跟三层的进度抢注意力，也不丢。 */
+function creationRenderExtras() {
+  const d = creationState.data || {};
+  const cards = creationRenderForeshadowCard(d.foreshadows)
+    + creationRenderCastCard(d.cast, d.consistency)
+    + creationRenderSynopsisCard(d.synopsis);
+  if (!cards.trim()) return '';
+  return `<details class="cd-extras">
+    <summary style="font-size:13px;color:var(--ink-2);cursor:pointer">
+      这本书现在的样子（伏笔账 · 人物动向 · 全书梗概）</summary>
+    <div class="cd-extras" style="margin-top:12px">${cards}</div>
+  </details>`;
 }
 
 async function creationLoad() {
@@ -4261,57 +4791,17 @@ async function creationLoad() {
     errors: read.errors || [], warnings: read.warnings || [], exists: !!read.exists,
     seeded: !!read.seeded,
   };
-  view.innerHTML = `
-    <p class="muted" style="margin-bottom:6px">
-      <a href="#/shelf">书架</a> / ${esc(creationState.name)} / 创作台
-    </p>
-    <h1 style="margin:0 0 4px">创作台</h1>
-    <p class="muted" style="margin:0 0 14px">
-      三层都是你自己写的真源，这里只做编辑与校验。
-      <b>没有一键生成</b>——创作要一步步调，一次全吐出来改起来等于全废。
-    </p>
-    <div id="creation-guide-anchor"></div>
-    ${creationRenderForeshadowCard(d.foreshadows)}
-    ${creationRenderCastCard(d.cast, d.consistency)}
-    ${creationRenderSynopsisCard(d.synopsis)}
-    <div style="display:grid;grid-template-columns:280px 1fr;gap:14px;align-items:start">
-      ${creationRenderSidebar()}
-      <div id="creation-editor">${creationRenderEditor(read)}</div>
-    </div>
-    <div id="creation-tools-host">${creationRenderTools()}</div>
-  `;
-
-  // 引导块放在「读的资料」之前：先告诉他该干什么，再给他看现状。
-  const anchor = document.getElementById('creation-guide-anchor');
-  anchor.outerHTML = creationRenderGuide();
-
-  view.querySelectorAll('[data-ck]').forEach((el) => {
-    el.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      creationGoto(el.getAttribute('data-ck'), el.getAttribute('data-key') || '');
-    });
-  });
-  creationBindGuide();
-  bindAnchors(view);
-
-  if (creationState.kind === 'setting' || creationState.kind === 'volume'
-      || creationState.kind === 'brief') {
-    if (creationState.mode === 'form') creationBindForm(read);
-    else creationBindRaw(read);
-    creationBindTools();
-    creationBindAssist();
-    creationBindDraft();
-    creationBindKb();
-  } else {
-    creationBindRaw(read);
-  }
-  // 放在最后：恢复在前、落盘在后。反过来的话，一进页面就会用空状态盖掉存着的提案。
-  creationPersist();
+  // 这一份读回来的东西留在 state 上：整页重画（加删字段、应用提案）要照着它重来，
+  // 不能再去读一次盘——那会把还没保存的草稿盖掉。
+  creationState.read = read;
   // ⚠️ 这一份骨架是后端拿卷表和设定集**拼**出来的，磁盘上还没有这个文件。
   // 不标出来的话，作者看见一表单的字会以为已经存过了，改两笔就走——这章等于没建。
-  // 文案由 creationRenderForm 里的 creationNotSaved() 出（重画也会照着出）；
+  // 「还没建文件」那几个字由 creationSetDirty 出（重画也会照着出）；
   // 这里只管把它算成「有未保存的改动」，关页面时才会拦一下。
   if (read.seeded) creationState.dirty = true;
+  creationRepaint();
+  // 放在最后：恢复在前、落盘在后。反过来的话，一进页面就会用空状态盖掉存着的提案。
+  creationPersist();
 }
 
 /* 草稿被别处换掉之后（应用提案、素材库导入），**必须把表单重画一遍**。
@@ -4325,24 +4815,26 @@ function creationDraftChanged() {
   if (creationState.rerenderForm) creationState.rerenderForm();
 }
 
+/* 加了一条之后，把光标放进新的那一格。
+   设计页就是这么做的（addCast().querySelector('input').focus()），
+   而且理由很实在：加一条**就是为了马上写**，还要作者自己再去点一下输入框，等于白加。
+   靠删按钮定位这一行：它是每行都有的唯一锚点，不依赖各列表字段的键名。 */
+function creationFocusNewRow(delSelector) {
+  const anchor = document.querySelector(delSelector);
+  // `.sk-i` 是等级阶梯那一种行——它不属于 li/erow/ecard/cast-item 里的任何一种，
+  // 漏掉它的后果是「加一级」之后光标还留在原地（实测 2026-10-01）。
+  const box = anchor && anchor.closest('.li, .erow, .ecard, .cast-item, .sk-i');
+  const input = box && box.querySelector('input, textarea');
+  if (input) input.focus({ preventScroll: true });
+}
+
 /* 表单：改哪个框就更新草稿的哪条路径。**只改草稿，不落盘**。 */
 function creationBindForm(read) {
-  const rerender = () => {
-    document.getElementById('creation-editor').innerHTML = creationRenderEditor(read);
-    creationRefreshTools(); // 切「表单 / 原文」时抽屉要跟着出现或消失
-    if (creationState.mode === 'form') creationBindForm(read);
-    else creationBindRaw(read);
-    creationBindAssist();
-    creationBindIssues();
-    bindAnchors(view); // 分区目录的跳转是重渲染后新生成的，得重新绑
-  };
+  const rerender = () => creationRepaint();
   // 外面（应用提案、素材库导入）换了草稿要重画表单，而重画得带这一串重新绑定。
   // 把闭包挂到 state 上，省得在外面抄一遍——抄漏一个，按钮就变成死的。
   creationState.rerenderForm = rerender;
-  const refreshFlag = () => {
-    const el = document.getElementById('draft-flag');
-    if (el) el.textContent = creationState.dirty ? '有未保存的改动' : '没有未保存的改动';
-  };
+
   // 「按卷表补全」：只填空格子，然后重画表单让作者当场看见补了什么。
   // 挂在这儿而不是 creationBindTools，是因为表单每次重画都要重新绑一次。
   const fillBtn = document.getElementById('brief-fill');
@@ -4352,13 +4844,44 @@ function creationBindForm(read) {
       creationState.dirty = true;
       creationState.suggest = null; // 补过了就把卡撤掉，免得被点第二次
       rerender();
-      const flag = document.getElementById('draft-flag');
-      if (flag) {
-        flag.textContent = n
-          ? `补了 ${n} 格（还没保存，检查后点上面的保存）` : '没有空格子可补';
-      }
+      creationSay(n ? `补了 ${n} 格，还没保存` : '没有空格子可补');
     };
   }
+
+  // 人物卡上的角色标签：点一下在主角 / 配角之间切。
+  // 校验器要求「role=主角 恰好一个」，所以这个标签是改 role 的地方，不是装饰。
+  //
+  // ⚠️ path 指向的是**人物这一条**（characters.2），不是 role 那一格。
+  // 所以不能 cSet(path, '主角')：那会把整个人物对象换成一个字符串，
+  // 名字变成「主角」、动机和身份当场清空——而页面上角色标签照旧写着「配角」，
+  // 作者看不到任何异常（实测 2026-10-01）。
+  // 条目本身是字符串的老数据（手写 setting.yaml 里的 `characters: [甲, 乙]`）
+  // 也在这里一并收成对象，字符串留在 name 上，不丢。
+  document.querySelectorAll('[data-role]').forEach((el) => {
+    el.onclick = () => {
+      const path = el.getAttribute('data-role');
+      const item = cGet(creationState.draft, path);
+      const row = item != null && typeof item === 'object' && !Array.isArray(item)
+        ? { ...item }
+        : (item == null || Array.isArray(item) ? {} : { name: String(item) });
+      row.role = String(row.role || '配角') === '主角' ? '配角' : '主角';
+      cSet(creationState.draft, path, row);
+      creationState.dirty = true;
+      rerender();
+    };
+  });
+  // 空表上那一个按钮：直接建一个主角，省掉「先加一条、再点角色」两步。
+  document.querySelectorAll('[data-add-lead]').forEach((el) => {
+    el.onclick = () => {
+      const path = el.getAttribute('data-add-lead');
+      const list = asList(cGet(creationState.draft, path)).slice();
+      list.push({ name: '', role: '主角', motive: '' });
+      cSet(creationState.draft, path, list);
+      creationState.dirty = true;
+      rerender();
+      creationFocusNewRow(`[data-del-obj="${path}.${list.length - 1}"]`);
+    };
+  });
 
   document.querySelectorAll('[data-set]').forEach((el) => {
     el.addEventListener('input', () => {
@@ -4374,7 +4897,7 @@ function creationBindForm(read) {
         cSet(creationState.draft, path, value);
       }
       creationState.dirty = true;
-      refreshFlag();
+      creationSetDirty();
     });
   });
   document.querySelectorAll('[data-add-list]').forEach((el) => {
@@ -4385,6 +4908,7 @@ function creationBindForm(read) {
       cSet(creationState.draft, path, list);
       creationState.dirty = true;
       rerender();
+      creationFocusNewRow(`[data-del-list="${path}.${list.length - 1}"]`);
     };
   });
   document.querySelectorAll('[data-del-list]').forEach((el) => {
@@ -4401,11 +4925,13 @@ function creationBindForm(read) {
     el.onclick = () => {
       const path = el.getAttribute('data-add-obj');
       const key = el.getAttribute('data-key');
+      const role = el.getAttribute('data-add-role');
       const list = asList(cGet(creationState.draft, path)).slice();
-      list.push({ [key]: '' });
+      list.push(role ? { [key]: '', role } : { [key]: '' });
       cSet(creationState.draft, path, list);
       creationState.dirty = true;
       rerender();
+      creationFocusNewRow(`[data-del-obj="${path}.${list.length - 1}"]`);
     };
   });
   document.querySelectorAll('[data-del-obj]').forEach((el) => {
@@ -4510,6 +5036,15 @@ async function assistApplyMulti(accept) {
           accepted: group.map((_, i) => i), layer: L });
       const okN = res.results.filter((r) => r.ok).length;
       bad += res.results.filter((r) => !r.ok).length;
+      // 逐条结果按顺序回写进提案对象本身（后端 results[i].index === i，
+      // 而 proposals 这一组就是我们发过去的顺序）。界面上那张卡要靠它决定
+      // 「已进草稿」还是「没进 + 为什么」——只报总数的话，
+      // 点「接受 1 条」的作者不知道自己点的那条到底进没进。
+      group.forEach((p, i) => {
+        const r = res.results[i] || {};
+        p.ok = !!r.ok;
+        p.reason = r.reason || '';
+      });
       if (editing) {
         creationState.draft = res.document;
         creationDraftChanged();
@@ -4586,48 +5121,84 @@ async function draftReview() {
 function creationBindRaw(read) {
   const ta = document.getElementById('creation-text');
   if (!ta) return;
-  ta.addEventListener('input', () => { creationState.dirty = true; });
+  ta.addEventListener('input', () => { creationState.dirty = true; creationSetDirty(); });
   const tabForm = document.getElementById('tab-form');
   if (tabForm) {
     tabForm.onclick = () => {
       creationState.mode = 'form';
       creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
-      creationLoad();
+      creationState.toolsOpen = false;
+      creationRepaint();
     };
   }
-  document.getElementById('creation-save').addEventListener('click', async () => {
-    const btn = document.getElementById('creation-save');
-    btn.disabled = true;
-    btn.textContent = '保存中…';
-    try {
-      const res = await api(
-        `/api/works/${encodeURIComponent(creationState.name)}/creation/${creationState.kind}` +
-        `?key=${encodeURIComponent(creationState.key)}`,
-        { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: ta.value }) }
-      );
-      document.getElementById('creation-check').innerHTML =
-        creationRenderCheck(res.errors, res.warnings) +
-        (res.saved ? '<div class="muted" style="margin-top:6px">已保存。</div>' : '');
-      if (res.saved) {
-        creationState.dirty = false;
-        creationState.data = await getJSON(
-          `/api/works/${encodeURIComponent(creationState.name)}/creation`);
-        const box = document.querySelector('[data-sidebar]');
-        if (box) box.outerHTML = creationRenderSidebar();
-      }
-    } catch (e) {
-      document.getElementById('creation-check').innerHTML = notice('bad', esc(e.message));
-    } finally {
-      btn.disabled = false;
-      btn.textContent = creationState.kind === 'setting' ? '保存原文' : '保存并校验';
+  const tabRaw = document.getElementById('tab-raw');
+  if (tabRaw) {
+    tabRaw.onclick = () => {
+      creationState.mode = 'raw';
+      // 抽屉收起来：原文模式下没有表单草稿，提案无处可落（和 creationRenderTools 一致）
+      creationState.toolsOpen = false;
+      creationRepaint();
+    };
+  }
+  const saveBtn = document.getElementById('creation-save');
+  if (saveBtn) {
+    saveBtn.onclick = () => creationSaveRaw(read);
+    saveBtn.textContent = creationState.kind === 'setting' ? '保存原文' : '保存并校验';
+  }
+}
+
+/* 原文模式落盘。表单那边走 creationSaveForm，两条路各存各的：
+   原文存的是整份文本（手写注释保留），表单存的是草稿对象（重新生成 YAML）。 */
+async function creationSaveRaw(read) {
+  const btn = document.getElementById('creation-save');
+  const ta = document.getElementById('creation-text');
+  if (!btn || !ta) return;
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    const res = await api(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/${creationState.kind}` +
+      `?key=${encodeURIComponent(creationState.key)}`,
+      { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: ta.value }) }
+    );
+    const check = document.getElementById('creation-check');
+    if (check) {
+      check.innerHTML = creationRenderCheck(res.errors, res.warnings)
+        + (res.saved ? '<div class="muted" style="margin-top:6px">已保存。</div>' : '');
     }
-  });
+    if (res.saved) {
+      creationState.dirty = false;
+      creationSay('已保存原文');
+      creationState.data = await getJSON(
+        `/api/works/${encodeURIComponent(creationState.name)}/creation`);
+      // 校验结果进了 state 才算数：分区徽章、汇总 pill、流水线都读它。
+      creationState.issues = {
+        errors: res.errors || [], warnings: res.warnings || [],
+        exists: true, seeded: false,
+      };
+      creationState.read = { ...read, text: ta.value, data: read.data };
+      creationRepaint();
+    }
+  } catch (e) {
+    const check = document.getElementById('creation-check');
+    if (check) check.innerHTML = notice('bad', esc(e.message));
+  } finally {
+    const still = document.getElementById('creation-save');
+    if (still) {
+      still.disabled = false;
+      still.textContent = creationState.kind === 'setting' ? '保存原文' : '保存并校验';
+    }
+  }
 }
 
 async function creationSaveForm() {
   const btn = document.getElementById('creation-save');
-  const note = document.getElementById('draft-flag');
+  // 没有改动就不写盘。设计页的 save()（creation-redesign.html:1208）就是这么做的：
+  // !dirty 时只回一句「没有要保存的改动」。
+  // 这里不只是省一次请求——表单保存是拿草稿**重新生成** YAML，作者手写的注释会没。
+  // 什么都没改却顺手按一下（或误按 Ctrl+S），等于白丢注释。
+  if (!creationState.dirty) { creationSay('没有要保存的改动'); return; }
   btn.disabled = true;
   btn.textContent = '保存中…';
   try {
@@ -4637,18 +5208,18 @@ async function creationSaveForm() {
       { method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: creationState.draft }) }
     );
-    if (note) {
-      note.textContent = res.saved
-        ? '已保存（表单保存会重写 YAML，手写注释不保留）' : '没保存';
-    }
     if (res.saved) {
       creationState.dirty = false;
-      // 保存之后最该看到的反馈是「校验结果变了没有」——哪条阻断消掉了。
-      // 只重画状态那几块，不重画表单，滚动位置和光标都留着。
+      // ⚠️ 顺序：先落盘、后重画。重画会把按钮整个换掉（它是顶栏的一部分），
+      // 所以下面那段 finally 摸到的是已经脱离文档的旧节点——那没关系，
+      // 新节点是干净的、可点的。反过来先重画再保存，按钮会连着两份 handler。
+      creationSay('已保存 · 表单保存会重写 YAML，手写注释不保留');
       await creationRefreshPanels();
+    } else {
+      creationSay('没保存');
     }
   } catch (e) {
-    if (note) note.textContent = `保存失败：${e.message}`;
+    creationSay(`保存失败：${e.message}`);
   } finally {
     btn.disabled = false;
     btn.textContent = SAVE_LABELS[creationState.kind] || '保存';
@@ -4724,21 +5295,24 @@ function creationBindAssist() {
   const propAll = document.getElementById('prop-all');
   if (propAll) propAll.onclick = () => {
     creationState.proposals.forEach((p) => { p.keep = true; });
-    creationLoad();
+    creationRepaint();
   };
   const propNone = document.getElementById('prop-none');
   if (propNone) propNone.onclick = () => {
     creationState.proposals.forEach((p) => { p.keep = false; });
-    creationLoad();
+    creationRepaint();
   };
-  // 「留」这一列的勾选要写回 p.keep：接受时读的是 p.keep，不是 DOM。
+  // 勾选要写回 p.keep：接受时读的是 p.keep，不是 DOM。
   document.querySelectorAll('[data-prop]').forEach((el) => {
     el.onchange = () => {
       const p = creationState.proposals[Number(el.getAttribute('data-prop'))];
-      if (p) p.keep = el.checked;
+      if (!p) return;
+      p.keep = el.checked;
+      const card = el.closest('.prop');
+      if (card) card.classList.toggle('keep', el.checked);
     };
   });  // 「内容」改动就地写回提案：改的是主键（条目表）或 value（字符串数组/单字段）。
-  // 不写回的话，作者在表里改完名字，接受时用的还是模型给的原名。
+  // 不写回的话，作者在卡片里改完名字，接受时用的还是模型给的原名。
   document.querySelectorAll('[data-prop-text]').forEach((el) => {
     el.onchange = () => {
       const p = creationState.proposals[Number(el.getAttribute('data-prop-text'))];
@@ -4748,6 +5322,47 @@ function creationBindAssist() {
       if (p.primary_field === 'value') p.value = text;
       else p.entry = { ...(p.entry || {}), [p.primary_field]: text };
       p.label = `${p.section_label} · ${p.op} · ${text}`;
+    };
+  });
+
+  // 逐条「接受」：只把这一条标成勾选，跑同一套应用流程，再恢复别人的勾选——
+  // 不能顺手把别的勾选也应用掉（作者只是点了一条，不是点了全部）。
+  document.querySelectorAll('[data-prop-ok]').forEach((el) => {
+    el.onclick = async () => {
+      const i = Number(el.getAttribute('data-prop-ok'));
+      const saved = creationState.proposals.map((p) => !!p.keep);
+      creationState.proposals.forEach((p, j) => { p.keep = j === i; });
+      await assistApplyMulti(el);
+      creationState.proposals.forEach((p, j) => { p.keep = saved[j]; });
+      const p = creationState.proposals[i];
+      if (p && p.ok) {
+        p.done = true;   // 进草稿了，别再让作者点第二次（重复会被整批拒收）
+        creationRepaint();
+        creationSay('已进草稿，记得保存');
+      } else if (p) {
+        creationRepaint();
+        creationSay(p.reason ? `没进：${p.reason}` : '没进，看抽屉里的说明');
+      }
+    };
+  });
+  // 「改一改」：直接改卡片里那一行——不另开编辑框，改的就是接受时会用的值。
+  document.querySelectorAll('[data-prop-edit]').forEach((el) => {
+    el.onclick = () => {
+      const i = Number(el.getAttribute('data-prop-edit'));
+      const input = document.querySelector(`[data-prop-text="${i}"]`);
+      if (!input) return;
+      input.focus();
+      input.select();
+      creationSay('直接改这一行的内容，改完点接受');
+    };
+  });
+  document.querySelectorAll('[data-prop-drop]').forEach((el) => {
+    el.onclick = () => {
+      const i = Number(el.getAttribute('data-prop-drop'));
+      creationState.proposals.splice(i, 1);
+      creationPersist();
+      creationRepaint();
+      creationSay('这一条丢掉了');
     };
   });
 
@@ -7819,6 +8434,11 @@ function route() {
     // 每换一页先清掉上一页的子导航与宽容器，由具体的视图再按需装上。
     // 不清的话，从作品页回到书架会留着一条指向别人作品的子导航。
     clearSubNav();
+    // 创作台自带一层「暖纸」外观和一套全宽的顶栏，只属于那一页。
+    // 每换一页先摘掉，由 renderCreation 再按需装上——不摘的话，
+    // 从创作台回到书架，书架会顶着一整页的暖纸底色和两层吸顶栏。
+    document.body.classList.remove('cd-on');
+    document.documentElement.classList.remove('cd-on');
     if (parts[0] === 'work' && parts[1] && WIDE_SEGMENTS.has(parts[2] || '') && mainEl) {
       mainEl.classList.add('wide');
     }
@@ -7917,7 +8537,17 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   const box = document.getElementById('creation-drawer');
-  if (box && !box.hidden) creationToggleTools(false);
+  if (box && box.hasAttribute('data-open')) creationToggleTools(false);
+});
+
+/* ⌘/Ctrl + S 保存。只认创作台这一页——别的页面没有「保存」这件事，
+   抢掉浏览器的默认行为只会更烦人。原文模式和表单模式各存各的那一份。 */
+document.addEventListener('keydown', (e) => {
+  if (!(e.metaKey || e.ctrlKey) || String(e.key).toLowerCase() !== 's') return;
+  if (!document.getElementById('creation-root')) return;
+  e.preventDefault();
+  if (creationState.mode === 'raw') creationSaveRaw(creationState.read || {});
+  else creationSaveForm();
 });
 
 /* 停在 #/import 时再点「导入作品」标签，hash 没变 → 不触发 hashchange → 路由不重跑。
