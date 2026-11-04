@@ -1126,7 +1126,7 @@ ANCHOR_OPENING_LABEL = "开局（第一章的处境，后面会变）："
 ANCHOR_DIRECTION_LABEL = "走向（每一章都要往前推）："
 ANCHOR_WORLD_LABEL = "世界（钉死不偏离）："
 WRITE_BRIEF_ORDER = (
-    "anchor", "recap", "part", "cast", "foreshadow", "hook", "future", "prev"
+    "anchor", "recap", "notes", "part", "cast", "foreshadow", "hook", "future", "prev"
 )
 
 # 写前必读里，哪几块是「丢了就必然写歪」的。其余的是可选材料，预算不够时按比例裁。
@@ -1238,9 +1238,24 @@ def render_recap(work_dir: str | Path, *, upto_chapter_no: int = 0,
             cno = int(ch.get("chapter_no") or 0)
             if upto_chapter_no and cno > upto_chapter_no:
                 break
-            if cno:
-                chapters.append(f"{cno} {ch.get('title') or '（未名）'}"
-                                + (f"（{ch['gist']}）" if ch.get("gist") else ""))
+            if not cno:
+                continue
+            # A5：这一章有「已确认要点」且快照未过期时，用要点摘要；
+            # 否则回退卷表 gist（例如作者还没审要点，或把 notes 删了）。
+            from .chapter_brief import chapter_id_of
+            from .summary import recap_line
+
+            cid = chapter_id_of(int(v.get("vol") or 0), cno)
+            body, source = recap_line(
+                work_dir, cid, vol=int(v.get("vol") or 0), chapter_no=cno,
+                fallback_gist=str(ch.get("gist") or ""),
+            )
+            if not body:
+                chapters.append(f"{cno} {ch.get('title') or '（未名）'}")
+            elif source == "notes":
+                chapters.append(f"{cno} {ch.get('title') or '（未名）'}（要点：{body}）")
+            else:
+                chapters.append(f"{cno} {ch.get('title') or '（未名）'}（{body}）")
         block = f"· {head}"
         if bits:
             block += "｜" + "｜".join(bits)
@@ -1276,12 +1291,31 @@ def render_cast_state(work_dir: str | Path, *, absent_alarm: int = 3) -> str:
         return ""
     latest = (cast.get("counts") or {}).get("latest_chapter_no") or 0
     lines = [f"【角色动态】已经写到第 {latest} 章"]
+    # A1：角色状态优先读「已确认的 state 要点」——那才是正文里实际发生的事。
+    # 作者没确认过就没有，绝不拿大纲里的计划冒充当前状态。
+    from .notes import latest_states
+
+    states = latest_states(work_dir)
+    lead_name = ""
+    try:
+        for c in (load_work_setting(work_dir).get("characters") or []):
+            if isinstance(c, dict) and str(c.get("role") or "") == "主角":
+                lead_name = str(c.get("name") or "")
+                break
+    except (ValueError, OSError):
+        pass
     for r in rows[:12]:
         line = f"· {r['name']}：出场 {r['count']} 章，第 {r['first']}–{r['last']} 章"
         if r["absent"]:
             line += f"，最近一次出场后已隔 {r['absent']} 章"
             if r["absent"] >= absent_alarm:
                 line += "（⚠️ 缺席偏久，要么让他回来，要么交代他去哪了）"
+        key = str(r["name"])
+        st = states.get(key)
+        if not st and key == "主角" and lead_name:
+            st = states.get(lead_name)
+        if st:
+            line += (f"｜当前（第 {st.get('chapter_no')} 章确认）：{st.get('text')}")
         lines.append(line)
     return "\n".join(lines)
 
@@ -1402,6 +1436,8 @@ _WRITE_BRIEF_META: dict[str, tuple[str, str, str]] = {
                "设定集里还没有能钉住全书走向的内容"),
     "recap": ("前情回顾", "70-volume/*.yaml",
               "前面还没有可回顾的卷/章"),
+    "notes": ("已确认章节要点", "90-draft/<前面章节>.notes.json",
+              "前面章节还没有作者确认过的要点"),
     "part": ("本段任务", "70-volume/*.yaml",
              "这一章还不属于任何已规划的段落"),
     "cast": ("角色动态", "80-brief/*.yaml",
@@ -1431,9 +1467,14 @@ def _write_brief_blocks(
 ) -> list[ContextBlock]:
     wd = Path(work_dir)
     prev_chars, prev_full = _prev_tail_config(brief)
+    from .notes import render_notes
+
     candidates = {
         "anchor": render_story_anchor(wd),
         "recap": render_recap(wd, upto_chapter_no=prev_chapter_no or 0),
+        # 要点单独成块：预算账本里能看见它自己的字数。
+        # 混进前情看似省一行标题，代价是作者永远不知道模型有没有真的用到它。
+        "notes": render_notes(wd, before_chapter_no=chapter_no),
         "part": render_part_task(wd, chapter_no=chapter_no),
         "cast": render_cast_state(wd),
         "foreshadow": render_open_foreshadows(wd),
@@ -1448,6 +1489,11 @@ def _write_brief_blocks(
     blocks: list[ContextBlock] = []
     for key in WRITE_BRIEF_ORDER:
         label, source, empty_note = _WRITE_BRIEF_META[key]
+        if key == "notes" and candidates.get("notes"):
+            # 报告里点名是哪几章的 notes、共几条，而不是一个占位路径。
+            from .notes import context_source
+
+            source = context_source(wd, before_chapter_no=chapter_no) or source
         blocks.append(
             ContextBlock(
                 id=key,

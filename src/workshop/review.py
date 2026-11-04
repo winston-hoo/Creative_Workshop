@@ -226,19 +226,79 @@ def _clean_type(value: Any) -> str:
     return kind if kind in TYPE_LABELS else "other"
 
 
+_QUOTE_PUNCT = str.maketrans({
+    "，": ",", "。": ".", "！": "!", "？": "?", "；": ";", "：": ":",
+    "、": ",", "“": '"', "”": '"', "‘": "'", "’": "'",
+    "（": "(", "）": ")", "【": "[", "】": "]", "《": "<", "》": ">",
+    "—": "-", "－": "-", "…": ".",
+})
+
+
+def normalize_quote(text: str) -> str:
+    """比对「同一句」用的归一化：去空白、统一全半角标点、去掉首尾标点。
+
+    只用于**判断重复**，不用于定位——定位必须用原文，否则偏移会错。
+    """
+    raw = re.sub(r"\s+", "", str(text or ""))
+    raw = raw.translate(_QUOTE_PUNCT).lower()
+    return raw.strip(",.!?;:\"'()[]<>-·")
+
+
+def _suppressors(existing_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """上一轮「已采纳」和「已拒绝」都进抑制集。
+
+    已拒绝尤其重要：作者明确说「保留原句」之后，下一次审稿再把同一句提出来，
+    等于没听见作者的裁决。但抑制不是永久封死——作者在界面上点「重新考虑」后
+    （条目带 `reopened_at`），它就不再抑制。
+    """
+    out: list[dict[str, Any]] = []
+    for it in existing_items:
+        status = str(it.get("status") or "")
+        if status not in ("adopted", "rejected"):
+            continue
+        if it.get("reopened_at"):
+            continue
+        quote = str(it.get("evidence") or "").strip()
+        if not quote:
+            continue
+        out.append({
+            "quote": quote,
+            "normalized": normalize_quote(quote),
+            "status": status,
+            "id": str(it.get("id") or ""),
+            "review_id": str(it.get("review_id") or ""),
+            "created_at": str(it.get("review_created_at") or it.get("status_at") or ""),
+            "reject_reason": str(it.get("reject_reason") or ""),
+        })
+    return out
+
+
+def _match_suppressor(
+    evidence: str, suppressors: list[dict[str, Any]]
+) -> tuple[dict[str, Any], str] | None:
+    """先按原文逐字比对，再按归一化比对。返回 (命中条目, 比对方式)。"""
+    norm = normalize_quote(evidence)
+    for row in suppressors:
+        if row["quote"] == evidence:
+            return row, "原文逐字一致"
+    for row in suppressors:
+        if norm and row["normalized"] == norm:
+            return row, "归一化后一致（仅标点/空白不同）"
+    return None
+
+
 def normalize_items(
     raw_items: Any, prose: str, *, existing_items: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """把模型给的条目收成可执行 finding；收不了的写进 invalid（带原因，不静默丢）。
 
-    `existing_items` 是历史审稿条目：引用与建议已采纳过的，新一次审稿再审出同一条，
-    标成 duplicate —— 否则作者会看到「刚改完的那句又被提了一次」。
+    `existing_items` 是历史审稿条目：引用与建议已采纳或已拒绝过的，新一次审稿再审出
+    同一条，标成 duplicate —— 否则作者会看到「刚改完的」或「刚拒绝的」那句又被提一次。
+    抑制只在**引文仍能在当前正文里定位**时成立：正文改过、这句话已经不在了，
+    就属于新情况，不抑制。
     """
     existing_items = existing_items or []
-    adopted_quotes = {
-        str(it.get("evidence") or "") for it in existing_items
-        if str(it.get("status") or "") == "adopted"
-    }
+    suppressors = _suppressors(existing_items)
     items: list[dict[str, Any]] = []
     invalid: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -275,8 +335,20 @@ def normalize_items(
         seen.add(fid)
         status = "open"
         repeat_of = ""
-        if evidence in adopted_quotes:
-            status, repeat_of = "duplicate", "adopted"
+        repeat_reason = ""
+        matched = _match_suppressor(evidence, suppressors)
+        if matched:
+            row_hit, how = matched
+            status = "duplicate"
+            repeat_of = row_hit["status"]
+            repeat_reason = (
+                f"与审稿 {row_hit['review_id'] or '（旧稿）'} 中"
+                f"{'已采纳' if row_hit['status'] == 'adopted' else '已拒绝'}"
+                f"的条目 {row_hit['id'] or ''} 相同（{how}）；"
+                "正文改过且这句仍在，按作者上一次裁决不再重复提出"
+            )
+            if row_hit["status"] == "rejected" and row_hit["reject_reason"]:
+                repeat_reason += f"。上次拒绝理由：{row_hit['reject_reason']}"
         items.append({
             "id": fid,
             "index": len(items),
@@ -291,6 +363,7 @@ def normalize_items(
             "locatable": True,
             "status": status,
             "repeat_of": repeat_of,
+            "repeat_reason": repeat_reason,
             "status_at": "",
             "reject_reason": "",
         })
@@ -503,7 +576,20 @@ def find_review(payload: dict[str, Any], review_id: str) -> dict[str, Any] | Non
 
 
 def all_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return [item for review in payload.get("reviews") or [] for item in review.get("items") or []]
+    """把多次审稿的条目摊平，并附上来源审稿信息。
+
+    附 `review_id` 是为了让「这条为什么不再提」在界面上能说清出处，
+    而不是只给一个 `duplicate` 状态。
+    """
+    out: list[dict[str, Any]] = []
+    for review in payload.get("reviews") or []:
+        for item in review.get("items") or []:
+            out.append({
+                **item,
+                "review_id": review.get("review_id") or "",
+                "review_created_at": review.get("created_at") or "",
+            })
+    return out
 
 
 def effective_status(item: dict[str, Any], review: dict[str, Any], prose_sha: str) -> str:

@@ -214,8 +214,8 @@ def test_write_brief_report_and_config() -> None:
             brief=_brief(2, prev_tail=500, future_count=2), budget_chars=8000,
         )
         ids = [b["id"] for b in report["blocks"]]
-        check(ids == ["anchor", "recap", "part", "cast", "foreshadow", "hook",
-                      "future", "prev"], "八块都在报告里，顺序固定")
+        check(ids == ["anchor", "recap", "notes", "part", "cast", "foreshadow", "hook",
+                      "future", "prev"], "九块都在报告里，顺序固定（notes 独立成块）")
         check(report["used_chars"] == len(text), "报告字数与真实装配文本一致")
         check(report["exact"] is True, "装配账目自洽")
 

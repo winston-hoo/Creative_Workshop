@@ -2341,6 +2341,10 @@ const creationState = {
   proseTaskTimer: null,
   proseVersions: null,   // 历史版本 + 恢复候选（A2/B3）
   proseReview: null,     // 审稿历史 + 最近一次的结构化意见（A3/U4）
+  proseNotes: null,      // 本章要点提案与裁决（A1/U8）
+  proseFinalize: null,   // 定稿后处理分步状态（B5）
+  notesBusyAt: 0,        // 要点操作（抽取/裁决/定稿编排）的忙碌标记
+  notesMsg: '',          // 要点面板的最近一条反馈（重渲染后仍保留）
   reviewBusyAt: 0,       // 审稿请求发起时刻；>0 时显示秒表
   reviewTimer: null,
   toolsOpen: false,    // 右侧工具抽屉（素材库 / 助手）开着没有
@@ -4231,6 +4235,7 @@ function creationRenderDraftResult() {
       直接在这里改。自检只查字数、禁令字面命中、该出场的人漏了谁——钩子和情节机器查不了。
     </div>
     <div id="creation-review-host">${creationRenderReview()}</div>
+    <div id="creation-notes-host">${creationRenderNotes()}</div>
   </div>`;
 }
 
@@ -4264,6 +4269,7 @@ function creationBindDraft() {
   }
   loadProseVersions();
   loadProseReview();
+  loadProseNotes();
   if (!creationState.prosePlan) {
     getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}/plan`)
@@ -4575,12 +4581,17 @@ function creationRenderReview() {
       </div>
       <blockquote class="rv-quote">${reviewSnippet(text, item)}</blockquote>
       <p class="rv-problem">${esc(item.problem || '')}</p>
+      ${item.status === 'duplicate' && item.repeat_reason
+        ? `<p class="muted" style="font-size:12px;margin:4px 0">不再重复提出：${esc(item.repeat_reason)}</p>` : ''}
       ${item.adoptable ? `<textarea class="rv-edit" data-replacement="${esc(item.id)}"
         rows="2" spellcheck="false">${esc(item.suggestion || '')}</textarea>` : ''}
       <div class="row" style="justify-content:flex-end;gap:6px;margin-top:4px">
         <button class="btn sm" data-locate="${esc(item.id)}">定位到正文</button>
         ${['open', 'stale', 'duplicate'].includes(item.status)
           ? `<button class="btn sm" data-reject="${esc(item.id)}">拒绝</button>` : ''}
+        ${item.status === 'rejected'
+          ? `<button class="btn sm" data-reopen="${esc(item.id)}"
+              title="解除抑制：下一次审稿会重新考虑这条">重新考虑</button>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -4658,6 +4669,353 @@ function bindReviewActions() {
   root.querySelectorAll('[data-reject]').forEach((btn) => {
     btn.onclick = () => rejectFinding(btn.dataset.reject);
   });
+  root.querySelectorAll('[data-reopen]').forEach((btn) => {
+    btn.onclick = () => reopenFinding(btn.dataset.reopen);
+  });
+}
+
+/* ── 章节要点 / 定稿后处理（P0 批次 4：A1/A5/B5/U8）──────────
+   抽取出来的只是**提案**：面板里逐条接受/编辑/丢弃，确认过的才进下一章。
+   这里要让人一眼看清三件事：
+     · 本章抽了什么（类型 + 关联角色/伏笔 + 原文依据 + 来自哪次生成）
+     · 哪些会进下一章（只有 accepted/edited，discarded 不会）
+     · 新旧状态冲突在哪（标出来由作者裁决，绝不静默覆盖） */
+
+const NOTE_TYPE_LABEL = { fact: '事实', state: '状态', foreshadow: '伏笔' };
+const NOTE_STATUS_LABEL = {
+  pending: '待确认', accepted: '已接受', edited: '已编辑', discarded: '已丢弃',
+};
+const FINALIZE_STEP_LABEL = {
+  snapshot: '版本快照', notes: '抽章节要点', summary: '摘要快照', state: '角色状态索引',
+};
+
+function notesChapterUrl(suffix) {
+  return `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+    + `${encodeURIComponent(creationState.key)}${suffix || ''}`;
+}
+
+function creationRenderNotes() {
+  const d = creationState.prose;
+  if (!d || !d.exists) return '';
+  const n = creationState.proseNotes;
+  const f = creationState.proseFinalize;
+  const busy = creationState.notesBusyAt > 0;
+  /* notes_state 的 status 是 {status: 稿子状态, review_summary}，
+     比 read_draft 多包了一层；不拆开这里就会渲染成 [object Object]。 */
+  const inner = n && n.status && n.status.status;
+  const status = (typeof inner === 'string' ? inner : (inner && inner.status))
+    || (d.status && d.status.status) || 'draft';
+  const head = `<div class="spread" style="margin-bottom:8px">
+    <div>
+      <b>章节要点回流</b> ${creationRenderDraftStatus({ status })}
+      <span class="muted" style="font-size:12px;margin-left:6px">
+        抽取只提案；只有你接受/编辑的条目会进下一章，丢弃的绝不</span>
+    </div>
+    <div class="row" style="gap:6px">
+      ${busy
+        ? '<span class="muted" id="notes-busy" style="font-size:12px">处理中…</span>'
+        : `<button class="btn" id="notes-extract">${n && n.exists ? '重新抽取…' : '抽取要点…'}</button>`}
+    </div>
+  </div>`;
+
+  if (!n) {
+    return `<div class="notes-box" id="creation-notes-inner">${head}
+      <p class="muted" style="margin:4px 0 0">正在读要点记录…</p></div>`;
+  }
+
+  const sum = n.summary || {};
+  const counts = sum.counts || {};
+  const snap = n.summary_snapshot;
+  const rows = (n.notes || []).map((note) => {
+    const conflict = note.conflict;
+    const locked = note.status === 'discarded';
+    return `<div class="nt-item nt-${esc(note.status)}" data-note="${esc(note.id)}">
+      <div class="nt-head">
+        <span class="nt-type nt-t-${esc(note.type)}">${esc(NOTE_TYPE_LABEL[note.type] || note.type)}</span>
+        <span class="nt-ref">${esc(note.ref || '')}</span>
+        <span class="nt-st nt-s-${esc(note.status)}">${esc(NOTE_STATUS_LABEL[note.status] || note.status)}</span>
+        ${note.in_context ? '<span class="nt-in">会进下一章</span>' : ''}
+        ${conflict ? '<span class="nt-conflict">与既有状态冲突，待裁决</span>' : ''}
+        <span class="grow"></span>
+        <span class="muted" style="font-size:12px">第 ${num(note.chapter_no || 0)} 章 · ${esc(note.type_label || '')}</span>
+      </div>
+      <textarea class="nt-text" data-note-text="${esc(note.id)}" rows="2" spellcheck="false"
+        ${locked ? 'disabled' : ''}>${esc(note.text || '')}</textarea>
+      ${note.evidence ? `<blockquote class="nt-evidence">${esc(note.evidence)}</blockquote>` : ''}
+      ${conflict ? `<div class="nt-conflict-box">
+        旧状态（第 ${num(conflict.chapter_no || 0)} 章）：${esc(conflict.text || '')}
+        <br><span class="muted">接受新状态会把旧条目标为「已被取代」，原文与历史都保留。</span>
+      </div>` : ''}
+      <div class="nt-meta muted">
+        来自 ${esc((note.source_generation && note.source_generation.model) || '—')}
+        · 生成 ${esc(when((note.source_generation || {}).at || n.generated_at))}
+        ${note.confirmed_by ? ` · ${esc(note.confirmed_by)}于 ${esc(when(note.confirmed_at))}确认` : ''}
+        ${note.superseded_by ? ` · 已被 ${esc(note.superseded_by)} 取代` : ''}
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:6px;margin-top:4px">
+        ${note.status !== 'accepted' && !locked
+          ? `<button class="btn sm primary" data-note-accept="${esc(note.id)}">接受</button>` : ''}
+        ${!locked && note.status !== 'edited'
+          ? `<button class="btn sm" data-note-edit="${esc(note.id)}">保存编辑</button>` : ''}
+        ${locked
+          ? `<button class="btn sm" data-note-reset="${esc(note.id)}">退回待确认</button>`
+          : `<button class="btn sm" data-note-discard="${esc(note.id)}">丢弃</button>`}
+        ${note.status !== 'pending'
+          ? `<button class="btn sm" data-note-reset="${esc(note.id)}">退回</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const finalizeBox = status === 'final' ? `<div class="nt-finalize">
+      <div class="spread" style="margin-bottom:6px">
+        <div><b>定稿后处理</b>
+          <span class="muted" style="font-size:12px">幂等：同一份正文重复跑不会重复写、不重复花钱</span></div>
+        <div class="row" style="gap:6px">
+          <button class="btn" id="finalize-run" ${busy ? 'disabled' : ''}>
+            ${(f && f.status === 'done') ? '重新检查' : '开始定稿处理…'}</button>
+        </div>
+      </div>
+      <div class="nt-steps">${Object.keys(FINALIZE_STEP_LABEL).map((step) => {
+        const st = (f && f.steps && f.steps[step]) || {};
+        const label = FINALIZE_STEP_LABEL[step];
+        const state = st.status || 'pending';
+        const extra = st.skipped ? '（已做过，跳过）'
+          : (st.count != null ? `（${num(st.count)} 条要点）` : '')
+            + (st.characters != null ? `（${num(st.characters)} 个角色）` : '');
+        return `<div class="nt-step nt-step-${esc(state)}">
+          <span>${esc(label)}</span><span class="muted">${esc(state)}${esc(extra)}</span>
+          ${state === 'failed'
+            ? `<button class="btn sm" data-finalize-step="${esc(step)}">只重试这一步</button>` : ''}
+          ${st.error ? `<div class="muted" style="font-size:12px">${esc(st.error)}</div>` : ''}
+        </div>`;
+      }).join('')}</div>
+      ${f && f.outdated ? notice('warn', '正文在这次定稿处理之后又改过：下面的结论已过期，需要重跑。') : ''}
+    </div>` : '';
+
+  return `<div class="notes-box" id="creation-notes-inner">
+    ${head}
+    ${sum.total
+      ? `<div class="muted" style="font-size:12px;margin-bottom:8px">
+          共 ${num(sum.total)} 条：待确认 ${num(counts.pending || 0)}
+          · 已接受 ${num(counts.accepted || 0)} · 已编辑 ${num(counts.edited || 0)}
+          · 已丢弃 ${num(counts.discarded || 0)}
+          · <b>会进下一章 ${num(sum.in_context || 0)} 条</b>
+          ${sum.conflicts ? ` · <span style="color:#b45309">${num(sum.conflicts)} 条待裁决冲突</span>` : ''}
+          <br>来源：${esc((n.source && n.source.model) || '—')} · ${esc(when(n.generated_at))}
+          · <code>${esc((sum.path) || '')}</code>
+        </div>`
+      : `<p class="muted" style="margin:4px 0 8px">
+          还没有要点提案。点「抽取要点…」让模型读这一章，产出 5–8 条事实/状态/伏笔；
+          这一步会花钱，且结果要你逐条确认后才会被下一章使用。</p>`}
+    <div class="nt-list">${rows}</div>
+    ${(n.invalid || []).length
+      ? `<details class="nt-invalid"><summary>${num(n.invalid.length)} 条未入库（校验不通过）</summary>
+          <ul style="margin:6px 0 0 18px">${n.invalid.map((x) =>
+            `<li>${esc(x.reason || '')}${x.text ? `：${esc(x.text)}` : ''}</li>`).join('')}</ul>
+        </details>` : ''}
+    <div class="nt-snap">
+      <div><b>摘要快照（A5）</b>
+        <span class="muted" style="font-size:12px">前情优先读已确认要点；要点一改，快照即标过期并回退卷摘要</span></div>
+      ${snap
+        ? `<div class="muted" style="font-size:12px;margin-top:4px">
+            ${snap.available ? esc(snap.summary || '') : '没有已确认要点，前情回退卷摘要'}
+            ${snap.stale ? '<span class="nt-conflict"> · 已过期</span>' : ' · 与来源一致'}
+            <br>source ${esc(String(snap.source_sha || '').slice(0, 12))}
+            · 当前 ${esc(String(snap.current_source_sha || '').slice(0, 12))}
+            · ${num(snap.note_count || 0)} 条要点 · ${esc(when(snap.built_at))}
+          </div>`
+        : '<div class="muted" style="font-size:12px;margin-top:4px">还没有快照（定稿处理或下面的按钮可建）</div>'}
+      <div class="row" style="justify-content:flex-end;margin-top:6px">
+        <button class="btn sm" id="notes-rebuild-summary" ${busy ? 'disabled' : ''}>重建摘要快照</button>
+      </div>
+    </div>
+    ${finalizeBox}
+    <div id="notes-note" class="muted" style="font-size:12px;margin-top:6px">${esc(creationState.notesMsg || '')}</div>
+  </div>`;
+}
+
+function loadProseNotes() {
+  if (creationState.kind !== 'brief' || !creationState.key) return Promise.resolve();
+  const chapter = creationState.key;
+  const render = () => {
+    const host = document.getElementById('creation-notes-host');
+    if (!host) return;
+    host.innerHTML = creationRenderNotes();
+    bindNotesActions();
+  };
+  return Promise.all([
+    getJSON(notesChapterUrl('/notes')).catch(() => null),
+    getJSON(notesChapterUrl('/finalize')).catch(() => null),
+  ]).then(([notes, fin]) => {
+    if (creationState.key !== chapter) return undefined;
+    creationState.proseNotes = notes;
+    creationState.proseFinalize = fin;
+    return render();
+  });
+}
+
+function notesSay(text) {
+  creationState.notesMsg = text || '';
+  const el = document.getElementById('notes-note');
+  if (el) el.textContent = creationState.notesMsg;
+}
+
+function notesRerender() {
+  const host = document.getElementById('creation-notes-host');
+  if (!host) return;
+  host.innerHTML = creationRenderNotes();
+  bindNotesActions();
+}
+
+function bindNotesActions() {
+  const root = document.getElementById('creation-notes-inner');
+  if (!root) return;
+  const extract = document.getElementById('notes-extract');
+  if (extract) extract.onclick = () => extractProseNotes();
+  const rebuild = document.getElementById('notes-rebuild-summary');
+  if (rebuild) rebuild.onclick = () => rebuildNotesSummary();
+  const runFin = document.getElementById('finalize-run');
+  if (runFin) runFin.onclick = () => runFinalizeSteps([]);
+  root.querySelectorAll('[data-finalize-step]').forEach((btn) => {
+    btn.onclick = () => runFinalizeSteps([btn.dataset.finalizeStep]);
+  });
+  const noteText = (id) => {
+    const el = root.querySelector(`[data-note-text="${id}"]`);
+    return el ? el.value : '';
+  };
+  root.querySelectorAll('[data-note-accept]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteAccept, 'accept', noteText(btn.dataset.noteAccept));
+  });
+  root.querySelectorAll('[data-note-edit]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteEdit, 'edit', noteText(btn.dataset.noteEdit));
+  });
+  root.querySelectorAll('[data-note-discard]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteDiscard, 'discard', '');
+  });
+  root.querySelectorAll('[data-note-reset]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteReset, 'reset', '');
+  });
+}
+
+async function extractProseNotes() {
+  if (creationState.notesBusyAt) return;
+  const ok = await askConfirm({
+    title: '从这一章正文抽要点？',
+    html: `<p style="margin:0">模型会读完整章，抽 5–8 条 <b>事实 / 状态 / 伏笔</b>。
+      这是另一笔调用；抽出来的只是提案，要你在下面逐条接受后才会进下一章。</p>
+      <p class="muted" style="margin:8px 0 0">不会改动正文，也不会写进你的设定集。</p>`,
+    confirmLabel: '开始抽取',
+  });
+  if (!ok) return;
+  creationState.notesBusyAt = Date.now();
+  notesRerender();
+  try {
+    const res = await postJSON(notesChapterUrl('/notes/extract'), {});
+    creationState.proseNotes = res.notes;
+    creationState.proseFinalize = creationState.proseFinalize;
+    notesSay(`抽出 ${num(res.added || 0)} 条，${num((res.invalid || []).length)} 条校验未通过。逐条确认才会进下一章。`);
+    notesRerender();
+  } catch (e) {
+    await tellUser('抽取失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function decideNote(noteId, action, text) {
+  if (creationState.notesBusyAt) return;
+  if (action === 'discard') {
+    const ok = await askConfirm({
+      title: '丢弃这条要点？',
+      html: '<p style="margin:0">丢弃后它不会进下一章上下文；以后想反悔可以点「退回待确认」。</p>',
+      confirmLabel: '丢弃',
+    });
+    if (!ok) return;
+  }
+  creationState.notesBusyAt = Date.now();
+  try {
+    const res = await postJSON(notesChapterUrl(`/notes/${encodeURIComponent(noteId)}`), {
+      action, text: text || '', reason: action === 'discard' ? '作者丢弃' : '',
+    });
+    creationState.proseNotes = res.notes;
+    notesSay(action === 'accept' ? '已接受：这条会进下一章装配。'
+      : action === 'edit' ? '已按你的改写保存并接受。'
+        : action === 'discard' ? '已丢弃：不会进下一章。' : '已退回待确认。');
+    notesRerender();
+  } catch (e) {
+    await tellUser('操作失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function rebuildNotesSummary() {
+  if (creationState.notesBusyAt) return;
+  creationState.notesBusyAt = Date.now();
+  try {
+    const res = await postJSON(notesChapterUrl('/summary/rebuild'), {});
+    creationState.proseNotes = null;
+    await loadProseNotes();
+    notesSay(`快照已重建：source ${String((res.snapshot || {}).source_sha || '').slice(0, 12)}。`);
+  } catch (e) {
+    await tellUser('重建失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function runFinalizeSteps(steps) {
+  if (creationState.notesBusyAt) return;
+  const only = (steps || []).length ? `只重试「${FINALIZE_STEP_LABEL[steps[0]] || steps[0]}」这一步。` : '';
+  const ok = await askConfirm({
+    title: '跑定稿后处理？',
+    html: `<p style="margin:0">会依次做：${Object.values(FINALIZE_STEP_LABEL).join(' → ')}。
+      ${only}</p>
+      <p class="muted" style="margin:8px 0 0">如果还没抽过要点，这一步会调模型（会花钱）；
+      已做过的步骤会跳过，不会重复写。</p>`,
+    confirmLabel: '开始',
+  });
+  if (!ok) return;
+  creationState.notesBusyAt = Date.now();
+  notesRerender();
+  try {
+    const res = await postJSON(notesChapterUrl('/finalize'), {
+      steps: steps || [], force: false,
+    });
+    creationState.proseFinalize = res;
+    creationState.proseNotes = null;
+    await loadProseNotes();
+    notesSay(`定稿处理：${res.status}。`);
+  } catch (e) {
+    await tellUser('定稿处理失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function reopenFinding(findingId) {
+  const reviewId = currentReviewId();
+  if (!reviewId) return;
+  const ok = await askConfirm({
+    title: '重新考虑这条已拒绝的意见？',
+    html: '<p style="margin:0">解除抑制后，<b>下一次审稿</b>会重新判断这条；'
+      + '本次不会立刻改正文。</p>',
+    confirmLabel: '重新考虑',
+  });
+  if (!ok) return;
+  try {
+    await postJSON(reviewChapterUrl(
+      `/reviews/${encodeURIComponent(reviewId)}/reopen/${encodeURIComponent(findingId)}`), {});
+    creationState.proseReview = null;
+    await loadProseReview();
+    reviewNote('已解除抑制：下次审稿会重新考虑这一条。');
+  } catch (e) {
+    await tellUser('操作失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
 }
 
 async function runProseReview() {

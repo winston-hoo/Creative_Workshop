@@ -1077,6 +1077,31 @@ class ReviewRejectBody(BaseModel):
     reason: str = ""
 
 
+class ReviewReopenBody(BaseModel):
+    reason: str = ""
+
+
+class NotesExtractBody(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    max_tokens: int = Field(default=3000, ge=1024, le=16000)
+
+
+class NoteUpdateBody(BaseModel):
+    """U8 的四种裁决：accept / edit / discard / reset。"""
+
+    action: str = Field(..., pattern="^(accept|edit|discard|reset)$")
+    text: str = ""
+    reason: str = ""
+
+
+class FinalizeBody(BaseModel):
+    """只跑指定步骤，方便单步重试。"""
+
+    steps: list[str] = Field(default_factory=list)
+    force: bool = False
+
+
 class DraftStatusBody(BaseModel):
     to: str
     reason: str = ""
@@ -1126,6 +1151,90 @@ def api_review_reject(name: str, chapter_id: str, review_id: str, body: ReviewRe
         return services.reject_review_findings(
             PATHS, safe_name(name), chapter_id, review_id,
             body.finding_ids, body.reason,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/reviews/{review_id}/reopen/{finding_id}")
+def api_review_reopen(
+    name: str, chapter_id: str, review_id: str, finding_id: str,
+    body: ReviewReopenBody,
+) -> dict:
+    """作者要求重新考虑某条已拒绝意见：解除对它的下次抑制。"""
+    try:
+        return services.reopen_review_finding(
+            PATHS, safe_name(name), chapter_id, review_id, finding_id, body.reason,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# ── 章节要点 / 定稿后处理（A1 / A5 / B5 / U8）──────────────
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/notes")
+def api_notes_state(name: str, chapter_id: str) -> dict:
+    """本章抽取了什么、每条裁决状态、以及哪些会进下一章。纯读。"""
+    try:
+        return services.notes_state(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/notes/extract")
+def api_notes_extract(name: str, chapter_id: str, body: NotesExtractBody) -> dict:
+    """从正文抽要点（会花钱）。结果是**提案**，等作者逐条接受/编辑/丢弃。"""
+    from workshop.notes import NotesPayloadError
+
+    try:
+        return services.extract_notes(
+            PATHS, safe_name(name), chapter_id,
+            provider_id=body.provider, model_id=body.model, max_tokens=body.max_tokens,
+        )
+    except NotesPayloadError as exc:
+        raise HTTPException(422, f"[{exc.code}] {exc}") from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/notes/{note_id}")
+def api_note_update(name: str, chapter_id: str, note_id: str, body: NoteUpdateBody) -> dict:
+    """U8：逐条接受 / 编辑 / 丢弃 / 退回。只有 accept/edit 会进下一章。"""
+    try:
+        return services.update_chapter_note(
+            PATHS, safe_name(name), chapter_id, note_id,
+            action=body.action, text=body.text, reason=body.reason,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/summary/rebuild")
+def api_summary_rebuild(name: str, chapter_id: str) -> dict:
+    """按当前已确认要点重建这一章的摘要快照（A5）。纯脚本。"""
+    try:
+        return services.rebuild_summary_snapshot(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/finalize")
+def api_finalize_status(name: str, chapter_id: str) -> dict:
+    """定稿后处理的分步状态（B5）。纯读。"""
+    try:
+        return services.finalize_status(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/finalize")
+def api_finalize_run(name: str, chapter_id: str, body: FinalizeBody) -> dict:
+    """跑定稿后处理。幂等；`steps` 可只重试某一步，`force` 强制重算。"""
+    try:
+        return services.run_finalize(
+            PATHS, safe_name(name), chapter_id,
+            steps=body.steps or None, force=body.force,
         )
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
