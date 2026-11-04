@@ -1059,6 +1059,98 @@ def api_restore_version(name: str, chapter_id: str, version_id: str) -> dict:
         raise HTTPException(400, str(exc)) from exc
 
 
+class DraftReviewBody(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    max_tokens: int = Field(default=4000, ge=1024, le=16000)
+
+
+class ReviewApplyBody(BaseModel):
+    """采纳：只动勾中的那几条；replacements 是作者在界面上改过的改写文本。"""
+
+    finding_ids: list[str] = Field(default_factory=list)
+    replacements: dict[str, str] = Field(default_factory=dict)
+
+
+class ReviewRejectBody(BaseModel):
+    finding_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class DraftStatusBody(BaseModel):
+    to: str
+    reason: str = ""
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/review")
+def api_draft_review(name: str, chapter_id: str, body: DraftReviewBody) -> dict:
+    """审**正文**（会花钱）：产出结构化意见，正文一个字节都不动。"""
+    from workshop.review import ReviewPayloadError
+
+    try:
+        return services.review_draft(
+            PATHS, safe_name(name), chapter_id,
+            provider_id=body.provider, model_id=body.model, max_tokens=body.max_tokens,
+        )
+    except ReviewPayloadError as exc:
+        raise HTTPException(422, f"[{exc.code}] {exc}") from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/reviews")
+def api_draft_reviews(name: str, chapter_id: str) -> dict:
+    """审稿历史 + 最近一次的条目（A3：可查历史、可对比）。"""
+    try:
+        return services.review_history(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/reviews/{review_id}/apply")
+def api_review_apply(name: str, chapter_id: str, review_id: str, body: ReviewApplyBody) -> dict:
+    """逐条采纳并**真的写回正文**；写回前自动存版本快照。"""
+    try:
+        return services.apply_review_findings(
+            PATHS, safe_name(name), chapter_id, review_id,
+            body.finding_ids, body.replacements,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/reviews/{review_id}/reject")
+def api_review_reject(name: str, chapter_id: str, review_id: str, body: ReviewRejectBody) -> dict:
+    """拒绝也落盘：以后能看到「这条当时为什么没采纳」。"""
+    try:
+        return services.reject_review_findings(
+            PATHS, safe_name(name), chapter_id, review_id,
+            body.finding_ids, body.reason,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/status")
+def api_draft_status(name: str, chapter_id: str) -> dict:
+    """D5 稿子状态：draft / reviewed / final，带迁移历史。"""
+    try:
+        return services.draft_status(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/status")
+def api_draft_set_status(name: str, chapter_id: str, body: DraftStatusBody) -> dict:
+    """改状态。未审不能定稿；定稿后要重写必须显式 reopen（走 draft 状态）。"""
+    try:
+        return services.set_draft_status(
+            PATHS, safe_name(name), chapter_id, body.to, reason=body.reason,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/works/{name}/creation/draft/{chapter_id}")
 def api_draft_read(name: str, chapter_id: str) -> dict:
     """读已写的正文，并**按当前指令重跑一次自检**（指令改过，结论要跟着变）。"""

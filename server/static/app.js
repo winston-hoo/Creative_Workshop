@@ -2340,6 +2340,9 @@ const creationState = {
   proseTaskLoaded: false,
   proseTaskTimer: null,
   proseVersions: null,   // 历史版本 + 恢复候选（A2/B3）
+  proseReview: null,     // 审稿历史 + 最近一次的结构化意见（A3/U4）
+  reviewBusyAt: 0,       // 审稿请求发起时刻；>0 时显示秒表
+  reviewTimer: null,
   toolsOpen: false,    // 右侧工具抽屉（素材库 / 助手）开着没有
   toolsPane: 'kb',     // 抽屉里当前在看哪个页签
   rerenderForm: null,  // 草稿被别处换掉之后的整页重画（见 creationDraftChanged）
@@ -4184,7 +4187,7 @@ function creationRenderDraft() {
     <div id="creation-recovery-host">${creationRenderRecovery()}</div>
     <div class="row" style="justify-content:flex-end;margin-top:8px">
       <button class="btn" id="draft-review" ${plan.has_draft ? '' : 'disabled'}
-        title="按技法审查维度审这一章，意见落成对本章指令的修正">技法审稿…</button>
+        title="按技法审查维度审这一章，意见落成对本章指令的修正">审指令…</button>
       <button class="btn" id="draft-writeback" ${plan.has_draft ? '' : 'disabled'}
         title="${plan.has_draft ? '' : '还没有正文，没什么可回填的'}">回填到设定集…</button>
       <button class="btn primary" id="draft-go" ${plan.ready && !taskRunning ? '' : 'disabled'}>
@@ -4203,7 +4206,8 @@ function creationRenderDraftResult() {
   return `<div class="blk">
     <div class="spread" style="margin-bottom:10px">
       <div>
-        <h3 style="margin:0 0 2px">${esc(creationState.key)} 正文</h3>
+        <h3 style="margin:0 0 2px">${esc(creationState.key)} 正文
+          ${creationRenderDraftStatus(d.status)}</h3>
         <span class="muted" style="font-size:12px">
           ${num(stats.chars || 0)} 字（目标 ${(stats.word_range || []).join('–')}）
           ${stats.in_range ? '· 在区间内' : '· 不在区间内'}
@@ -4226,6 +4230,7 @@ function creationRenderDraftResult() {
     <div id="draft-save-note" class="muted" style="font-size:12px;margin-top:6px">
       直接在这里改。自检只查字数、禁令字面命中、该出场的人漏了谁——钩子和情节机器查不了。
     </div>
+    <div id="creation-review-host">${creationRenderReview()}</div>
   </div>`;
 }
 
@@ -4258,6 +4263,7 @@ function creationBindDraft() {
       .catch(() => {});
   }
   loadProseVersions();
+  loadProseReview();
   if (!creationState.prosePlan) {
     getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}/plan`)
@@ -4323,6 +4329,7 @@ function creationBindDraft() {
   if (rv) rv.onclick = () => draftReview();
   bindProseTaskActions();
   bindRecoveryActions();
+  bindReviewActions();
 }
 
 function clearProseTaskTimer() {
@@ -4454,6 +4461,357 @@ function bindRecoveryActions() {
   });
 }
 
+/* ── 正文审稿（P0 批次 3：D1/D2/D3/D5/U4）────────────────────
+   意见不是一段散文点评：每条都有「正文原句 + 偏移 + 问题 + 改写」。
+   界面要做的是让作者**看得到它指哪一句**、能逐条勾选/拒绝，
+   勾完写回正文时真的只动那几处（服务端按偏移替换，写前存版本）。
+
+   长正文（三五千字）下不能卡：这里只渲染每条的引文片段（前后各 40 字），
+   不把整章塞进每条卡片；定位用的是偏移，不是全页搜索。 */
+
+const REVIEW_STATUS_LABEL = {
+  open: '未处理', adopted: '已采纳', rejected: '已拒绝',
+  stale: '已过期', duplicate: '已处理过',
+};
+const REVIEW_SEV_LABEL = { blocker: '阻断', major: '主要', minor: '次要' };
+const DRAFT_STATUS_LABEL = { draft: '草稿', reviewed: '已审', final: '已定稿' };
+
+function creationRenderDraftStatus(status) {
+  const s = (status && status.status) || 'draft';
+  const label = DRAFT_STATUS_LABEL[s] || s;
+  return `<span class="draft-status ds-${esc(s)}">${esc(label)}</span>`;
+}
+
+function reviewChapterUrl(suffix) {
+  return `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+    + `${encodeURIComponent(creationState.key)}${suffix || ''}`;
+}
+
+function currentReviewId() {
+  const latest = creationState.proseReview && creationState.proseReview.latest;
+  return latest ? latest.review_id : '';
+}
+
+function reviewNote(text) {
+  const el = document.getElementById('review-note');
+  if (el) el.textContent = text || '';
+}
+
+/* 只显示引文左右各 40 字，并把原句包进 mark。
+   直接渲染整段甚至整章会让 12 张卡片各扛一份长文本，滚动时明显发涩。 */
+function reviewSnippet(text, item) {
+  const evidence = String(item.evidence || '');
+  const source = String(text || '');
+  let start = Number(item.start);
+  if (!(start >= 0) || source.slice(start, start + evidence.length) !== evidence) {
+    start = source.indexOf(evidence);
+  }
+  if (start < 0) return esc(evidence);
+  const from = Math.max(0, start - 40);
+  const to = Math.min(source.length, start + evidence.length + 40);
+  const before = source.slice(from, start).replace(/\s*\n\s*/g, ' ');
+  const after = source.slice(start + evidence.length, to).replace(/\s*\n\s*/g, ' ');
+  return `${from > 0 ? '…' : ''}${esc(before)}<mark>${esc(evidence)}</mark>`
+    + `${esc(after)}${to < source.length ? '…' : ''}`;
+}
+
+function creationRenderReview() {
+  const d = creationState.prose;
+  if (!d || !d.exists) return '';
+  const r = creationState.proseReview;
+  const status = (r && r.status && r.status.status)
+    || (d.status && d.status.status) || 'draft';
+  const busy = creationState.reviewBusyAt > 0;
+  const head = `<div class="spread" style="margin-bottom:8px">
+    <div>
+      <b>正文审稿</b> ${creationRenderDraftStatus({ status })}
+      <span class="muted" style="font-size:12px;margin-left:6px">
+        意见逐条定位到原句；采纳写回正文前自动存版本</span>
+    </div>
+    <div class="row" style="gap:6px">
+      ${busy
+        ? '<span class="muted" id="review-busy" style="font-size:12px">正在审…</span>'
+        : (status === 'final' ? ''
+          : `<button class="btn" id="review-run">${r && r.latest ? '再审一次…' : '审这一章正文…'}</button>`)}
+      ${status === 'reviewed' ? '<button class="btn primary" id="review-final">标为定稿</button>' : ''}
+      ${status === 'final' ? '<button class="btn" id="review-reopen">重新打开</button>' : ''}
+      ${status === 'draft'
+        ? '<button class="btn" id="review-final" disabled title="先审稿，才能定稿">标为定稿</button>' : ''}
+    </div>
+  </div>`;
+
+  if (!r) {
+    return `<div class="review-box" id="creation-review-inner">${head}
+      <p class="muted" style="margin:4px 0 0">正在读审稿记录…</p></div>`;
+  }
+  const latest = r.latest;
+  if (!latest) {
+    return `<div class="review-box" id="creation-review-inner">${head}
+      <p class="muted" style="margin:4px 0 0">
+        还没有审过这一章。点「审这一章正文…」让模型逐句找问题——会读完整章与技法维度，
+        通常几十秒；正文不会被改动，意见只列在下面，由你逐条选择。</p></div>`;
+  }
+
+  const text = d.text || '';
+  const stale = String(latest.prose_sha || '') !== String(r.prose_sha || '');
+  const items = latest.items || [];
+  const count = (s) => items.filter((i) => i.status === s).length;
+  const adoptable = items.filter((i) => i.adoptable);
+
+  const rows = items.map((item) => {
+    const stLabel = REVIEW_STATUS_LABEL[item.status] || item.status;
+    const sevLabel = REVIEW_SEV_LABEL[item.severity] || item.severity;
+    const pick = item.adoptable
+      ? `<label class="rv-pick"><input type="checkbox" data-pick="${esc(item.id)}"> 采纳</label>`
+      : `<span class="muted" style="font-size:12px">${esc(REVIEW_STATUS_LABEL[item.status] || '')}</span>`;
+    return `<div class="rv-item${item.adoptable ? '' : ' rv-dim'}" data-finding="${esc(item.id)}">
+      <div class="rv-head">
+        <span class="sev sev-${esc(item.severity)}">${esc(sevLabel)}</span>
+        <span class="rv-type">${esc(item.type_label || '')}</span>
+        <span class="rv-st st-${esc(item.status)}">${esc(stLabel)}</span>
+        <span class="grow"></span>
+        <span class="muted" style="font-size:12px">第 ${num(item.paragraph || 0)} 段</span>
+        ${pick}
+      </div>
+      <blockquote class="rv-quote">${reviewSnippet(text, item)}</blockquote>
+      <p class="rv-problem">${esc(item.problem || '')}</p>
+      ${item.adoptable ? `<textarea class="rv-edit" data-replacement="${esc(item.id)}"
+        rows="2" spellcheck="false">${esc(item.suggestion || '')}</textarea>` : ''}
+      <div class="row" style="justify-content:flex-end;gap:6px;margin-top:4px">
+        <button class="btn sm" data-locate="${esc(item.id)}">定位到正文</button>
+        ${['open', 'stale', 'duplicate'].includes(item.status)
+          ? `<button class="btn sm" data-reject="${esc(item.id)}">拒绝</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const histRows = (r.reviews || []).slice(0, 8).map((x) => `<div class="rv-hist-row">
+    <code>${esc(x.review_id)}</code>
+    <span class="muted">${esc(when(x.created_at))} · ${num(x.count)} 条
+      · 采纳 ${num(x.counts.adopted || 0)} · 拒绝 ${num(x.counts.rejected || 0)}
+      · 未处理 ${num(x.counts.open || 0)}${x.stale ? ' · 正文已改，意见过期' : ''}</span>
+  </div>`).join('');
+
+  return `<div class="review-box" id="creation-review-inner">
+    ${head}
+    ${stale ? notice('warn', '正文在这次审稿之后改过，下面的条目已过期：'
+      + '定位和采纳都已关闭。要处理请先「再审一次」。') : ''}
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      ${esc(when(latest.created_at))} · ${num(latest.chars || 0)} 字 · ${num(items.length)} 条意见
+      ${(latest.invalid || []).length
+        ? ` · ${num(latest.invalid.length)} 条定位不到已丢弃` : ''}
+      · 未处理 ${num(count('open'))} · 已采纳 ${num(count('adopted'))}
+      · 已拒绝 ${num(count('rejected'))}
+      ${latest.summary ? `<br><b>总评：</b>${esc(latest.summary)}` : ''}
+    </div>
+    <div class="rv-list">${rows || '<p class="muted" style="margin:0">这次没提得出可执行的意见。</p>'}</div>
+    <div class="row" style="justify-content:flex-end;gap:8px;margin-top:8px">
+      <button class="btn" id="review-check-all" ${adoptable.length ? '' : 'disabled'}>
+        全选可采纳（${num(adoptable.length)}）</button>
+      <button class="btn primary" id="review-apply" ${adoptable.length ? '' : 'disabled'}>
+        采纳选中并写回</button>
+    </div>
+    <div id="review-note" class="muted" style="font-size:12px;margin-top:6px"></div>
+    ${histRows ? `<details class="rv-history"><summary>审稿历史（${(r.reviews || []).length} 次）</summary>
+      ${histRows}</details>` : ''}
+  </div>`;
+}
+
+function loadProseReview() {
+  if (creationState.kind !== 'brief' || !creationState.key) return Promise.resolve();
+  const chapter = creationState.key;
+  const render = () => {
+    const host = document.getElementById('creation-review-host');
+    if (!host) return;
+    host.innerHTML = creationRenderReview();
+    bindReviewActions();
+  };
+  if (creationState.proseReview) return Promise.resolve(render());
+  return getJSON(reviewChapterUrl('/reviews'))
+    .then((data) => {
+      if (creationState.key !== chapter) return undefined;
+      creationState.proseReview = data;
+      return render();
+    })
+    .catch(() => undefined);
+}
+
+function bindReviewActions() {
+  const root = document.getElementById('creation-review-inner');
+  if (!root) return;
+  const run = document.getElementById('review-run');
+  if (run) run.onclick = () => runProseReview();
+  const finalBtn = document.getElementById('review-final');
+  if (finalBtn && !finalBtn.disabled) finalBtn.onclick = () => setProseStatus('final');
+  const reopen = document.getElementById('review-reopen');
+  if (reopen) reopen.onclick = () => setProseStatus('draft');
+  const checkAll = document.getElementById('review-check-all');
+  if (checkAll) checkAll.onclick = () => {
+    root.querySelectorAll('[data-pick]').forEach((box) => { box.checked = true; });
+    reviewNote('已全选可采纳项，点「采纳选中并写回」才会动正文。');
+  };
+  const apply = document.getElementById('review-apply');
+  if (apply) apply.onclick = () => applyReviewFindings();
+  root.querySelectorAll('[data-locate]').forEach((btn) => {
+    btn.onclick = () => locateFinding(btn.dataset.locate);
+  });
+  root.querySelectorAll('[data-reject]').forEach((btn) => {
+    btn.onclick = () => rejectFinding(btn.dataset.reject);
+  });
+}
+
+async function runProseReview() {
+  if (creationState.reviewBusyAt) return;
+  const plan = creationState.prosePlan || {};
+  const cost = plan.est_cost_cny == null ? '' : `生成那次的参考价约 ¥${plan.est_cost_cny}；`;
+  const ok = await askConfirm({
+    title: '审这一章的正文？',
+    html: `<p style="margin:0">会读完整章 + 设定摘要 + 技法审查维度，产出逐句可定位的意见。
+      ${esc(cost)}这次审稿是另一笔调用。</p>
+      <p class="muted" style="margin:8px 0 0">正文不会被改动；意见只落盘并在下面列出，由你逐条选择。</p>`,
+    confirmLabel: '开始审稿',
+  });
+  if (!ok) return;
+
+  creationState.reviewBusyAt = Date.now();
+  const inner = document.getElementById('creation-review-inner');
+  if (inner) { inner.innerHTML = creationRenderReview(); bindReviewActions(); }
+  const tick = () => {
+    const el = document.getElementById('review-busy');
+    if (!el) return;
+    const secs = ((Date.now() - creationState.reviewBusyAt) / 1000).toFixed(0);
+    el.textContent = `正在审… ${secs}s（读完整章后逐条核对引文）`;
+  };
+  tick();
+  creationState.reviewTimer = setInterval(tick, 1000);
+  try {
+    const res = await postJSON(reviewChapterUrl('/review'), {});
+    const items = res.items || [];
+    await tellUser('审稿完成', `<p style="margin:0">共 ${num(items.length)} 条意见
+      ${res.invalid && res.invalid.length ? `，另有 ${num(res.invalid.length)} 条引文对不上正文已丢弃` : ''}。</p>
+      <p class="muted" style="margin:8px 0 0">下面每条都能定位到原句；勾选后点「采纳选中并写回」，
+      写回前会自动存一份历史版本。</p>`);
+  } catch (e) {
+    await tellUser('审稿失败', `<p style="margin:0">${esc(e.message)}</p>
+      <p class="muted" style="margin:8px 0 0">正文没有被改动。</p>`);
+  } finally {
+    creationState.reviewBusyAt = 0;
+    if (creationState.reviewTimer) clearInterval(creationState.reviewTimer);
+    creationState.reviewTimer = null;
+    creationState.proseReview = null;
+    creationState.prose = null;
+    creationLoad();
+    loadProseReview();
+  }
+}
+
+function locateFinding(id) {
+  const latest = creationState.proseReview && creationState.proseReview.latest;
+  const item = latest && (latest.items || []).find((x) => x.id === id);
+  const area = document.getElementById('draft-text');
+  if (!item || !area) return;
+  const text = area.value;
+  const evidence = String(item.evidence || '');
+  let start = Number(item.start);
+  if (!(start >= 0) || text.slice(start, start + evidence.length) !== evidence) {
+    start = text.indexOf(evidence);
+  }
+  if (start < 0) {
+    reviewNote('正文里已经找不到这句（可能被改过），这条意见不能定位，建议重新审稿。');
+    return;
+  }
+  const end = start + evidence.length;
+  area.focus();
+  area.setSelectionRange(start, end);
+  const ratio = text.length ? start / text.length : 0;
+  area.scrollTop = Math.max(0, ratio * area.scrollHeight - area.clientHeight / 3);
+  reviewNote(`已定位到第 ${num(item.paragraph || 0)} 段（偏移 ${start}–${end}），`
+    + '正文里已选中这一句。');
+}
+
+async function rejectFinding(id) {
+  const reviewId = currentReviewId();
+  if (!reviewId) return;
+  const ok = await askConfirm({
+    title: '拒绝这条意见？',
+    html: '<p style="margin:0">拒绝会留下记录（原因和条目），列表里仍能看到它，下次审稿也查得到。</p>',
+    confirmLabel: '拒绝这条',
+  });
+  if (!ok) return;
+  try {
+    await postJSON(reviewChapterUrl(`/reviews/${encodeURIComponent(reviewId)}/reject`),
+      { finding_ids: [id], reason: '作者拒绝' });
+    creationState.proseReview = null;
+    await loadProseReview();
+    reviewNote('已拒绝，记录已保存。');
+  } catch (e) {
+    await tellUser('拒绝失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+async function applyReviewFindings() {
+  const reviewId = currentReviewId();
+  const root = document.getElementById('creation-review-inner');
+  if (!reviewId || !root) return;
+  const ids = [...root.querySelectorAll('[data-pick]:checked')].map((box) => box.dataset.pick);
+  if (!ids.length) {
+    reviewNote('先勾选要采纳的意见（每条左上角有复选框）。');
+    return;
+  }
+  const replacements = {};
+  ids.forEach((id) => {
+    const area = root.querySelector(`[data-replacement="${id}"]`);
+    if (area) replacements[id] = area.value;
+  });
+  const ok = await askConfirm({
+    title: `采纳 ${ids.length} 条并写回正文？`,
+    html: `<p style="margin:0">只替换这几条对应的原句，其余文字一个字节都不动。</p>
+      <p class="muted" style="margin:8px 0 0">写回前会自动存一份历史版本；写回后状态退回草稿，需要再审一次才能定稿。</p>`,
+    confirmLabel: '写回正文',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const res = await postJSON(
+      reviewChapterUrl(`/reviews/${encodeURIComponent(reviewId)}/apply`),
+      { finding_ids: ids, replacements },
+    );
+    const skipped = res.skipped || [];
+    creationState.prose = null;
+    creationState.proseReview = null;
+    creationLoad();
+    loadProseReview();
+    loadProseVersions();
+    await tellUser('已写回正文', `<p style="margin:0">共改写 ${num(res.regions || 0)} 处，
+      现在 ${num(res.chars || 0)} 字。</p>
+      <p class="muted" style="margin:8px 0 0">旧稿已存为版本 <code>${esc(res.version_id || '')}</code>，
+      可在「恢复候选与历史版本」里找回。</p>
+      ${skipped.length ? `<p class="muted" style="margin:8px 0 0">${num(skipped.length)} 条被跳过：
+        ${esc(skipped.map((s) => s.reason).join('；'))}</p>` : ''}
+      <p class="muted" style="margin:8px 0 0">稿子状态已退回草稿：改过的正文需要再审一次才能定稿。</p>`);
+  } catch (e) {
+    await tellUser('写回失败', `<p style="margin:0">${esc(e.message)}</p>
+      <p class="muted" style="margin:8px 0 0">正文没有被改动。</p>`);
+  }
+}
+
+async function setProseStatus(to) {
+  const label = to === 'final' ? '已定稿' : '已重新打开（草稿）';
+  try {
+    const res = await postJSON(reviewChapterUrl('/status'), {
+      to, reason: to === 'final' ? '作者确认定稿' : '重新打开以便修改',
+    });
+    creationState.prose = null;
+    creationState.proseReview = null;
+    creationLoad();
+    loadProseReview();
+    await tellUser(label, `<p style="margin:0">现在状态：${
+      esc(DRAFT_STATUS_LABEL[res.status] || res.status)}。</p>
+      ${to === 'final' ? '<p class="muted" style="margin:8px 0 0">定稿后再重写，需要先点「重新打开」。</p>' : ''}`);
+  } catch (e) {
+    await tellUser('状态没改成', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
 /* 回填：拿这一章的正文当事实来源，把正文里**实际出现过的**东西提回设定集。
    和起草走同一套提案表格（逐条留/改/丢），但提示词是另一套——
    回填提错了会把编出来的东西写进真源，所以铁律是「正文里没有的一个字都不许提」。 */
@@ -5738,6 +6096,10 @@ async function renderCreation(name, kind, key) {
     creationState.proseTask = null;
     creationState.proseTaskLoaded = false;
     creationState.proseVersions = null;
+    creationState.proseReview = null;
+    creationState.reviewBusyAt = 0;
+    if (creationState.reviewTimer) clearInterval(creationState.reviewTimer);
+    creationState.reviewTimer = null;
     clearProseTaskTimer();
     creationState.kb.rows = null;
     creationState.kb.loaded = false;

@@ -801,6 +801,63 @@ body.cd-on main { padding: 0; }
 .cdt .recover-row .row { gap: 6px; flex-wrap: wrap; }
 .cdt .recover-row code { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
 
+/* ── 正文审稿（D1/D2/D5/U4）───────────────────────────────
+   每条意见是一张小卡：严重度 + 维度 + 状态 + 原句引用 + 改写输入。
+   引文片段只截前后各 40 字——整章贴在每张卡上，几千字时滚动会拖慢。 */
+
+.cdt .draft-status {
+  display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  border: 1px solid var(--line-strong); color: var(--ink-3); background: var(--sunk);
+}
+.cdt .draft-status.ds-reviewed { color: var(--ok); background: var(--ok-wash); border-color: #cfe3d8; }
+.cdt .draft-status.ds-final { color: #fff; background: var(--brand); border-color: var(--brand); }
+
+.cdt .review-box {
+  margin: 16px 0 0; padding: 14px 16px; border-radius: var(--r);
+  border: 1px solid var(--line); background: #fffdf9;
+}
+.cdt .rv-list { display: flex; flex-direction: column; gap: 10px; }
+.cdt .rv-item {
+  padding: 10px 12px; border-radius: var(--r-sm); border: 1px solid var(--line);
+  background: var(--surface);
+}
+.cdt .rv-item.rv-dim { opacity: .62; background: #fbfaf7; }
+.cdt .rv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cdt .rv-type { font-size: 12px; color: var(--ink-2); }
+.cdt .rv-st { font-size: 11px; color: var(--ink-3); }
+.cdt .rv-st.st-adopted { color: var(--ok); }
+.cdt .rv-st.st-rejected { color: var(--bad); }
+.cdt .rv-st.st-stale { color: var(--warn); }
+.cdt .rv-st.st-duplicate { color: var(--ink-3); }
+.cdt .sev {
+  font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
+  border: 1px solid transparent;
+}
+.cdt .sev-blocker { color: var(--bad); background: var(--bad-wash); border-color: #eed3cf; }
+.cdt .sev-major { color: var(--warn); background: var(--warn-wash); border-color: #ecdcbc; }
+.cdt .sev-minor { color: var(--ink-3); background: var(--sunk); border-color: var(--line); }
+.cdt .rv-pick { font-size: 12px; color: var(--ink-2); display: inline-flex; gap: 4px; align-items: center; }
+
+.cdt .rv-quote {
+  margin: 8px 0 6px; padding: 7px 10px; border-left: 3px solid var(--brand-wash);
+  background: var(--brand-wash); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  font: 13px/1.75 var(--serif); color: var(--ink-2);
+  word-break: break-word;
+}
+.cdt .rv-quote mark { background: #fff2b8; color: var(--ink); padding: 0 2px; border-radius: 2px; }
+.cdt .rv-problem { margin: 0 0 6px; font-size: 12.5px; color: var(--ink-2); line-height: 1.6; }
+.cdt .rv-edit {
+  width: 100%; resize: vertical; padding: 7px 9px; border-radius: var(--r-sm);
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink);
+  font: 13px/1.7 var(--serif);
+}
+.cdt .rv-history { margin-top: 10px; font-size: 12px; color: var(--ink-3); }
+.cdt .rv-history summary { cursor: pointer; }
+.cdt .rv-hist-row { padding: 5px 0; border-top: 1px dotted var(--line); display: flex; gap: 8px; flex-wrap: wrap; }
+.cdt .rv-hist-row code { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
+
+
 @media (prefers-reduced-motion: reduce) {
   .cdt * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }

@@ -3904,6 +3904,13 @@ def run_draft(
             truncated=False, continued=result.continued,
             continue_rounds=result.continue_rounds,
         )
+        # 新正文写进来，之前那次审稿的结论就作废了。状态自动退回草稿，
+        # 免得界面上还挂着「已审」而正文其实是重写的另一份。
+        if draft_store.get_status(ctx["work_dir"], chapter_id).get("status") != "draft":
+            draft_store.set_status(
+                ctx["work_dir"], chapter_id, "draft",
+                reason="重新生成正文，之前的审稿结论作废", by="generation",
+            )
         payload = {
             "ok": True, "chapter_id": chapter_id, "text": result.text,
             "errors": errors, "warnings": warnings, "stats": stats,
@@ -3976,6 +3983,10 @@ def start_draft(
 
         if not draft_store.load_candidate(ctx["work_dir"], chapter_id, resume_candidate):
             raise ValueError(f"找不到候选「{resume_candidate}」，无法从断点继续")
+    from workshop import draft_store
+
+    if draft_store.get_status(ctx["work_dir"], chapter_id).get("status") == "final":
+        raise ValueError("这一章已定稿。要重写，先点「重新打开」把状态退回草稿。")
 
     task = task_registry.create(
         paths, work=name, chapter_id=chapter_id, kind="draft",
@@ -4040,6 +4051,368 @@ def restore_version(paths: Paths, name: str, chapter_id: str, version_id: str) -
     return draft_store.restore_version(paths.work_dir(name), chapter_id, version_id)
 
 
+def _append_manifest_call(
+    work_dir: Path,
+    chapter_id: str,
+    call: dict[str, Any] | None,
+    *,
+    review_meta: dict[str, Any] | None = None,
+    refine_meta: dict[str, Any] | None = None,
+) -> None:
+    """把审稿这一次调用追加进现有 manifest，**不覆盖**批次 1/2 的账。
+
+    生成那次的 `calls`（细纲 + 每一轮续写）必须原样保留：
+    U5 是按这些行算「各自占了多少」的。这里只往后面加一行 `stage=review`，
+    再补上 review/refine 的摘要。
+    """
+    from workshop.context_budget import load_manifest, save_manifest
+
+    manifest = load_manifest(work_dir, chapter_id) or {}
+    calls = list(manifest.get("calls") or [])
+    if call:
+        calls.append(call)
+    extra = {
+        key: value for key, value in manifest.items()
+        if key not in ("schema_version", "chapter_id", "saved_at", "report")
+    }
+    extra["calls"] = calls
+    if review_meta is not None:
+        extra["review"] = review_meta
+    if refine_meta is not None:
+        extra["refine"] = refine_meta
+    save_manifest(work_dir, chapter_id, manifest.get("report") or {}, extra=extra)
+
+
+def review_draft(
+    paths: Paths, name: str, chapter_id: str, *,
+    provider_id: str | None = None, model_id: str | None = None,
+    max_tokens: int = 4000,
+) -> dict[str, Any]:
+    """对**正文**跑一次结构化审稿（会花钱）。意见落盘，正文不动。
+
+    与「审指令」不同：这里审的是已经写出来的字，产出是能逐条替换回正文的 finding。
+    """
+    from workshop import craft, draft_store
+    from workshop import review as review_mod
+    from workshop.draft import count_chars, load_draft
+    from workshop.llm import OpenAICompatProvider
+    from workshop.config import load_config
+    from workshop.secrets import SecretStore, setup_logging
+
+    ctx = _draft_inputs(paths, name, chapter_id)
+    loaded = load_draft(ctx["work_dir"], chapter_id)
+    prose = str(loaded.get("text") or "")
+    if not prose.strip():
+        raise ValueError(f"{chapter_id} 还没有正文，没什么可审的。先写这一章。")
+
+    state = draft_store.get_status(ctx["work_dir"], chapter_id)
+    if state.get("status") == "final":
+        raise ValueError("这一章已定稿。要再审，先点「重新打开」。")
+
+    cfg = load_config(paths.root / "providers.yaml")
+    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
+    if provider.api_key_ref and not _read_api_key(cfg, provider):
+        raise ValueError(_no_key_msg(provider))
+
+    store = SecretStore(paths.root / "config")
+    setup_logging(store.known_values)
+    client = OpenAICompatProvider(
+        base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
+        timeout_sec=180, auth_scheme=provider.auth_scheme,
+        secrets=store.known_values, rate_limit=provider.rate_limit,
+    )
+
+    chapter_no = int((ctx["brief"] or {}).get("chapter_no") or 0)
+    vol_start = int(((ctx["volume"] or {}).get("vol") or {}).get("start_chapter") or 0)
+    block = craft.craft_block(
+        chapter_no=chapter_no, is_first_of_volume=bool(vol_start and chapter_no == vol_start),
+        brief=ctx["brief"], review=True,
+    )
+
+    payload = review_mod.load_reviews(ctx["work_dir"], chapter_id)
+    result = review_mod.run_review(
+        client=client, model_id=model, prose=prose,
+        brief=ctx["brief"], setting=ctx["setting"], craft_block=block,
+        max_tokens=max_tokens,
+        existing_items=review_mod.all_items(payload),
+    )
+
+    prose_sha = review_mod.sha256(prose)
+    entry = {
+        "review_id": review_mod.new_review_id(),
+        "created_at": review_mod._now_iso(),
+        "model": model,
+        "provider": provider.id,
+        "prose_sha": prose_sha,
+        "chars": len(prose),
+        "count_chars": count_chars(prose),
+        "summary": result["summary"],
+        "items": result["items"],
+        "invalid": result["invalid"],
+        "attempts": result["attempts"],
+        "attempt_count": len(result["attempts"]),
+        "usage": result["usage"],
+        "call": result["call"],
+        "max_tokens": max_tokens,
+    }
+    review_mod.append_review(ctx["work_dir"], chapter_id, entry)
+
+    _append_manifest_call(
+        ctx["work_dir"], chapter_id, result["call"],
+        review_meta={
+            "review_id": entry["review_id"],
+            "items": len(entry["items"]),
+            "invalid": len(entry["invalid"]),
+            "prose_sha": prose_sha,
+            "summary": entry["summary"],
+        },
+    )
+
+    status = state.get("status") or "draft"
+    if status == "draft":
+        status = draft_store.set_status(
+            ctx["work_dir"], chapter_id, "reviewed",
+            reason=f"正文审稿完成：{len(entry['items'])} 条意见", by="review",
+        )["status"]
+
+    items = review_mod.public_items(entry, prose_sha)
+    counts = {"blocker": 0, "major": 0, "minor": 0}
+    for item in items:
+        counts[item["severity"]] = counts.get(item["severity"], 0) + 1
+    return {
+        "ok": True,
+        "chapter_id": chapter_id,
+        "review_id": entry["review_id"],
+        "summary": entry["summary"],
+        "items": items,
+        "invalid": entry["invalid"],
+        "counts": counts,
+        "attempts": entry["attempts"],
+        "usage": entry["usage"],
+        "call": result["call"],
+        "status": status,
+        "prose_sha": prose_sha,
+        "chars": entry["chars"],
+        "error_code": "",
+    }
+
+
+def apply_review_findings(
+    paths: Paths, name: str, chapter_id: str, review_id: str,
+    finding_ids: list[str], replacements: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """把勾选的意见逐条写回正文（D2/D3）。**写回前一定存版本快照。**"""
+    from workshop import draft_store, refine as refine_mod
+    from workshop import review as review_mod
+    from workshop.draft import count_chars, load_draft, save_draft
+
+    work_dir = paths.work_dir(name)
+    payload = review_mod.load_reviews(work_dir, chapter_id)
+    review = review_mod.find_review(payload, review_id)
+    if not review:
+        raise ValueError(f"找不到审稿记录「{review_id}」，可能已被清理。")
+
+    loaded = load_draft(work_dir, chapter_id)
+    prose = str(loaded.get("text") or "")
+    if not prose.strip():
+        raise ValueError("这一章没有正文，无法应用意见。")
+    prose_sha = review_mod.sha256(prose)
+
+    items = review_mod.public_items(review, prose_sha)
+    wanted = {str(x) for x in finding_ids or []}
+    if not wanted:
+        raise ValueError("没有选中任何意见")
+    selected = [item for item in items if str(item.get("id")) in wanted]
+    missing = wanted - {str(item.get("id")) for item in selected}
+    if missing:
+        raise ValueError("这些意见在这次审稿里找不到：" + "、".join(sorted(missing)))
+    blocked = [item for item in selected if not item.get("adoptable")]
+    if blocked:
+        detail = "；".join(
+            f"{item.get('id')}（{item.get('status')}）" for item in blocked
+        )
+        raise ValueError(
+            "这些意见当前不能采纳：" + detail
+            + "。正文改过（stale）或引文定位不到的意见只能重新审稿后再处理。"
+        )
+
+    result = refine_mod.apply_findings(prose, selected, replacements or {})
+    if not result["applied"]:
+        reasons = "；".join(str(x.get("reason") or "") for x in result["skipped"]) or "没有可替换的内容"
+        raise ValueError(f"没有一条能应用：{reasons}")
+    if not refine_mod.only_selected_changed(prose, result["text"], result["applied"]):
+        raise RuntimeError("改写校验失败：选中范围之外的文字被改动了，已拒绝写入")
+
+    # A2/D3：先快照，再覆盖。这一步不能省——采纳是覆盖式的。
+    version = draft_store.snapshot_version(
+        work_dir, chapter_id, text=prose, meta=loaded.get("meta") or {},
+        reason="按审稿意见改写前自动备份",
+    )
+    version_id = (version or {}).get("version_id", "")
+    applied_ids = [str(pick["id"]) for pick in result["applied"]]
+    review_apply = {
+        "review_id": review_id,
+        "finding_ids": applied_ids,
+        "regions": result["regions"],
+        "changed_chars": result["changed_chars"],
+        "version_id": version_id,
+        "at": review_mod._now_iso(),
+    }
+    save_draft(
+        work_dir, chapter_id, text=result["text"],
+        meta={
+            **(loaded.get("meta") or {}),
+            "chars": count_chars(result["text"]),
+            "review_apply": review_apply,
+            "last_edited_at": review_apply["at"],
+        },
+    )
+
+    # 把状态写进审稿记录：采纳过什么、写进哪个版本，以后查得到。
+    applied_map = {str(pick["id"]): pick for pick in result["applied"]}
+    for item in review.get("items") or []:
+        pick = applied_map.get(str(item.get("id")))
+        if not pick:
+            continue
+        item["status"] = "adopted"
+        item["status_at"] = review_apply["at"]
+        item["applied_version_id"] = version_id
+        item["applied_text"] = pick["after"]
+    review["applied_at"] = review_apply["at"]
+    review_mod.save_reviews(work_dir, chapter_id, payload)
+
+    state = draft_store.get_status(work_dir, chapter_id)
+    status = state.get("status") or "draft"
+    if status == "reviewed":
+        status = draft_store.set_status(
+            work_dir, chapter_id, "draft",
+            reason=f"按审稿意见改写 {result['regions']} 处，需要复审", by="refine",
+        )["status"]
+
+    _append_manifest_call(
+        work_dir, chapter_id, None,
+        refine_meta={**review_apply, "chars": count_chars(result["text"])},
+    )
+    return {
+        "ok": True,
+        "chapter_id": chapter_id,
+        "review_id": review_id,
+        "applied": result["applied"],
+        "skipped": result["skipped"],
+        "regions": result["regions"],
+        "changed_chars": result["changed_chars"],
+        "chars": count_chars(result["text"]),
+        "version_id": version_id,
+        "status": status,
+        "prose_sha": review_mod.sha256(result["text"]),
+    }
+
+
+def reject_review_findings(
+    paths: Paths, name: str, chapter_id: str, review_id: str,
+    finding_ids: list[str], reason: str = "",
+) -> dict[str, Any]:
+    """拒绝也留记录：以后重新审稿时，作者能看出「这条我早就不要了」。"""
+    from workshop import review as review_mod
+    from workshop.draft import load_draft
+
+    work_dir = paths.work_dir(name)
+    payload = review_mod.load_reviews(work_dir, chapter_id)
+    review = review_mod.find_review(payload, review_id)
+    if not review:
+        raise ValueError(f"找不到审稿记录「{review_id}」")
+    wanted = {str(x) for x in finding_ids or []}
+    if not wanted:
+        raise ValueError("没有选中任何意见")
+
+    rejected: list[str] = []
+    skipped: list[dict[str, str]] = []
+    now = review_mod._now_iso()
+    for item in review.get("items") or []:
+        fid = str(item.get("id"))
+        if fid not in wanted:
+            continue
+        current = str(item.get("status") or "open")
+        if current == "adopted":
+            skipped.append({"id": fid, "reason": "已经采纳并写回正文，不能再拒绝"})
+            continue
+        item["status"] = "rejected"
+        item["status_at"] = now
+        item["reject_reason"] = reason or "作者拒绝"
+        rejected.append(fid)
+    if not rejected:
+        raise ValueError("选中的意见都没法拒绝：" +
+                         "；".join(f"{x['id']}（{x['reason']}）" for x in skipped))
+    review_mod.save_reviews(work_dir, chapter_id, payload)
+
+    loaded = load_draft(work_dir, chapter_id)
+    prose_sha = review_mod.sha256(str(loaded.get("text") or ""))
+    return {
+        "ok": True, "review_id": review_id, "rejected": rejected,
+        "skipped": skipped, "prose_sha": prose_sha,
+    }
+
+
+def review_history(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    """审稿历史（A3）：每次审了几条、各状态多少、正文是否已经改过。"""
+    from workshop import draft_store
+    from workshop import review as review_mod
+    from workshop.draft import load_draft
+
+    work_dir = paths.work_dir(name)
+    payload = review_mod.load_reviews(work_dir, chapter_id)
+    prose = str(load_draft(work_dir, chapter_id).get("text") or "")
+    prose_sha = review_mod.sha256(prose)
+    reviews = review_mod.summarize(payload, prose_sha)
+    latest = (payload.get("reviews") or [None])[-1]
+    return {
+        "chapter_id": chapter_id,
+        "prose_sha": prose_sha,
+        "chars": len(prose),
+        "status": draft_store.get_status(work_dir, chapter_id),
+        "reviews": reviews,
+        "latest": ({
+            "review_id": latest.get("review_id"),
+            "created_at": latest.get("created_at"),
+            "model": latest.get("model"),
+            "summary": latest.get("summary"),
+            "prose_sha": latest.get("prose_sha"),
+            "chars": latest.get("chars"),
+            "items": review_mod.public_items(latest, prose_sha),
+            "invalid": latest.get("invalid") or [],
+        } if latest else None),
+    }
+
+
+def draft_status(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    from workshop import draft_store
+    from workshop.draft import load_draft
+
+    work_dir = paths.work_dir(name)
+    state = draft_store.get_status(work_dir, chapter_id)
+    state["has_draft"] = bool(load_draft(work_dir, chapter_id).get("exists"))
+    return state
+
+
+def set_draft_status(
+    paths: Paths, name: str, chapter_id: str, to: str, *, reason: str = ""
+) -> dict[str, Any]:
+    """D5 的闸门：未审不能定稿；定稿后要重写必须先 reopen。"""
+    from workshop import draft_store
+    from workshop.draft import load_draft
+
+    work_dir = paths.work_dir(name)
+    loaded = load_draft(work_dir, chapter_id)
+    if to == "final":
+        if not loaded.get("exists"):
+            raise ValueError("还没有正文，不能定稿。")
+        if not str(loaded.get("text") or "").strip():
+            raise ValueError("正文是空的，不能定稿。")
+    state = draft_store.set_status(work_dir, chapter_id, to, reason=reason, by="ui")
+    state["has_draft"] = bool(loaded.get("exists"))
+    return state
+
+
 def read_draft(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
     """读已写的正文 + 重跑一次自检（指令可能改过了，结论要跟着变）。"""
     from workshop.draft import check_draft, load_draft
@@ -4053,7 +4426,33 @@ def read_draft(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
         loaded["text"], brief=ctx["brief"], setting=ctx["setting"],
     )
     loaded.update({"errors": errors, "warnings": warnings, "stats": stats})
+    loaded.update(_draft_state_summary(ctx["work_dir"], chapter_id, loaded["text"]))
     return loaded
+
+
+def _draft_state_summary(work_dir: Path, chapter_id: str, prose: str) -> dict[str, Any]:
+    """稿子状态 + 最近一次审稿的摘要，随正文一起下发。
+
+    界面不该为了画一个「已审/已定稿」的小标签再多跑两个请求——
+    这类额外请求一多，切章时就会看到状态闪一下才出来。
+    """
+    from workshop import draft_store
+    from workshop import review as review_mod
+
+    state = draft_store.get_status(work_dir, chapter_id)
+    payload = review_mod.load_reviews(work_dir, chapter_id)
+    latest = (payload.get("reviews") or [None])[-1]
+    summary = None
+    if latest:
+        summary = {
+            "review_id": latest.get("review_id"),
+            "created_at": latest.get("created_at"),
+            "count": len(latest.get("items") or []),
+            "invalid_count": len(latest.get("invalid") or []),
+            "prose_sha": latest.get("prose_sha"),
+            "stale": str(latest.get("prose_sha") or "") != review_mod.sha256(prose),
+        }
+    return {"status": state, "review_summary": summary}
 
 
 def write_draft_text(paths: Paths, name: str, chapter_id: str, text: str) -> dict[str, Any]:

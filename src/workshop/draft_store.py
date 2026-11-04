@@ -35,6 +35,17 @@ CANDIDATES_KEEP = 8
 
 VERSION_SCHEMA = "draft-version-v1"
 CANDIDATE_SCHEMA = "draft-candidate-v1"
+STATUS_SCHEMA = "draft-status-v1"
+
+# D5：稿子状态机。**未审不能定稿**——`draft → final` 不在这个集合里。
+# final 之后要重写，必须先显式 reopen 回 draft，不能悄悄覆盖一个「已定稿」。
+DRAFT_STATUSES = ("draft", "reviewed", "final")
+_ALLOWED_TRANSITIONS = {
+    ("draft", "reviewed"),      # 审稿通过
+    ("reviewed", "draft"),      # 按意见改写后需要复审
+    ("reviewed", "final"),      # 定稿
+    ("final", "draft"),         # 显式重新打开
+}
 
 
 def _now_iso() -> str:
@@ -233,6 +244,64 @@ def promote_candidate(
         },
     )
     return {"saved": True, "candidate_id": candidate_id, "chars": count_chars(text), **saved}
+
+
+def status_path(work_dir: str | Path, chapter_id: str) -> Path:
+    return draft_dir(Path(work_dir)) / f"{chapter_id}.status.json"
+
+
+def get_status(work_dir: str | Path, chapter_id: str) -> dict[str, Any]:
+    """当前稿子状态。没有状态文件就当 `draft`——旧稿不用迁移也能继续用。"""
+    path = status_path(work_dir, chapter_id)
+    data = _read_json(path)
+    if not data:
+        return {"schema_version": STATUS_SCHEMA, "chapter_id": chapter_id,
+                "status": "draft", "updated_at": "", "history": []}
+    status = str(data.get("status") or "draft")
+    if status not in DRAFT_STATUSES:
+        status = "draft"
+    data["status"] = status
+    data.setdefault("history", [])
+    return data
+
+
+def set_status(
+    work_dir: str | Path,
+    chapter_id: str,
+    to: str,
+    *,
+    reason: str = "",
+    by: str = "ui",
+) -> dict[str, Any]:
+    """迁移状态。**非法跳转直接报错**，不悄悄改——闸门值钱的地方就在会拒绝。
+
+    每次迁移写进 history（时间、从哪到哪、为什么、谁干的），
+    否则「这章什么时候定的稿」只能靠猜。
+    """
+    if to not in DRAFT_STATUSES:
+        raise ValueError(f"未知的稿子状态「{to}」，只能是 {'/'.join(DRAFT_STATUSES)}")
+    data = get_status(work_dir, chapter_id)
+    current = str(data.get("status") or "draft")
+    if current == to:
+        return data
+    if (current, to) not in _ALLOWED_TRANSITIONS:
+        if current == "draft" and to == "final":
+            raise ValueError("这一章还没审过，不能定稿。先跑一次正文审稿。")
+        if current == "final":
+            raise ValueError("这一章已定稿。要重写或再审，先点「重新打开」。")
+        raise ValueError(f"状态不能从「{current}」直接变成「{to}」")
+    entry = {
+        "at": _now_iso(),
+        "from": current,
+        "to": to,
+        "reason": reason,
+        "by": by,
+    }
+    data["status"] = to
+    data["updated_at"] = entry["at"]
+    data["history"] = list(data.get("history") or []) + [entry]
+    _write_json(status_path(work_dir, chapter_id), data)
+    return data
 
 
 def restore_version(
