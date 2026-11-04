@@ -3513,7 +3513,7 @@ def draft_plan(
     """写这一章的免费计划：多少 token、多少钱、会喂进去什么。**不调模型。**"""
     from workshop.batch import _pick_price, price_bucket
     from workshop.config import load_config
-    from workshop.draft import build_draft_plan, load_draft
+    from workshop.draft import MAX_CONTINUE_ROUNDS, build_draft_plan, load_draft
 
     ctx = _draft_inputs(paths, name, chapter_id)
     cfg = load_config(paths.root / "providers.yaml")
@@ -3548,7 +3548,43 @@ def draft_plan(
     plan["has_draft"] = bool(existing.get("exists"))
     plan["existing_chars"] = len(existing.get("text") or "")
     plan["refs_available"] = assist_refs(paths)
+
+    # B1：细纲是落盘的，计划接口直接读磁盘，不重新生成。
+    # 指令改过（brief_sha 对不上）就把旧细纲标成 stale，生成时会重新做一份。
+    from workshop import beats as beats_mod
+
+    saved_beats = beats_mod.load_beats(ctx["work_dir"], chapter_id)
+    reusable, _ = beats_mod.load_reusable_beats(ctx["work_dir"], chapter_id, ctx["brief"])
+    plan["beats"] = {
+        "exists": bool(saved_beats),
+        "path": str(beats_mod.beats_path(ctx["work_dir"], chapter_id)),
+        "count": len((saved_beats or {}).get("beats") or []),
+        "source": (saved_beats or {}).get("source") or "",
+        "saved_at": (saved_beats or {}).get("generated_at") or "",
+        "brief_sha": (saved_beats or {}).get("brief_sha") or "",
+        "reusable": bool(reusable),
+        "stale": bool(saved_beats) and not reusable,
+        "beats": (saved_beats or {}).get("beats") or [],
+    }
+    plan["max_continue_rounds"] = int(MAX_CONTINUE_ROUNDS)
+    plan["last_run"] = _last_run_summary(ctx["work_dir"], chapter_id)
     return plan
+
+
+def _last_run_summary(work_dir: Path, chapter_id: str) -> dict[str, Any]:
+    """上一轮生成的调用账。U5 靠它显示「细纲/每一轮续写各占多少」。"""
+    from workshop.context_budget import load_manifest
+
+    manifest = load_manifest(work_dir, chapter_id)
+    if not manifest:
+        return {}
+    keys = (
+        "phase", "saved_at", "usage", "finish_reason", "truncated", "continued",
+        "continue_rounds", "max_continue_rounds", "beats", "error_code", "error",
+    )
+    out = {key: manifest.get(key) for key in keys if manifest.get(key) is not None}
+    out["calls"] = manifest.get("calls") or []
+    return out
 
 
 def run_draft(
@@ -3557,17 +3593,39 @@ def run_draft(
     provider_id: str | None = None, model_id: str | None = None,
     max_tokens: int = 8000, temperature: float = 0.8,
     budget_chars: int | None = None,
+    task: Any | None = None,
+    resume_candidate: str = "",
+    force_beats: bool = False,
 ) -> dict[str, Any]:
-    """写这一章（**会花钱**）。跑完落盘并做机械自检。只出一章，不往下串。"""
+    """写这一章（**会花钱**）。跑完落盘并做机械自检。只出一章，不往下串。
+
+    批次 2 的三件新事都在这里串起来：
+      · 细纲：先花一次短调用拆节拍，失败就回退为不注入；
+      · 续写：`finish_reason=length` 时按章续，最多 `MAX_CONTINUE_ROUNDS` 轮；
+      · 失败关闭：失败/截断/取消**不覆盖正式稿**，只留候选恢复点。
+    所有调用（含细纲）都进 manifest 的 `calls`，U5 能看到各自占了多少。
+    """
+    import time
     from datetime import datetime, timezone
 
+    from server import tasks as task_registry
+    from workshop import beats as beats_mod
+    from workshop import draft_store
     from workshop.config import load_config
+    from workshop.context_budget import save_manifest
+    from workshop.creation import render_prev_tail
     from workshop.draft import (
-        build_draft_messages, check_draft, generate_draft, save_draft,
+        MAX_CONTINUE_ROUNDS, build_draft_messages, check_draft, count_chars,
+        generate_draft, load_draft, save_draft,
     )
+    from workshop.errors import ErrorKind, GenerationCancelled, describe_error
     from workshop.llm import OpenAICompatProvider
     from workshop.secrets import SecretStore, setup_logging
 
+    if task is not None:
+        task.started_ms = time.monotonic()
+        task_registry.update(task, status="running", stage="装配材料", stage_index=0,
+                             message="正在装配设定集、指令与写前必读")
     ctx = _draft_inputs(paths, name, chapter_id)
     if not ctx["brief_exists"] or not ctx["brief"]:
         raise ValueError(
@@ -3594,9 +3652,12 @@ def run_draft(
     block, _missing = _setting_refs_block(paths, refs or [], level)
     _ctx, _report = _draft_context_bundle(ctx, budget_chars=budget_chars)
 
-    # A4：生成前先落一份「这次到底喂了什么」。模型失败也留着这份证据；
-    # 成功后再覆盖成终态，写进 usage / finish_reason。
-    from workshop.context_budget import save_manifest
+    calls: list[dict[str, Any]] = []
+    beats_meta: dict[str, Any] = {
+        "source": "none", "count": 0, "path": str(beats_mod.beats_path(ctx["work_dir"], chapter_id)),
+    }
+    resume_meta: dict[str, Any] = {}
+    warnings_store: list[str] = []
 
     manifest_extra = {
         "phase": "assembled",
@@ -3606,53 +3667,377 @@ def run_draft(
         "budget_chars": _report.get("budget_chars"),
         "refs_level": level,
         "refs": refs or [],
+        "calls": calls,
+        "beats": beats_meta,
+        "max_continue_rounds": MAX_CONTINUE_ROUNDS,
     }
-    save_manifest(ctx["work_dir"], chapter_id, _report, extra=manifest_extra)
 
-    messages = build_draft_messages(
-        setting=ctx["setting"], volume=ctx["volume"], brief=ctx["brief"],
-        refs_block=block, title=ctx["title"], context_block=_ctx,
-    )
-    result = generate_draft(
-        client=client, model_id=model, messages=messages,
-        max_tokens=max_tokens, temperature=temperature,
-    )
-    if result.error or not result.text.strip():
+    def write_manifest(phase: str, **extra: Any) -> None:
         save_manifest(
             ctx["work_dir"], chapter_id, _report,
-            extra={**manifest_extra, "phase": "failed",
-                   "error": result.error or "模型没返回内容",
-                   "usage": result.usage},
+            extra={**manifest_extra, "phase": phase, "calls": calls,
+                   "beats": beats_meta, **extra},
         )
-        return {"ok": False, "error": result.error or "模型没返回内容", "usage": result.usage}
 
-    errors, warnings, stats = check_draft(
-        result.text, brief=ctx["brief"], setting=ctx["setting"],
-    )
-    if result.truncated:
-        errors = ["模型是被 max_tokens 截断的，末尾是断的——这一章没写完"] + errors
+    # A4：生成前先落一份「这次到底喂了什么」。模型失败也留着这份证据。
+    write_manifest("assembled")
 
-    save_manifest(
-        ctx["work_dir"], chapter_id, _report,
-        extra={**manifest_extra, "phase": "generated",
-               "usage": result.usage, "finish_reason": result.finish_reason,
-               "truncated": result.truncated},
+    def fail(
+        *,
+        status: str,
+        code: str,
+        error: str,
+        text: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """失败/截断/取消的统一出口：**不覆盖正式稿**，只留候选。"""
+        candidate_id = ""
+        if (text or "").strip():
+            cand = draft_store.save_candidate(
+                ctx["work_dir"], chapter_id, text=text,
+                meta={"model": model, "provider": provider.id, "beats": beats_meta,
+                      "calls": calls, "candidate_from": "generation"},
+                reason=error, task_id=task.task_id if task else "",
+            )
+            candidate_id = (cand or {}).get("candidate_id", "")
+        info = describe_error(code, error)
+        payload = {
+            "ok": False, "status": status, "chapter_id": chapter_id,
+            "cancelled": status == "cancelled",
+            "error": error, "error_code": code,
+            "title": info["title"], "action": info["action"],
+            "retryable": info["retryable"],
+            "candidate_id": candidate_id, "chars": count_chars(text),
+            "calls": calls, "beats": beats_meta, **(extra or {}),
+        }
+        write_manifest(
+            status if status in ("cancelled",) else "failed",
+            error=error, error_code=code, candidate_id=candidate_id, **(extra or {}),
+        )
+        if task is not None:
+            task_registry.finish(
+                task, status=status, message=error, result=payload,
+                error=error, error_code=code, candidate_id=candidate_id,
+                chars=count_chars(text), calls=calls,
+            )
+        return payload
+
+    def on_round(row: dict[str, Any]) -> None:
+        calls.append(row)
+        if task is not None:
+            label = "细纲" if row.get("stage") == "beats" else (
+                "正文首轮" if row.get("round") == 0 and row.get("stage") == "draft"
+                else f"续写第 {int(row.get('round') or 0)} 轮"
+            )
+            task_registry.update(
+                task,
+                stage="正文生成", stage_index=2,
+                round=int(row.get("round") or 0),
+                chars=int(row.get("total_chars") or 0),
+                calls=list(calls),
+                message=f"{label}完成：{int(row.get('new_chars') or 0)} 字，"
+                        f"{row.get('finish_reason') or '未给结束原因'}",
+            )
+
+    def on_partial(text: str, row: dict[str, Any]) -> None:
+        # 截断时把这一轮的半截正文留成候选。进程随后被杀、或取消，
+        # 作者至少还有这一轮的字可以从断点继续。
+        if row.get("finish_reason") not in ("length", "max_tokens") or not (text or "").strip():
+            return
+        cand = draft_store.save_candidate(
+            ctx["work_dir"], chapter_id, text=text,
+            meta={"model": model, "provider": provider.id, "beats": beats_meta,
+                  "calls": list(calls), "candidate_from": "truncated_round"},
+            reason="正文被 max_tokens 截断时的中间稿",
+            task_id=task.task_id if task else "",
+        )
+        if task is not None and cand:
+            task_registry.update(task, candidate_id=cand.get("candidate_id", ""))
+
+    try:
+        # ── 1. 装配材料（已落 manifest，这里只推进阶段） ──
+        if task is not None:
+            task_registry.update(task, stage="装配材料", stage_index=0,
+                                 message="写前必读已装配，预算报告已落盘")
+
+        # 恢复候选：从断点续写时，先把它当已写正文，模型只需接着往下写。
+        prior_text = ""
+        if resume_candidate:
+            candidate = draft_store.load_candidate(ctx["work_dir"], chapter_id, resume_candidate)
+            if not candidate:
+                raise ValueError(f"找不到候选「{resume_candidate}」，无法从断点继续")
+            prior_text = str(candidate.get("text") or "")
+            resume_meta = {
+                "resumed_from_candidate": resume_candidate,
+                "resumed_chars": count_chars(prior_text),
+            }
+            manifest_extra.update(resume_meta)
+            write_manifest("assembled")
+
+        # ── 2. 写前细纲（B1） ──
+        if task is not None:
+            task_registry.update(task, stage="写前细纲", stage_index=1,
+                                 message="正在拆这一章的 5–8 个节拍")
+        reusable, saved = beats_mod.load_reusable_beats(ctx["work_dir"], chapter_id, ctx["brief"])
+        if reusable and not force_beats:
+            beats_list = reusable
+            beats_meta = {
+                "source": "reused", "count": len(reusable),
+                "path": str(beats_mod.beats_path(ctx["work_dir"], chapter_id)),
+                "saved_at": (saved or {}).get("generated_at") or "",
+            }
+        else:
+            prev_tail = ""
+            try:
+                prev_tail = render_prev_tail(
+                    ctx["work_dir"], before_chapter_no=int(ctx["brief"].get("chapter_no") or 0),
+                    chars=600,
+                )
+            except (ValueError, OSError):
+                prev_tail = ""
+            beats_result = beats_mod.generate_beats(
+                client=client, model_id=model, setting=ctx["setting"],
+                volume=ctx["volume"], brief=ctx["brief"],
+                word_range=None, prev_tail=prev_tail,
+                cancel_event=task.cancel_event if task is not None else None,
+                cancel_check=(lambda: bool(task.cancel_event.is_set())) if task is not None else None,
+            )
+            calls.append(beats_result["call"])
+            if task is not None:
+                task_registry.update(task, calls=list(calls))
+            if beats_result.get("ok"):
+                beats_list = beats_result["beats"]
+                saved_meta = beats_mod.save_beats(
+                    ctx["work_dir"], chapter_id, beats=beats_list, brief=ctx["brief"],
+                    model=model, source="model", usage=beats_result.get("usage") or {},
+                )
+                beats_meta = {
+                    "source": "model", "count": len(beats_list),
+                    "path": saved_meta.get("path", ""),
+                    "brief_sha": saved_meta.get("brief_sha", ""),
+                }
+            else:
+                beats_list = []
+                beats_meta = {
+                    "source": "failed", "count": 0,
+                    "path": str(beats_mod.beats_path(ctx["work_dir"], chapter_id)),
+                    "error": beats_result.get("error") or "细纲生成失败",
+                    "error_code": beats_result.get("error_code") or "",
+                }
+                warnings_store.append(
+                    "细纲没生成成功，已回退为不注入细纲继续写正文"
+                    f"（{beats_result.get('error_code') or 'unknown'}：{beats_result.get('error') or ''}）"
+                )
+            write_manifest("beats_ready")
+        manifest_extra["beats"] = beats_meta
+
+        # ── 3. 正文（B2：截断自动续写） ──
+        if task is not None:
+            task_registry.update(
+                task, stage="正文生成", stage_index=2, round=0,
+                max_rounds=MAX_CONTINUE_ROUNDS,
+                message="正在写正文（首轮）",
+            )
+        messages = build_draft_messages(
+            setting=ctx["setting"], volume=ctx["volume"], brief=ctx["brief"],
+            refs_block=block, title=ctx["title"], context_block=_ctx,
+            beats=beats_mod.render_beats_for_prompt(beats_list) if beats_list else "",
+        )
+        result = generate_draft(
+            client=client, model_id=model, messages=messages,
+            max_tokens=max_tokens, temperature=temperature,
+            cancel_event=task.cancel_event if task is not None else None,
+            on_round=on_round, on_partial=on_partial,
+            prior_text=prior_text,
+        )
+
+        # 失败/截断/空响应：一律不落正式稿
+        if result.error_code or result.truncated or not result.text.strip():
+            code = result.error_code or ErrorKind.UNKNOWN.value
+            error = result.error or "模型没有返回可用的正文"
+            return fail(status="failed", code=code, error=error, text=result.text,
+                        extra={"usage": result.usage, "finish_reason": result.finish_reason,
+                               "continued": result.continued,
+                               "continue_rounds": result.continue_rounds})
+
+        # ── 4. 自检与落盘 ──
+        if task is not None:
+            task_registry.update(task, stage="自检与落盘", stage_index=3,
+                                 message="正在做机械自检并保存正文")
+        errors, warnings, stats = check_draft(
+            result.text, brief=ctx["brief"], setting=ctx["setting"],
+        )
+        warnings = warnings_store + list(warnings)
+        if beats_meta.get("source") == "failed":
+            beats_meta["fallback"] = True
+        if result.continued:
+            warnings.append(
+                f"这一章靠续写凑成：首轮被截断后自动续了 {result.continue_rounds} 轮"
+                f"（上限 {MAX_CONTINUE_ROUNDS}）；拼接处已做 n-gram 去重。"
+            )
+
+        existing = load_draft(ctx["work_dir"], chapter_id)
+        if existing.get("exists") and existing.get("text") != result.text:
+            draft_store.snapshot_version(
+                ctx["work_dir"], chapter_id, text=existing["text"],
+                meta=existing.get("meta") or {}, reason="重写前自动备份",
+            )
+
+        saved = save_draft(
+            ctx["work_dir"], chapter_id, text=result.text,
+            meta={
+                "work": name, "model": model, "provider": provider.id,
+                "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                "usage": result.usage, "finish_reason": result.finish_reason,
+                "truncated": False, "continued": result.continued,
+                "continue_rounds": result.continue_rounds,
+                "max_continue_rounds": MAX_CONTINUE_ROUNDS,
+                "refs_level": level, "refs": refs or [],
+                "beats": beats_meta, "calls": calls,
+                **resume_meta,
+                "stats": stats, "errors": errors, "warnings": warnings,
+            },
+        )
+        write_manifest(
+            "generated",
+            usage=result.usage, finish_reason=result.finish_reason,
+            truncated=False, continued=result.continued,
+            continue_rounds=result.continue_rounds,
+        )
+        payload = {
+            "ok": True, "chapter_id": chapter_id, "text": result.text,
+            "errors": errors, "warnings": warnings, "stats": stats,
+            "usage": result.usage, "truncated": False,
+            "continued": result.continued, "continue_rounds": result.continue_rounds,
+            "beats": beats_meta, "calls": calls, **resume_meta, **saved,
+        }
+        if task is not None:
+            task_registry.finish(
+                task, status="done",
+                message=f"完成：{count_chars(result.text)} 字"
+                        + (f"（续写 {result.continue_rounds} 轮）" if result.continued else ""),
+                # 任务状态是轮询接口，**不能把整章正文塞进去**：
+                # 每秒返回几千字既浪费又会让任务 JSON 越来越大。正文走 GET draft。
+                result={k: v for k, v in payload.items() if k != "text"},
+                chars=count_chars(result.text),
+                calls=calls, beats_count=int(beats_meta.get("count") or 0),
+                round=result.continue_rounds,
+            )
+        return payload
+
+    except GenerationCancelled as exc:
+        # 取消发生在一次调用中途：这一次没有正常结束帧，但**它产生了字数、花了时间**。
+        # 不记的话，U5 的账本会显示 0 次调用，作者会以为取消没花钱、也没吐出半截正文。
+        cancelled_stage = "beats" if (task is not None and task.stage_index == 1) else "draft"
+        calls.append({
+            "stage": cancelled_stage,
+            "round": int(getattr(task, "round", 0) or 0) if task is not None else 0,
+            "aborted": True,
+            "chars": count_chars(exc.partial_text),
+            "new_chars": count_chars(exc.partial_text),
+            "total_chars": count_chars(exc.partial_text),
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "finish_reason": "cancelled",
+            "elapsed_ms": float(getattr(task, "elapsed_ms", 0) or 0) if task is not None else 0,
+            "max_tokens": max_tokens,
+            "error_code": ErrorKind.CANCELLED.value,
+            "ok": False,
+        })
+        return fail(
+            status="cancelled", code=ErrorKind.CANCELLED.value,
+            error="已取消：服务端已停止模型调用，未覆盖正式稿",
+            text=exc.partial_text,
+        )
+
+
+def start_draft(
+    paths: Paths, name: str, chapter_id: str, *,
+    refs: list[str] | None = None, level: str = "k3",
+    provider_id: str | None = None, model_id: str | None = None,
+    max_tokens: int = 8000, temperature: float = 0.8,
+    budget_chars: int | None = None,
+    resume_candidate: str = "",
+    force_beats: bool = False,
+) -> dict[str, Any]:
+    """异步启动一次生成，立刻返回 task。**同步校验**放在线程外，参数错不排队。"""
+    from server import tasks as task_registry
+    from workshop.draft import MAX_CONTINUE_ROUNDS
+    from workshop.errors import ErrorKind, describe_error
+
+    ctx = _draft_inputs(paths, name, chapter_id)
+    if not ctx["brief_exists"] or not ctx["brief"]:
+        raise ValueError(f"还没有 {chapter_id} 的创作任务指令，无法开始生成。")
+    if ctx["brief_errors"]:
+        raise ValueError(f"这一章的指令有 {len(ctx['brief_errors'])} 项阻断没解决：{ctx['brief_errors'][0]}")
+    if ctx["setting_errors"]:
+        raise ValueError(f"设定集有 {len(ctx['setting_errors'])} 项阻断没解决：{ctx['setting_errors'][0]}")
+    if resume_candidate:
+        from workshop import draft_store
+
+        if not draft_store.load_candidate(ctx["work_dir"], chapter_id, resume_candidate):
+            raise ValueError(f"找不到候选「{resume_candidate}」，无法从断点继续")
+
+    task = task_registry.create(
+        paths, work=name, chapter_id=chapter_id, kind="draft",
+        total_stages=4, max_rounds=MAX_CONTINUE_ROUNDS,
     )
-    saved = save_draft(
-        ctx["work_dir"], chapter_id, text=result.text,
-        meta={
-            "work": name, "model": model, "provider": provider.id,
-            "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-            "usage": result.usage, "finish_reason": result.finish_reason,
-            "truncated": result.truncated, "refs_level": level, "refs": refs or [],
-            "stats": stats, "errors": errors, "warnings": warnings,
-        },
-    )
-    return {
-        "ok": True, "chapter_id": chapter_id, "text": result.text,
-        "errors": errors, "warnings": warnings, "stats": stats,
-        "usage": result.usage, "truncated": result.truncated, **saved,
+
+    def worker() -> None:
+        try:
+            run_draft(
+                paths, name, chapter_id, refs=refs, level=level,
+                provider_id=provider_id, model_id=model_id,
+                max_tokens=max_tokens, temperature=temperature,
+                budget_chars=budget_chars, task=task,
+                resume_candidate=resume_candidate, force_beats=force_beats,
+            )
+        except Exception as exc:  # noqa: BLE001
+            code = ErrorKind.BAD_REQUEST.value if isinstance(exc, ValueError) else ErrorKind.UNKNOWN.value
+            info = describe_error(code, str(exc))
+            task_registry.finish(
+                task, status="failed", message=str(exc), error=str(exc), error_code=code,
+                action=str(info["action"]), result={"ok": False, "error": str(exc), "error_code": code},
+            )
+
+    task_registry.spawn(worker, name=f"draft-{task.task_id}")
+    return task.public()
+
+
+def draft_task_status(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    from server import tasks as task_registry
+
+    return task_registry.latest(paths, name, chapter_id) or {
+        "status": "idle", "chapter_id": chapter_id, "cancellable": False,
     }
+
+
+def cancel_task(paths: Paths, task_id: str) -> dict[str, Any]:
+    from server import tasks as task_registry
+
+    return task_registry.request_cancel(paths, task_id)
+
+
+def draft_versions(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    from workshop import draft_store
+
+    work_dir = paths.work_dir(name)
+    return {
+        "chapter_id": chapter_id,
+        "versions": draft_store.list_versions(work_dir, chapter_id),
+        "candidates": draft_store.list_candidates(work_dir, chapter_id),
+    }
+
+
+def promote_candidate(paths: Paths, name: str, chapter_id: str, candidate_id: str) -> dict[str, Any]:
+    from workshop import draft_store
+
+    return draft_store.promote_candidate(paths.work_dir(name), chapter_id, candidate_id)
+
+
+def restore_version(paths: Paths, name: str, chapter_id: str, version_id: str) -> dict[str, Any]:
+    from workshop import draft_store
+
+    return draft_store.restore_version(paths.work_dir(name), chapter_id, version_id)
 
 
 def read_draft(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:

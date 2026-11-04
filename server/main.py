@@ -68,6 +68,22 @@ PATHS = services.Paths(root=ROOT)
 app = FastAPI(title="小说创作工坊", version=__version__, docs_url="/api/docs")
 
 
+@app.on_event("startup")
+def _mark_interrupted_generation_tasks() -> None:
+    """上次进程被杀时还在跑的任务，重启后不能装成还在跑。
+
+    扫盘上 task 文件，把 running/cancelling 标成 interrupted，
+    UI 才能给出「查看候选 / 从断点继续」的入口。
+    """
+    from server import tasks
+
+    try:
+        tasks.mark_interrupted(PATHS)
+    except OSError:
+        # 启动阶段不该因为一个坏 task 文件起不来。
+        pass
+
+
 @app.middleware("http")
 async def no_cache_for_ui(request, call_next):
     """界面文件强制重新校验。
@@ -934,6 +950,10 @@ class DraftGenerateBody(BaseModel):
     temperature: float = 0.8
     # 调试/验收用：不传就用默认 8000。正常界面不暴露这个参数。
     budget_chars: int | None = Field(default=None, ge=1, le=200000)
+    # B3/A2：从候选的断点继续写，而不是从头重写。
+    resume_candidate: str = ""
+    # B1：指令没变时不重复生成细纲。作者手动点「重做细纲」才置 true。
+    force_beats: bool = False
 
 
 class DraftWriteBody(BaseModel):
@@ -962,18 +982,79 @@ def api_draft_plan(
         raise HTTPException(400, str(exc)) from exc
 
 
-@app.post("/api/works/{name}/creation/draft/{chapter_id}")
+@app.post("/api/works/{name}/creation/draft/{chapter_id}", status_code=202)
 def api_draft_generate(name: str, chapter_id: str, body: DraftGenerateBody) -> dict:
-    """写这一章（**会花钱**）。只出一章，跑完落盘并自检，不往下串。"""
+    """写这一章（**会花钱**）。立刻返回 task_id，进度与取消走 /api/tasks。
+
+    不能在这里同步等模型：一次写几千字要几十秒，期间界面什么都做不了，
+    作者连「停」都点不了。改成后台任务后，取消信号才能一路传到模型调用层。
+    """
     try:
-        return services.run_draft(
+        return services.start_draft(
             PATHS, safe_name(name), chapter_id, refs=body.refs, level=body.level,
             provider_id=body.provider, model_id=body.model,
             max_tokens=body.max_tokens, temperature=body.temperature,
-            budget_chars=body.budget_chars,
+            budget_chars=body.budget_chars, resume_candidate=body.resume_candidate,
+            force_beats=body.force_beats,
         )
     except ContextBudgetError as exc:
         raise HTTPException(422, str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/tasks/{task_id}")
+def api_task_status(task_id: str) -> dict:
+    """任务进度：阶段、第几轮、调用账、能不能取消。"""
+    from server import tasks
+
+    task = tasks.get(PATHS, task_id)
+    if not task:
+        raise HTTPException(404, f"找不到任务「{task_id}」")
+    return task.public()
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+def api_task_cancel(task_id: str) -> dict:
+    """**真取消**：置位 cancel_event，流式循环读到下一行就关掉上游连接。"""
+    try:
+        return services.cancel_task(PATHS, task_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/task")
+def api_draft_latest_task(name: str, chapter_id: str) -> dict:
+    """页面刷新后恢复：这一章最近一次生成到哪了（含中断/失败原因）。"""
+    try:
+        return services.draft_task_status(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/versions")
+def api_draft_versions(name: str, chapter_id: str) -> dict:
+    """历史版本 + 恢复候选。作者可以选一个转正，或从候选断点继续。"""
+    try:
+        return services.draft_versions(PATHS, safe_name(name), chapter_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/candidates/{candidate_id}/promote")
+def api_promote_candidate(name: str, chapter_id: str, candidate_id: str) -> dict:
+    """候选转正。转正前先把当前正文存成历史版本，不会把上一版弄丢。"""
+    try:
+        return services.promote_candidate(PATHS, safe_name(name), chapter_id, candidate_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/works/{name}/creation/draft/{chapter_id}/versions/{version_id}/restore")
+def api_restore_version(name: str, chapter_id: str, version_id: str) -> dict:
+    """恢复到某个历史版本；恢复前同样先备份当前正文。"""
+    try:
+        return services.restore_version(PATHS, safe_name(name), chapter_id, version_id)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 

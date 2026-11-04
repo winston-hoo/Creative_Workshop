@@ -119,6 +119,8 @@ class StreamResult:
     output_tokens: int = 0
     reasoning_tokens: int = 0
     usage: Usage | None = None
+    finish_reason: str = ""
+    """流式结束原因。`length` 表示撞上 max_tokens。截断续写全靠它判定。"""
 
     @property
     def content_tokens(self) -> int:
@@ -365,12 +367,17 @@ class OpenAICompatProvider:
         max_tokens: int = 8,
         temperature: float = 0.0,
         extra: dict[str, Any] | None = None,
+        cancel_event: Any | None = None,
     ) -> StreamResult:
-        """流式对话。开流式才能测出首字延迟（TTFT）。
+        """流式对话。开流式才能测出首字延迟（TTFT），也才能**真取消**。
 
         思维链内容走独立的 reasoning_content 字段，与 content 同级。
         如果只盯 content，思考模式下会整段思考都统计不到，TTFT 直接变成「未测到」。
         所以这里两者都记：ttft_ms 记首个任意 delta，first_content_ms 记首个正文 delta。
+
+        `cancel_event` 是 `threading.Event`。每读到一行检查一次，置位就关闭连接并抛
+        `GenerationCancelled`。非流式调用做不到这一点——它只能等整段返回，
+        「取消」就变成了前端假停。所以写正文与细纲统一走流式。
         """
         payload: dict[str, Any] = {
             "model": model,
@@ -384,15 +391,22 @@ class OpenAICompatProvider:
         if extra:
             payload.update(extra)
 
+        from .errors import GenerationCancelled
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationCancelled("已取消")
+        pieces: list[str] = []
+
         result = StreamResult()
         start = time.perf_counter()
         resp = self._request("POST", "/chat/completions", json=payload, stream=True)
         self._raise_for_status(resp)
 
-        pieces: list[str] = []
         reasoning_pieces: list[str] = []
         try:
             for raw_line in resp.iter_lines(decode_unicode=False):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationCancelled("已取消", partial_text="".join(pieces))
                 if not raw_line:
                     continue
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -413,6 +427,9 @@ class OpenAICompatProvider:
                 choices = parsed.get("choices") or []
                 if not choices or not isinstance(choices[0], dict):
                     continue
+                finish = choices[0].get("finish_reason")
+                if finish:
+                    result.finish_reason = str(finish)
                 delta = choices[0].get("delta") or {}
 
                 content = delta.get("content")

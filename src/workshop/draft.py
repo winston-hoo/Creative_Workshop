@@ -217,6 +217,7 @@ def build_draft_messages(
     title: str = "",
     craft: str | None = None,
     context_block: str = "",
+    beats: str = "",
 ) -> list[dict[str, str]]:
     from .setting_assist import REFS_USAGE_HINT, render_document
 
@@ -245,6 +246,10 @@ def build_draft_messages(
                   render_document(volume, layer="volume"), ""]
     if brief:
         parts += ["【本章创作任务指令：按它写】", render_document(brief, layer="brief"), ""]
+    # B1：细纲紧随指令之后。放在设定集/卷表前面会被几千字材料冲掉；
+    # 放在指令后面，模型读完「这一章要干什么」，立刻看到「按这几步干」。
+    if beats:
+        parts += [beats, ""]
     if craft:
         parts += ["【技法参考：这些是写法，不是内容；按它组织，但不要照抄例句】", craft, ""]
     if refs_block:
@@ -263,13 +268,72 @@ def build_draft_messages(
 # ── 生成（会花钱） ──────────────────────────────────────────
 
 
+MAX_CONTINUE_ROUNDS = 3
+"""截断后最多再续写几轮。刻意有上限：模型如果反复写不完整，
+再多轮也只是把同一段尾巴复读得更长，钱和时间都白花。"""
+
+CONTINUE_INSTRUCTION = (
+    "上一段正文被 max_tokens 截断了。请**从断掉的地方接着写**，只输出接下来的正文：\n"
+    "- 不要重写开头，不要重复已经写过的任何句子或段落；\n"
+    "- 不要写「续」「（未完）」之类的标记，不要解释；\n"
+    "- 保持原来的视角、语气与人物状态，直接往下叙事。"
+)
+
+
 @dataclass
 class DraftResult:
     text: str = ""
     usage: dict[str, int] = field(default_factory=dict)
     error: str = ""
+    error_code: str = ""
     finish_reason: str = ""
     truncated: bool = False
+    continued: bool = False
+    """这一章是否靠续写才写成（首轮就被截断过）。"""
+    continue_rounds: int = 0
+    hit_continue_limit: bool = False
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    """每一次模型调用的账：轮次、字数、finish_reason、耗时、用量。写进 manifest。"""
+
+
+def _merge_usage(total: dict[str, int], usage: dict[str, int] | None) -> None:
+    for key, value in (usage or {}).items():
+        if isinstance(value, int):
+            total[key] = total.get(key, 0) + value
+
+
+def _call_row(
+    *,
+    stage: str,
+    round_no: int,
+    attempt: int,
+    raw_text: str,
+    new_text: str,
+    total_chars: int,
+    usage: dict[str, int],
+    finish_reason: str,
+    elapsed_ms: float,
+    max_tokens: int,
+    dedupe: dict[str, Any] | None = None,
+    error_code: str = "",
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "round": round_no,
+        "attempt": attempt,
+        "chars": count_chars(raw_text),
+        "new_chars": count_chars(new_text),
+        "total_chars": total_chars,
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "finish_reason": finish_reason,
+        "elapsed_ms": round(float(elapsed_ms), 1),
+        "max_tokens": max_tokens,
+        "dedupe": dedupe or {},
+        "error_code": error_code,
+        "ok": not error_code,
+    }
 
 
 def generate_draft(
@@ -281,33 +345,170 @@ def generate_draft(
     temperature: float = 0.8,
     max_attempts: int = 2,
     thinking: str | None = "disabled",
+    cancel_event: Any | None = None,
+    cancel_check: Any | None = None,
+    on_round: Any | None = None,
+    on_partial: Any | None = None,
+    prior_text: str = "",
+    max_continue_rounds: int = MAX_CONTINUE_ROUNDS,
 ) -> DraftResult:
-    """写这一章。**只返回文本，不落盘**——落盘由调用方决定。"""
+    """写这一章。**只返回文本，不落盘**——落盘由调用方决定。
+
+    2026-11 起改走流式：
+      · 只有流式能在读到一半时**真的停掉**（取消）；
+      · `finish_reason=length` 也只有流式结束帧才稳定拿得到。
+
+    被截断时自动按章续写，最多 `max_continue_rounds` 轮；续写开头与上一轮尾巴的
+    重叠交给 `text_overlap.dedupe_continuation` 机械裁掉，不靠提示词自觉。
+    """
+    from .errors import ErrorKind, GenerationCancelled
+    from .text_overlap import dedupe_continuation, stitch
+
     extra = build_thinking_extra(thinking, None)
     usage_total: dict[str, int] = {}
+    calls: list[dict[str, Any]] = []
+    accumulated = strip_wrapping(prior_text) if prior_text else ""
+    continued = bool(prior_text)
+    continue_rounds = 0
+    last_finish = ""
     last_error = ""
-    for _ in range(max(1, max_attempts)):
-        try:
-            result: ChatResult = client.chat(
-                model_id, messages, max_tokens=max_tokens, temperature=temperature, extra=extra,
+    last_error_code = ""
+    hit_limit = False
+    round_no = 0
+
+    def cancelled() -> bool:
+        return bool(cancel_event is not None and cancel_event.is_set()) or bool(
+            cancel_check and cancel_check()
+        )
+
+    def emit(row: dict[str, Any]) -> None:
+        calls.append(row)
+        if on_round:
+            on_round(row)
+
+    while True:
+        if cancelled():
+            raise GenerationCancelled("已取消")
+        first = not prior_text and round_no == 0
+        stage = "draft" if first else "continue"
+        if first:
+            call_messages = messages
+        else:
+            call_messages = list(messages) + [
+                {"role": "assistant", "content": accumulated},
+                {"role": "user", "content": CONTINUE_INSTRUCTION},
+            ]
+
+        attempt = 0
+        result = None
+        while attempt < max(1, max_attempts):
+            attempt += 1
+            if cancelled():
+                raise GenerationCancelled("已取消")
+            try:
+                result = client.chat_stream(
+                    model_id, call_messages, max_tokens=max_tokens,
+                    temperature=temperature, extra=extra, cancel_event=cancel_event,
+                )
+            except GenerationCancelled as exc:
+                # 把**此前各轮**的正文一起带出去。只给当前这一轮的话，
+                # 从第二轮取消时，第一轮写好的内容就丢了，作者没法从断点继续。
+                raise GenerationCancelled(
+                    str(exc), partial_text=(accumulated + (exc.partial_text or ""))
+                ) from exc
+            except ApiError as exc:
+                last_error_code = exc.kind.value
+                last_error = f"{exc.kind.value}：{exc.safe_body(client.secrets)}"
+                emit(_call_row(
+                    stage=stage, round_no=round_no, attempt=attempt, raw_text="",
+                    new_text="", total_chars=count_chars(accumulated), usage={},
+                    finish_reason="", elapsed_ms=0, max_tokens=max_tokens,
+                    error_code=last_error_code,
+                ))
+                if exc.kind in (ErrorKind.AUTH_FAILED, ErrorKind.ENDPOINT_NOT_FOUND,
+                                ErrorKind.MODEL_NOT_FOUND):
+                    return DraftResult(
+                        text=accumulated, usage=usage_total, error=last_error,
+                        error_code=last_error_code, calls=calls,
+                        continued=continued, continue_rounds=continue_rounds,
+                    )
+                continue
+            usage = result.usage.to_dict() if result.usage else {
+                "prompt_tokens": 0,
+                "completion_tokens": result.output_tokens,
+                "total_tokens": result.output_tokens,
+            }
+            _merge_usage(usage_total, usage)
+            if not (result.text or "").strip():
+                last_error_code = ErrorKind.EMPTY_RESPONSE.value
+                last_error = "模型返回了空正文"
+                emit(_call_row(
+                    stage=stage, round_no=round_no, attempt=attempt, raw_text="",
+                    new_text="", total_chars=count_chars(accumulated), usage=usage,
+                    finish_reason=result.finish_reason, elapsed_ms=result.total_ms,
+                    max_tokens=max_tokens, error_code=last_error_code,
+                ))
+                continue
+            break
+
+        if result is None or not (result.text or "").strip():
+            return DraftResult(
+                text=accumulated, usage=usage_total, error=last_error or "模型没有返回内容",
+                error_code=last_error_code, calls=calls, continued=continued,
+                continue_rounds=continue_rounds,
             )
-        except ApiError as exc:
-            last_error = f"{exc.kind.value}：{exc.safe_body(client.secrets)}"
-            continue
-        if result.usage:
-            for key, value in result.usage.to_dict().items():
-                if isinstance(value, int):
-                    usage_total[key] = usage_total.get(key, 0) + value
-        text = strip_wrapping(result.text)
-        if not text.strip():
-            last_error = "模型返回了空正文"
-            continue
-        finish = getattr(result, "finish_reason", "") or ""
-        # 被 max_tokens 截断的话，末尾就是断的。这个必须说出来——
-        # 作者以为模型写完了，其实后面少了半章，而它读起来像正常的结尾。
+
+        finish = result.finish_reason or ""
         truncated = finish in ("length", "max_tokens")
-        return DraftResult(text=text, usage=usage_total, finish_reason=finish, truncated=truncated)
-    return DraftResult(error=last_error, usage=usage_total)
+        # 有些供应商不给 finish_reason。输出刚好顶满 max_tokens 时用用量兜底——
+        # 不能因为上游少一个字段，就让半章正文被当成完整章节落盘。
+        if not finish and max_tokens and int(usage.get("completion_tokens") or 0) >= max_tokens:
+            truncated = True
+        last_finish = finish
+
+        if first:
+            cleaned = strip_wrapping(result.text)
+            dedupe_stats: dict[str, Any] = {}
+        else:
+            cleaned_raw = strip_wrapping(result.text)
+            cleaned, dedupe_stats = dedupe_continuation(accumulated, cleaned_raw)
+        if not cleaned.strip() and not truncated:
+            last_error_code = ErrorKind.EMPTY_RESPONSE.value
+            last_error = "续写只重复了上一段，没有产生新内容"
+        new_total = stitch(accumulated, cleaned) if not first else cleaned
+        if stage == "continue":
+            continue_rounds += 1
+            continued = True
+        accumulated = new_total
+        row = _call_row(
+            stage=stage, round_no=round_no, attempt=attempt, raw_text=result.text,
+            new_text=cleaned, total_chars=count_chars(accumulated), usage=usage,
+            finish_reason=finish, elapsed_ms=result.total_ms, max_tokens=max_tokens,
+            dedupe=dedupe_stats,
+            error_code=(ErrorKind.EMPTY_RESPONSE.value
+                        if not cleaned.strip() and not truncated else ""),
+        )
+        emit(row)
+        if on_partial:
+            on_partial(accumulated, row)
+
+        if not truncated:
+            return DraftResult(
+                text=accumulated, usage=usage_total, error=last_error,
+                error_code=last_error_code, finish_reason=last_finish, truncated=False,
+                continued=continued, continue_rounds=continue_rounds, calls=calls,
+            )
+        # 到了轮数上限还截断：这一章就是没写完，交给调用方按失败处理。
+        if continue_rounds >= max(1, max_continue_rounds):
+            hit_limit = True
+            return DraftResult(
+                text=accumulated, usage=usage_total,
+                error=f"续写到上限（{continue_rounds} 轮）仍被 max_tokens 截断，这一章没写完",
+                error_code=ErrorKind.TRUNCATED.value,
+                finish_reason=last_finish, truncated=True, continued=continued,
+                continue_rounds=continue_rounds, hit_continue_limit=True, calls=calls,
+            )
+        round_no += 1
 
 
 _TITLE_PATTERNS = (

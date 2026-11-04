@@ -2336,6 +2336,10 @@ const creationState = {
   prose: null,         // 已写的正文（brief 层）；draft 是表单草稿，别混
   prosePlan: null,
   prosePlanError: null,  // 计划被预算挡下时的可读原因，原样显示，不吞
+  proseTask: null,       // 最近一次生成任务（U3：阶段/轮次/取消）
+  proseTaskLoaded: false,
+  proseTaskTimer: null,
+  proseVersions: null,   // 历史版本 + 恢复候选（A2/B3）
   toolsOpen: false,    // 右侧工具抽屉（素材库 / 助手）开着没有
   toolsPane: 'kb',     // 抽屉里当前在看哪个页签
   rerenderForm: null,  // 草稿被别处换掉之后的整页重画（见 creationDraftChanged）
@@ -3990,6 +3994,152 @@ function creationRenderBudget(report) {
   </div>`;
 }
 
+/* U5：调用账。细纲、正文首轮、每一轮续写各花多少，必须分开列——
+   合起来只给一个总数的话，作者看到费用翻倍，却不知道钱花在「多写了一次细纲」
+   还是「模型复读了三轮」。数据和 manifest 的 calls 是同一份。 */
+function creationRenderCallLedger(calls) {
+  if (!Array.isArray(calls) || !calls.length) return '';
+  const label = (r) => (r.stage === 'beats' ? '写前细纲'
+    : r.stage === 'continue' ? `续写第 ${Number(r.round) || 1} 轮`
+      : '正文首轮');
+  const finish = (f) => ({ length: '截断 length', max_tokens: '截断 max_tokens', stop: '写完 stop' }[f]
+    || f || '—');
+  const rows = calls.filter(Boolean).map((r) => `
+    <tr class="${r.error_code ? 'ledger-bad' : ''}">
+      <td>${esc(label(r))}</td>
+      <td>${num(r.new_chars || r.chars || 0)} 字${r.total_chars ? `<span class="muted"> / 累计 ${num(r.total_chars)}</span>` : ''}</td>
+      <td>${num(r.prompt_tokens || 0)} + ${num(r.completion_tokens || 0)}</td>
+      <td>${esc(finish(r.finish_reason))}</td>
+      <td>${r.elapsed_ms ? `${(Number(r.elapsed_ms) / 1000).toFixed(1)}s` : '—'}</td>
+      <td class="muted">${r.dedupe && r.dedupe.overlap_removed
+        ? `去重 ${num(r.dedupe.overlap_removed)} 字` : ''}${r.error_code ? ` ${esc(r.error_code)}` : ''}</td>
+    </tr>`).join('');
+  return `<div class="ledger">
+    <div class="spread" style="align-items:baseline">
+      <b>调用账本</b>
+      <span class="muted" style="font-size:12px">共 ${calls.length} 次调用；续写与细纲各占一行</span>
+    </div>
+    <table class="ledger-table">
+      <thead><tr><th>用途</th><th>本轮新增</th><th>token 入+出</th><th>结束原因</th><th>耗时</th><th>去重/错误</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+function creationRenderBeats(info) {
+  if (!info) return '';
+  const beats = Array.isArray(info.beats) ? info.beats : [];
+  const status = info.stale
+    ? notice('warn', '指令改过了，这份细纲已过期；下次生成会重新拆，不会拿旧计划写新章。')
+    : '';
+  const body = beats.length ? beats.map((b) => `
+    <div class="beat-row">
+      <span class="beat-no">${Number(b.no) || 0}</span>
+      <div><b>${esc(b.title || '（无标题）')}</b>
+        <p style="margin:2px 0 0">${esc(b.goal || '')}</p>
+        ${(b.must || []).length ? `<p class="muted" style="margin:2px 0 0">必须写到：${esc(b.must.join('、'))}</p>` : ''}
+      </div>
+    </div>`).join('') : `<p class="muted" style="margin:6px 0 0">
+      还没有细纲。第一次生成时会先花一次短调用拆 5–8 个节拍，再写正文。</p>`;
+  return `<div class="beats-box">
+    <div class="spread" style="align-items:baseline">
+      <b>写前细纲</b>
+      <span class="muted" style="font-size:12px">
+        ${info.count ? `${info.count} 个节拍` : '未生成'}
+        ${info.source ? ` · ${({ model: '本次生成', reused: '复用已落盘', failed: '生成失败已回退' }[info.source] || info.source)}` : ''}
+        ${info.saved_at ? ` · ${esc(info.saved_at)}` : ''}
+      </span>
+    </div>
+    ${status}
+    ${info.source === 'failed' ? notice('warn', `细纲失败已回退：${esc(info.error || '未知原因')}`) : ''}
+    <div class="beat-list">${body}</div>
+    ${beats.length ? `<label class="muted" style="display:block;margin-top:8px;font-size:12px">
+      <input type="checkbox" id="draft-force-beats"> 重写时重新拆细纲（指令没改也能强制重做）</label>` : ''}
+  </div>`;
+}
+
+const PROSE_STAGES = ['装配材料', '写前细纲', '正文生成', '自检与落盘'];
+
+function creationRenderTask(task) {
+  if (!task || !task.status || task.status === 'idle') return '';
+  const running = task.status === 'running' || task.status === 'cancelling';
+  const failed = task.status === 'failed' || task.status === 'interrupted';
+  const stopped = failed || task.status === 'cancelled';
+  const idx = Number(task.stage_index) || 0;
+  const steps = PROSE_STAGES.map((name, i) => {
+    const done = task.status === 'done' || (task.status !== 'failed' && task.status !== 'cancelled'
+      && task.status !== 'interrupted' && i < idx);
+    const now = running && i === idx;
+    return `<li class="${done ? 'task-done' : now ? 'task-now' : (stopped && i === idx ? 'task-stop' : '')}">
+      <i></i><span>${esc(name)}</span></li>`;
+  }).join('');
+  const round = Number(task.round) || 0;
+  const maxRounds = Number(task.max_rounds) || 0;
+  const roundText = (idx >= 2 && (round > 0 || running))
+    ? `正文第 ${round + 1} 次调用${maxRounds ? `（续写上限 ${maxRounds} 轮）` : ''}`
+    : '';
+  const eta = task.elapsed_ms ? `${(Number(task.elapsed_ms) / 1000).toFixed(1)}s` : '';
+  const statusText = ({
+    running: '正在跑', cancelling: '正在停…', done: '完成',
+    failed: `失败${task.error_code ? ` · ${task.error_code}` : ''}`,
+    cancelled: '已取消', interrupted: '中断',
+  }[task.status] || task.status);
+  return `<div class="task-box ${failed ? 'task-box-bad' : task.status === 'done' ? 'task-box-ok' : ''}">
+    <div class="spread" style="align-items:baseline">
+      <b>生成进度：${esc(statusText)}</b>
+      <span class="muted" style="font-size:12px">${eta}${roundText ? ` · ${esc(roundText)}` : ''}</span>
+    </div>
+    <ul class="task-steps">${steps}</ul>
+    <p class="muted" style="margin:4px 0 0;font-size:12px">${esc(task.message || '')}</p>
+    ${task.chars ? `<p class="muted" style="margin:4px 0 0;font-size:12px">已写 ${num(task.chars)} 字</p>` : ''}
+    ${failed ? notice('bad',
+      `<b>${esc(task.error_code || 'failed')}</b>：${esc(task.error || task.message || '未知原因')}`
+      + (task.action ? `<br><span class="muted">建议：${esc(task.action)}</span>` : '')) : ''}
+    ${task.status === 'cancelled'
+      ? notice('warn', '已取消。服务端已停止模型调用，正式稿没有被覆盖。') : ''}
+    ${task.status === 'interrupted'
+      ? notice('warn', '服务重启导致中断。已写内容在候选里；可以「从断点继续」或重新生成。') : ''}
+    ${task.candidate_id ? `<p class="muted" style="margin:4px 0 0;font-size:12px">
+      候选已保留：<code>${esc(task.candidate_id)}</code>（见下方恢复候选）</p>` : ''}
+    ${running && task.cancellable ? '<div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn" id="draft-cancel">停止生成</button></div>' : ''}
+    ${creationRenderCallLedger(task.calls || [])}
+  </div>`;
+}
+
+function creationRenderRecovery() {
+  const v = creationState.proseVersions;
+  if (!v) return '';
+  const cands = v.candidates || [];
+  const versions = v.versions || [];
+  if (!cands.length && !versions.length) return '';
+  const candRows = cands.map((c) => `<div class="recover-row">
+    <div>
+      <b>${num(c.chars || 0)} 字</b>
+      <span class="muted"> · ${esc(c.created_at || '')}</span>
+      <p class="muted" style="margin:2px 0 0;font-size:12px">${esc(c.reason || '')}</p>
+    </div>
+    <div class="row">
+      <button class="btn" data-resume-candidate="${esc(c.candidate_id)}">从断点继续</button>
+      <button class="btn" data-promote-candidate="${esc(c.candidate_id)}">转正为正文</button>
+    </div>
+  </div>`).join('');
+  const verRows = versions.map((r) => `<div class="recover-row">
+    <div>
+      <b>${num(r.chars || 0)} 字</b>
+      <span class="muted"> · ${esc(r.created_at || '')} · ${esc(r.reason || '')}</span>
+      <p class="muted" style="margin:2px 0 0;font-size:12px"><code>${esc(r.version_id)}</code></p>
+    </div>
+    <button class="btn" data-restore-version="${esc(r.version_id)}">恢复到此版本</button>
+  </div>`).join('');
+  return `<div class="recover-box">
+    <b>恢复候选与历史版本</b>
+    <p class="muted" style="margin:4px 0 8px;font-size:12px">
+      候选是失败/中断/截断时留下的半截正文，可转正或从断点继续；版本是每次成功覆盖前自动备份的。</p>
+    ${cands.length ? `<div class="recover-title">候选（${cands.length}）</div>${candRows}` : ''}
+    ${versions.length ? `<div class="recover-title">历史版本（${versions.length}）</div>${verRows}` : ''}
+  </div>`;
+}
+
 function creationRenderDraft() {
   if (creationState.kind !== 'brief' || !creationState.key) return '';
   const plan = creationState.prosePlan || {};
@@ -3997,8 +4147,10 @@ function creationRenderDraft() {
   const cost = plan.est_cost_cny == null ? '（没填单价，算不出费用）' : `约 ¥${plan.est_cost_cny}`;
   const words = (plan.word_range || [2800, 4000]).join('–');
   const existing = plan.has_draft
-    ? `<span class="muted" style="font-size:12px">已有正文 ${num(plan.existing_chars || 0)} 字，再写一次会覆盖</span>`
+    ? `<span class="muted" style="font-size:12px">已有正文 ${num(plan.existing_chars || 0)} 字，再写一次会覆盖；覆盖前自动存历史版本，可恢复</span>`
     : '';
+  const taskRunning = creationState.proseTask
+    && ['running', 'cancelling'].includes(creationState.proseTask.status);
   const blockers = (plan.blocker ? [plan.blocker] : []).concat(plan.warnings || []);
 
   return `<div class="blk" id="creation-draft-host">
@@ -4018,6 +4170,10 @@ function creationRenderDraft() {
     ${blockers.length ? blockers.map((b, i) =>
       notice(plan.blocker && i === 0 ? 'bad' : 'warn', esc(b))).join('') : ''}
     ${plan.context_report ? creationRenderBudget(plan.context_report) : ''}
+    <div id="creation-task-host">${creationRenderTask(creationState.proseTask)}</div>
+    ${creationRenderBeats(plan.beats)}
+    ${creationRenderCallLedger((creationState.proseTask && creationState.proseTask.calls)
+      || (plan.last_run && plan.last_run.calls) || [])}
     ${existing}
     ${creationNotSaved() ? `
     <div class="row" style="justify-content:space-between;align-items:center;margin-top:8px">
@@ -4025,13 +4181,14 @@ function creationRenderDraft() {
         上面那份指令还只是骨架，磁盘上没有这个文件——保存之后才写得成。</span>
       <button class="btn" id="draft-save-brief">保存本章指令</button>
     </div>` : ''}
+    <div id="creation-recovery-host">${creationRenderRecovery()}</div>
     <div class="row" style="justify-content:flex-end;margin-top:8px">
       <button class="btn" id="draft-review" ${plan.has_draft ? '' : 'disabled'}
         title="按技法审查维度审这一章，意见落成对本章指令的修正">技法审稿…</button>
       <button class="btn" id="draft-writeback" ${plan.has_draft ? '' : 'disabled'}
         title="${plan.has_draft ? '' : '还没有正文，没什么可回填的'}">回填到设定集…</button>
-      <button class="btn primary" id="draft-go" ${plan.ready ? '' : 'disabled'}>
-        ${plan.has_draft && plan.ready ? '重写这一章' : '写这一章'}${plan.ready ? `（${cost}）` : ''}</button>
+      <button class="btn primary" id="draft-go" ${plan.ready && !taskRunning ? '' : 'disabled'}>
+        ${taskRunning ? '正在生成…' : `${plan.has_draft && plan.ready ? '重写这一章' : '写这一章'}${plan.ready ? `（${cost}）` : ''}`}</button>
     </div>
     <div id="draft-note" style="margin-top:8px"></div>
   </div>`;
@@ -4083,6 +4240,24 @@ function creationRenderDraftResult() {
 
 function creationBindDraft() {
   if (creationState.kind !== 'brief' || !creationState.key) return;
+  // U3：刷新页面后先把这一章最近一次任务接回来。还在跑的继续轮询，
+  // 中断/失败的显示原因与恢复入口；已经完成的不用再占一块（计划里已有调用账）。
+  if (!creationState.proseTaskLoaded) {
+    creationState.proseTaskLoaded = true;
+    getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}/task`)
+      .then((t) => {
+        // 已完成的正文已经在正文区；已取消的不该每次刷新都挂一块旧提示。
+        // 只有还在跑、或失败/中断（需要作者处置）才恢复显示。
+        if (!t || ['idle', 'done', 'cancelled'].includes(t.status)) return;
+        creationState.proseTask = t;
+        updateProseTaskPanel();
+        if (t.status === 'running' || t.status === 'cancelling') pollProseTask(t.task_id);
+        else loadProseVersions();
+      })
+      .catch(() => {});
+  }
+  loadProseVersions();
   if (!creationState.prosePlan) {
     getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}/plan`)
@@ -4131,7 +4306,7 @@ function creationBindDraft() {
         html:
           `<p style="margin:0">目标 ${esc(words)} 字，${esc(cost)}。</p>` +
           (plan.has_draft
-            ? '<p class="muted" style="margin:8px 0 0">写完会覆盖现有正文，覆盖之后找不回来。</p>'
+            ? '<p class="muted" style="margin:8px 0 0">写完会覆盖现有正文；覆盖前会自动存一份历史版本，可从「恢复候选」里找回。</p>'
             : ''),
         confirmLabel: plan.has_draft ? '覆盖并重写' : '开始写',
         danger: !!plan.has_draft,
@@ -4146,6 +4321,137 @@ function creationBindDraft() {
   if (wb) wb.onclick = () => draftWriteback();
   const rv = document.getElementById('draft-review');
   if (rv) rv.onclick = () => draftReview();
+  bindProseTaskActions();
+  bindRecoveryActions();
+}
+
+function clearProseTaskTimer() {
+  if (creationState.proseTaskTimer) {
+    clearTimeout(creationState.proseTaskTimer);
+    creationState.proseTaskTimer = null;
+  }
+}
+
+function bindProseTaskActions() {
+  const btn = document.getElementById('draft-cancel');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const task = creationState.proseTask;
+    if (!task || !task.task_id) return;
+    btn.disabled = true;
+    btn.textContent = '正在停…';
+    try {
+      // 这里必须调服务端接口：只断前端轮询等于没停，上游还在烧 token。
+      creationState.proseTask = await postJSON(`/api/tasks/${encodeURIComponent(task.task_id)}/cancel`, {});
+      updateProseTaskPanel();
+      pollProseTask(task.task_id);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '停止生成';
+      await tellUser('取消失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    }
+  };
+}
+
+function updateProseTaskPanel() {
+  const host = document.getElementById('creation-task-host');
+  if (host) host.innerHTML = creationRenderTask(creationState.proseTask);
+  bindProseTaskActions();
+  const go = document.getElementById('draft-go');
+  const running = creationState.proseTask
+    && ['running', 'cancelling'].includes(creationState.proseTask.status);
+  if (go) {
+    go.disabled = running || !(creationState.prosePlan || {}).ready;
+    if (running) go.textContent = '正在生成…';
+  }
+}
+
+function pollProseTask(taskId) {
+  clearProseTaskTimer();
+  const tick = async () => {
+    try {
+      const task = await getJSON(`/api/tasks/${encodeURIComponent(taskId)}`);
+      creationState.proseTask = task;
+      updateProseTaskPanel();
+      const done = ['done', 'failed', 'cancelled', 'interrupted'].includes(task.status);
+      if (done) {
+        // 结束后重新取计划/正文/候选：调用账、细纲、错误码都来自服务端落盘结果。
+        creationState.prosePlan = null;
+        creationState.prosePlanError = null;
+        creationState.prose = null;
+        loadProseVersions();
+        creationLoad();
+        return;
+      }
+    } catch (e) {
+      // 轮询失败不要静默定成完成：可能只是这一秒网络抖了，下一轮继续。
+    }
+    creationState.proseTaskTimer = setTimeout(tick, 1000);
+  };
+  creationState.proseTaskTimer = setTimeout(tick, 1000);
+}
+
+function loadProseVersions() {
+  if (creationState.kind !== 'brief' || !creationState.key) return;
+  const chapter = creationState.key;
+  getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+    + `${encodeURIComponent(chapter)}/versions`)
+    .then((v) => {
+      if (creationState.key !== chapter) return;
+      creationState.proseVersions = v;
+      const host = document.getElementById('creation-recovery-host');
+      if (host) host.innerHTML = creationRenderRecovery();
+      bindRecoveryActions();
+    })
+    .catch(() => {});
+}
+
+function bindRecoveryActions() {
+  const box = document.getElementById('creation-recovery-host');
+  if (!box) return;
+  box.querySelectorAll('[data-promote-candidate]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const res = await postJSON(
+          `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+          + `${encodeURIComponent(creationState.key)}/candidates/`
+          + `${encodeURIComponent(btn.dataset.promoteCandidate)}/promote`, {});
+        creationState.prose = null;
+        creationState.prosePlan = null;
+        loadProseVersions();
+        creationLoad();
+        await tellUser('候选已转正', `<p style="margin:0">现在正文 ${num(res.chars || 0)} 字。</p>`);
+      } catch (e) {
+        await tellUser('转正失败', `<p style="margin:0">${esc(e.message)}</p>`);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
+  box.querySelectorAll('[data-restore-version]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const res = await postJSON(
+          `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+          + `${encodeURIComponent(creationState.key)}/versions/`
+          + `${encodeURIComponent(btn.dataset.restoreVersion)}/restore`, {});
+        creationState.prose = null;
+        creationState.prosePlan = null;
+        loadProseVersions();
+        creationLoad();
+        await tellUser('已恢复', `<p style="margin:0">现在正文 ${num(res.chars || 0)} 字。</p>`);
+      } catch (e) {
+        await tellUser('恢复失败', `<p style="margin:0">${esc(e.message)}</p>`);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
+  box.querySelectorAll('[data-resume-candidate]').forEach((btn) => {
+    btn.onclick = () => draftGenerate({ resumeCandidate: btn.dataset.resumeCandidate });
+  });
 }
 
 /* 回填：拿这一章的正文当事实来源，把正文里**实际出现过的**东西提回设定集。
@@ -4182,34 +4488,34 @@ async function draftWriteback() {
   }
 }
 
-async function draftGenerate() {
+async function draftGenerate(options = {}) {
   const btn = document.getElementById('draft-go');
   const note = document.getElementById('draft-note');
-  btn.disabled = true;
-  btn.textContent = '写着呢…（长篇会慢，可能要一两分钟）';
+  const forceBeats = !!document.getElementById('draft-force-beats')?.checked;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '正在启动…';
+  }
+  if (note) note.innerHTML = '';
   try {
-    const res = await postJSON(
+    const task = await postJSON(
       `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}`,
-      { refs: creationState.refs, level: creationState.refsLevel }
+      {
+        refs: creationState.refs, level: creationState.refsLevel,
+        force_beats: forceBeats,
+        resume_candidate: options.resumeCandidate || '',
+      }
     );
-    if (!res.ok) {
-      note.innerHTML = notice('bad', `没写成：${esc(res.error || '未知原因')}`);
-      return;
-    }
-    creationState.prose = {
-      exists: true, text: res.text, errors: res.errors, warnings: res.warnings,
-      stats: res.stats, meta: { model: creationState.prosePlan.model, usage: res.usage },
-    };
-    note.innerHTML = notice('ok',
-      `写完并已落盘：${num(res.stats.chars)} 字。${(res.errors || []).length
-        ? `有 ${res.errors.length} 项要处理，看下面。` : '自检没发现问题。'}`);
-    creationLoad();
+    creationState.proseTask = task;
+    updateProseTaskPanel();
+    pollProseTask(task.task_id);
   } catch (e) {
-    note.innerHTML = notice('bad', esc(e.message));
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '写这一章';
+    if (note) note.innerHTML = notice('bad', `没能开始：${esc(e.message)}`);
+    if (btn) {
+      btn.disabled = !(creationState.prosePlan || {}).ready;
+      btn.textContent = '写这一章';
+    }
   }
 }
 
@@ -5424,6 +5730,15 @@ async function renderCreation(name, kind, key) {
   if (nextKind !== creationState.kind || (key || '') !== creationState.key) {
     creationState.draft = null;
     creationState.dirty = false;
+    // 换章必须把上一章的计划/正文/任务一起清掉。留着的话，新章会先画上一章的
+    // 字数、任务轮次和候选列表，作者会以为那些属于当前章。
+    creationState.prosePlan = null;
+    creationState.prosePlanError = null;
+    creationState.prose = null;
+    creationState.proseTask = null;
+    creationState.proseTaskLoaded = false;
+    creationState.proseVersions = null;
+    clearProseTaskTimer();
     creationState.kb.rows = null;
     creationState.kb.loaded = false;
     creationState.kb.picked = {};
