@@ -64,12 +64,14 @@ def empty_setting(work: str = "", genre: str = "") -> dict[str, Any]:
         "genre": genre,
         "target": {"chapters": 0, "chars_per_chapter": [2800, 4000]},
         "style": {"perspective": "第三限知", "tone": "", "taboo": []},
-        "world": {"era": "", "places": [], "rules": []},
-        "power": {"system": "", "tiers": []},
+        "world": {"era": "", "scope": "", "places": [], "rules": []},
+        "power": {"system": "", "cost": "", "tiers": [], "rules": []},
+        "ability": {"category": "", "acquire": []},
         "factions": [],
         "characters": [],
         "terms": [],
         "themes": [],
+        "motifs": [],
     }
 
 
@@ -153,12 +155,20 @@ style:
 
 world:
   era: ""                    # 时代/纪年
+  scope: ""                  # 地理范围：故事主要在哪一片地方发生
   places: []                 # - {{name: 地名, note: 一句话说明}}
   rules: []                  # 世界硬规则，一条一句：- "查克拉用尽会昏迷"
 
 power:
-  system: ""                 # 力量体系名
-  tiers: []                  # 由低到高，一行一个：- 炼气 / - 筑基
+  system: ""                 # 力量来源／体系名：这股力量从哪儿来、叫什么
+  cost: ""                   # 代价：用一次要付什么
+  tiers: []                  # 等级阶梯，由低到高，一行一级：- 炼气 / - 筑基
+  rules: []                  # 体系规则：上限在哪、越界会怎样
+
+# 能力体系。能力本身写在 abilities 里，这两行说「怎么分类、怎么拿到」。
+ability:
+  category: ""               # 能力分类：射击型 / 支援型 / 特异型
+  acquire: []                # 获取方式，一条一种
 
 # 势力。leader 与 characters 里的名字要对得上（校验会查）。
 factions: []
@@ -172,7 +182,8 @@ factions: []
 terms: []
 #  - {{term: 数值之眼, meaning: 能看到目标的修为数值}}
 
-themes: []                   # 主题与象征
+themes: []                   # 主题：这本书到底在说什么
+motifs: []                   # 反复出现的意象：砂砾 / 补给券 / 被擦掉的编号
 """
 
 
@@ -312,10 +323,12 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
         lines.append("")
 
     world = data.get("world") or {}
-    if any(world.get(k) for k in ("era", "places", "rules")):
+    if any(world.get(k) for k in ("era", "scope", "places", "rules")):
         lines.append("## 世界观")
         if world.get("era"):
             lines.append(f"- 时代：{world['era']}")
+        if world.get("scope"):
+            lines.append(f"- 地理范围：{world['scope']}")
         for p in world.get("places") or []:
             if isinstance(p, dict):
                 lines.append(f"- 地点 **{p.get('name')}**：{p.get('note') or ''}")
@@ -324,12 +337,16 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
         lines.append("")
 
     power = data.get("power") or {}
-    if power.get("system") or power.get("tiers"):
+    if power.get("system") or power.get("tiers") or power.get("cost") or power.get("rules"):
         lines.append("## 力量体系")
         if power.get("system"):
-            lines.append(f"- 体系：{power['system']}")
+            lines.append(f"- 力量来源：{power['system']}")
+        if power.get("cost"):
+            lines.append(f"- 代价：{power['cost']}")
         if power.get("tiers"):
             lines.append("- 等级：" + " → ".join(str(t) for t in power["tiers"]))
+        for r in power.get("rules") or []:
+            lines.append(f"- 体系规则：{r}")
         lines.append("")
 
     if data.get("factions"):
@@ -339,6 +356,21 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
         for f in data["factions"]:
             if isinstance(f, dict):
                 lines.append(f"| {f.get('name')} | {f.get('stance') or '—'} | {f.get('leader') or '—'} |")
+        lines.append("")
+
+    # 能力体系。以前人读版里根本没有这一节——作者在表单里填的能力，
+    # 只在注入卡里给模型看过，导出的 markdown 上看不见（2026-09-30 补）。
+    ability_meta = data.get("ability") or {}
+    if ability_meta.get("category") or ability_meta.get("acquire") or data.get("abilities"):
+        lines.append("## 能力体系")
+        if ability_meta.get("category"):
+            lines.append(f"- 分类：{ability_meta['category']}")
+        for a in ability_meta.get("acquire") or []:
+            lines.append(f"- 获取方式：{a}")
+        for a in data.get("abilities") or []:
+            if isinstance(a, dict):
+                bits = [x for x in (a.get("tier"), a.get("holder"), a.get("effect")) if x]
+                lines.append(f"- **{a.get('name')}**" + ("（" + "｜".join(bits) + "）" if bits else ""))
         lines.append("")
 
     if data.get("characters"):
@@ -368,9 +400,12 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
                 lines.append(f"| {t.get('term')} | {t.get('meaning') or '—'} |")
         lines.append("")
 
-    if data.get("themes"):
+    if data.get("themes") or data.get("motifs"):
         lines.append("## 主题与象征")
-        lines.append("、".join(str(t) for t in data["themes"]))
+        for t in data.get("themes") or []:
+            lines.append(f"- 主题：{t}")
+        for m in data.get("motifs") or []:
+            lines.append(f"- 反复出现的意象：{m}")
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -379,6 +414,7 @@ def render_setting_markdown(data: dict[str, Any]) -> str:
 # 注入时按这个顺序填，超预算就从后往前丢。
 _INJECTION_SECTIONS = (
     "basis", "style", "characters", "world", "factions", "power", "abilities", "terms",
+    "themes",
 )
 # 告警里要报中文小节名——报英文 key 的话，人看到「characters 没注入」还得回去查代码。
 _SECTION_LABELS = {
@@ -390,6 +426,7 @@ _SECTION_LABELS = {
     "power": "力量体系",
     "abilities": "能力体系",
     "terms": "术语",
+    "themes": "主题与意象",
 }
 
 
@@ -445,6 +482,8 @@ def render_injection_block(data: dict[str, Any], *, max_chars: int | None = None
     world_lines = ["【世界观】"]
     if world.get("era"):
         world_lines.append(f"时代：{world['era']}")
+    if world.get("scope"):
+        world_lines.append(f"地理范围：{world['scope']}")
     for p in world.get("places") or []:
         if isinstance(p, dict):
             world_lines.append(f"地点 {p.get('name')}：{p.get('note') or ''}")
@@ -463,13 +502,22 @@ def render_injection_block(data: dict[str, Any], *, max_chars: int | None = None
 
     power = data.get("power") or {}
     power_lines = []
-    if power.get("system") or power.get("tiers"):
+    if power.get("system") or power.get("tiers") or power.get("cost") or power.get("rules"):
         power_lines.append("【力量体系】" + str(power.get("system") or ""))
+        if power.get("cost"):
+            power_lines.append(f"代价：{power['cost']}")
         if power.get("tiers"):
             power_lines.append("等级：" + " → ".join(str(t) for t in power["tiers"]))
+        for r in power.get("rules") or []:
+            power_lines.append(f"体系规则：{r}")
     sections["power"] = power_lines
 
+    ability_meta = data.get("ability") or {}
     ability_lines = ["【能力体系】"]
+    if ability_meta.get("category"):
+        ability_lines.append(f"分类：{ability_meta['category']}")
+    for a in ability_meta.get("acquire") or []:
+        ability_lines.append(f"获取方式：{a}")
     for a in data.get("abilities") or []:
         if not isinstance(a, dict):
             continue
@@ -485,6 +533,16 @@ def render_injection_block(data: dict[str, Any], *, max_chars: int | None = None
         if isinstance(t, dict):
             term_lines.append(f"{t.get('term')}={t.get('meaning') or ''}")
     sections["terms"] = term_lines if len(term_lines) > 1 else []
+
+    # 主题与意象。原来 themes 一个字段都没进过设定卡——作者写了主题，
+    # 而写正文的模型从来没见过它（2026-09-30 补）。排在小节表末尾：
+    # 预算不够时它第一个被丢，而且丢的时候会点名，不会静默消失。
+    theme_lines = ["【主题与意象】"]
+    for t in data.get("themes") or []:
+        theme_lines.append(f"主题：{t}")
+    for m in data.get("motifs") or []:
+        theme_lines.append(f"反复出现的意象：{m}")
+    sections["themes"] = theme_lines if len(theme_lines) > 1 else []
 
     kept: list[str] = []
     dropped: list[str] = []

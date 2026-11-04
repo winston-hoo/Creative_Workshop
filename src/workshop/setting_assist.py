@@ -87,6 +87,18 @@ LAYER_SPECS: dict[str, dict[str, dict[str, Any]]] = {
         },
         "rules": {"kind": "strlist", "path": ("world", "rules"), "label": "世界硬规则"},
         "tiers": {"kind": "strlist", "path": ("power", "tiers"), "label": "力量体系等级"},
+        # 下面这几条是随界面改版补的白名单（2026-09-30）。表单上有了格子、
+        # 注入卡里也认了键，如果白名单不认，助手一提就被整条拒收——
+        # 同一个字段两条路各堵一半，作者只能自己去原文模式改。
+        "world_scope": {"kind": "scalar", "path": ("world", "scope"), "label": "地理范围"},
+        "power_cost": {"kind": "scalar", "path": ("power", "cost"), "label": "力量代价"},
+        "power_rules": {"kind": "strlist", "path": ("power", "rules"), "label": "力量体系规则"},
+        "ability_category": {
+            "kind": "scalar", "path": ("ability", "category"), "label": "能力分类",
+        },
+        "ability_acquire": {
+            "kind": "strlist", "path": ("ability", "acquire"), "label": "能力获取方式",
+        },
         # 能力原本只是人物身上一个逗号分隔的文本框，没效果、没等级、没归属。
         # 升成一等小节：知识库里 400 多条能力要有地方落，作者也要能单独查和改。
         "abilities": {
@@ -94,9 +106,10 @@ LAYER_SPECS: dict[str, dict[str, dict[str, Any]]] = {
             "fields": ["name", "effect", "tier", "holder"], "required": ["name"],
         },
         "themes": {"kind": "strlist", "path": ("themes",), "label": "主题与象征"},
+        "motifs": {"kind": "strlist", "path": ("motifs",), "label": "反复出现的意象"},
         "taboo": {"kind": "strlist", "path": ("style", "taboo"), "label": "文风禁忌"},
         "era": {"kind": "scalar", "path": ("world", "era"), "label": "时代"},
-        "power_system": {"kind": "scalar", "path": ("power", "system"), "label": "力量体系名"},
+        "power_system": {"kind": "scalar", "path": ("power", "system"), "label": "力量来源"},
         "tone": {"kind": "scalar", "path": ("style", "tone"), "label": "基调"},
         # 视角在表单里是一个下拉，选项只有 creation._PERSPECTIVES 那三个，
         # 而它原来**不在这张白名单里**——助手提「视角：第一人称」会被整条拒收，

@@ -532,6 +532,11 @@ def test_ui() -> None:
     real_console = [e for e in console_errors if "favicon" not in e.lower()]
     check(not real_console, f"没有 console 错误（{real_console[:2]}）")
 
+    # ⚠️ 必须显式断言。check() 只是把失败记进 _failures，那只有 __main__ 分支会读它；
+    # 走 pytest 时函数正常返回就是「通过」——界面全坏也是绿的。
+    # 实测：逐章指令的卡片回归一整天没被发现，就是因为它只跑在 pytest 下（2026-09-30）。
+    assert not _failures, "未通过：" + "；".join(_failures)
+
 
 def main() -> int:
     print("=" * 58)
