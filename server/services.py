@@ -2698,6 +2698,12 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
     for item in cb.validate_brief_chain(briefs)[0] if briefs else []:
         errors.append(f"创作任务指令：{item}")
 
+    # 左侧章节导航要显示每章状态。逐个另发三个请求会让首屏多几十次往返，
+    # 这里顺手把状态文件读出来一起返回——都是几十字节的小 JSON。
+    from workshop import draft_store as _draft_store_mod
+    from workshop import notes as _notes_mod
+    from workshop import review as _review_mod
+
     chapters: list[dict[str, Any]] = []
     for no in sorted(volumes):
         vol = volumes[no].get("vol") or {}
@@ -2705,6 +2711,27 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
             if not isinstance(row, dict) or not isinstance(row.get("chapter_no"), int):
                 continue
             cid = cb.chapter_id_of(no, row["chapter_no"])
+            has_draft = (wd / "90-draft" / f"{cid}.md").exists()
+            try:
+                draft_status = _draft_store_mod.get_status(wd, cid).get("status") or "draft"
+            except (OSError, ValueError):
+                draft_status = "draft"
+            try:
+                notes_payload = _notes_mod.load_notes(wd, cid)
+                pending_notes = len(
+                    [x for x in (notes_payload.get("notes") or [])
+                     if x.get("status") == "pending"]
+                )
+            except (OSError, ValueError):
+                pending_notes = 0
+            try:
+                review_payload = _review_mod.load_reviews(wd, cid)
+                open_reviews = len(
+                    [x for x in _review_mod.all_items(review_payload)
+                     if x.get("status") == "open"]
+                )
+            except (OSError, ValueError):
+                open_reviews = 0
             chapters.append(
                 {
                     "chapter_id": cid,
@@ -2712,6 +2739,10 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
                     "chapter_no": row["chapter_no"],
                     "title": row.get("title") or "",
                     "has_brief": cid in briefs,
+                    "has_draft": has_draft,
+                    "draft_status": draft_status,
+                    "pending_notes": pending_notes,
+                    "open_reviews": open_reviews,
                     "errors": len(brief_errors.get(cid, [])),
                     "warnings": len(brief_warnings.get(cid, [])),
                 }
@@ -4039,6 +4070,16 @@ def draft_versions(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
     }
 
 
+def draft_version(paths: Paths, name: str, chapter_id: str, version_id: str) -> dict[str, Any]:
+    """读某一个历史版本的正文，供 D4 版本对比用。列表接口只给元数据。"""
+    from workshop import draft_store
+
+    data = draft_store.load_version(paths.work_dir(name), chapter_id, version_id)
+    if not data:
+        raise FileNotFoundError(f"找不到历史版本「{version_id}」")
+    return data
+
+
 def promote_candidate(paths: Paths, name: str, chapter_id: str, candidate_id: str) -> dict[str, Any]:
     from workshop import draft_store
 
@@ -4865,19 +4906,32 @@ def _draft_state_summary(work_dir: Path, chapter_id: str, prose: str) -> dict[st
 
 
 def write_draft_text(paths: Paths, name: str, chapter_id: str, text: str) -> dict[str, Any]:
-    """作者手改过的正文存回去。**空文本不许覆盖有内容的文件**。"""
+    """作者手改过的正文存回去。**空文本不许覆盖有内容的文件**。
+
+    D4「保存不覆盖」：内容真的变了，先把旧稿快照成一版再写。
+    没有这一版，手改就没有回退点，而作者是拿这个当唯一后悔药的。
+    """
     from workshop.draft import count_chars, load_draft, save_draft
+    from workshop import draft_store
 
     ctx = _draft_inputs(paths, name, chapter_id)
     existing = load_draft(ctx["work_dir"], chapter_id)
-    if existing.get("exists") and not text.strip() and (existing.get("text") or "").strip():
+    old_text = existing.get("text") or ""
+    if existing.get("exists") and not text.strip() and old_text.strip():
         raise ValueError(
             "要保存的正文是空的，但磁盘上这一章已经有内容。已拒绝写入，免得把正文清空。"
         )
+    version_id = ""
+    if existing.get("exists") and old_text != text:
+        version = draft_store.snapshot_version(
+            ctx["work_dir"], chapter_id, text=old_text,
+            meta=existing.get("meta") or {}, reason="手改保存前自动备份",
+        )
+        version_id = (version or {}).get("version_id", "")
     saved = save_draft(ctx["work_dir"], chapter_id, text=text, meta={
         **(existing.get("meta") or {}), "edited": True, "chars": count_chars(text),
     })
-    return {"saved": True, **saved}
+    return {"saved": True, "version_id": version_id, "chars": count_chars(text), **saved}
 
 
 # ── M9 创作台 · 从知识库导入 ────────────────────────────────

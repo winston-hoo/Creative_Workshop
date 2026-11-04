@@ -1041,6 +1041,15 @@ def api_draft_versions(name: str, chapter_id: str) -> dict:
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.get("/api/works/{name}/creation/draft/{chapter_id}/versions/{version_id}")
+def api_draft_version(name: str, chapter_id: str, version_id: str) -> dict:
+    """读某个历史版本的正文。D4 版本对比要逐段 diff，前端不能只拿元数据。"""
+    try:
+        return services.draft_version(PATHS, safe_name(name), chapter_id, version_id)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/works/{name}/creation/draft/{chapter_id}/candidates/{candidate_id}/promote")
 def api_promote_candidate(name: str, chapter_id: str, candidate_id: str) -> dict:
     """候选转正。转正前先把当前正文存成历史版本，不会把上一版弄丢。"""

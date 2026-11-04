@@ -100,6 +100,20 @@ body {
 .conn.bad { color: var(--danger); }
 .conn.bad::before { background: var(--danger); }
 
+/* 窄屏（375px 手机/分屏）：顶栏不换行时会把整页撑出横向滚动条。
+   品牌副标题和连接状态在这里没有信息价值，先让位；页签在顶栏里横滚。 */
+@media (max-width: 640px) {
+  .topbar { padding: 0 10px; gap: 6px; }
+  .topbar .brand { font-size: 13px; white-space: nowrap; }
+  .topbar .brand small { display: none; }
+  .tabs {
+    flex: 1 1 auto; min-width: 0; overflow-x: auto;
+    scrollbar-width: none; margin-left: 0;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .conn { display: none; }
+}
+
 main { max-width: var(--page-max); margin: 0 auto; padding: 28px 24px 80px; }
 
 /* 工作台型页面：把宽度让给内容。窗口不够宽时自动退回归属宽度，

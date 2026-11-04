@@ -2343,6 +2343,16 @@ const creationState = {
   proseReview: null,     // 审稿历史 + 最近一次的结构化意见（A3/U4）
   proseNotes: null,      // 本章要点提案与裁决（A1/U8）
   proseFinalize: null,   // 定稿后处理分步状态（B5）
+  wbMode: 'read',        // U7 阅读/编辑态
+  wbFont: 2,             // 字号档 1/2/3
+  wbWidth: 2,            // 行宽档 1/2/3
+  wbDirty: false,        // 正文有未保存改动（只影响本页，不写服务端）
+  wbText: '',            // 编辑区当前文本；阅读态从它渲染
+  wbLocalTimer: null,    // 本地自动保留的防抖句柄
+  wbScrollTimer: null,
+  wbLastApply: null,     // 最近一次采纳改写：{chapter, version_id, count, chars}
+  wbDiff: null,          // 最近一次逐段 diff 结果
+  wbDiffBusy: false,
   notesBusyAt: 0,        // 要点操作（抽取/裁决/定稿编排）的忙碌标记
   notesMsg: '',          // 要点面板的最近一条反馈（重渲染后仍保留）
   reviewBusyAt: 0,       // 审稿请求发起时刻；>0 时显示秒表
@@ -3188,6 +3198,11 @@ async function creationGoto(kind, key) {
   // 一个只剩「问助手」的抽屉（素材库只属于设定集层），像是工具被吞了一个。
   creationState.toolsOpen = false;
   creationState.mode = kind === 'setting' ? creationState.mode : 'form';
+  // 换章/换层就清掉工作台这一章的内存态；本地草稿仍留在 localStorage 里，
+  // 回到这一章时由 creationBindWorkbench 再问一次「恢复还是丢弃」。
+  creationState.wbDirty = false;
+  creationState.wbText = '';
+  creationState.wbLocalChecked = null;
   location.hash = `#/work/${encodeURIComponent(creationState.name)}/creation/${kind}`
     + (key ? `/${encodeURIComponent(key)}` : '');
 }
@@ -4327,8 +4342,10 @@ function creationBindDraft() {
       draftGenerate();
     };
   }
+  // 工作台里 #draft-save 在中栏工具条，由 creationBindWorkbench 走 wbSaveProse；
+  // 这里再绑一次会变成「一次点击存两遍」，而且旧函数要的 #draft-save-note 在新布局里不存在。
   const save = document.getElementById('draft-save');
-  if (save) save.onclick = () => draftSave();
+  if (save && !document.getElementById('wb-root')) save.onclick = () => draftSave();
   const wb = document.getElementById('draft-writeback');
   if (wb) wb.onclick = () => draftWriteback();
   const rv = document.getElementById('draft-review');
@@ -4415,6 +4432,19 @@ function loadProseVersions() {
       const host = document.getElementById('creation-recovery-host');
       if (host) host.innerHTML = creationRenderRecovery();
       bindRecoveryActions();
+      // 工作台里的版本面板是同一份数据画的，异步回来也要跟着重画一次；
+      // 已经画出来的逐段对比保留下来，不让它闪一下消失。
+      const wbHost = document.getElementById('wb-vers-host');
+      if (wbHost) {
+        const prevDiff = wbHost.querySelector('#wb-diff-out');
+        const keep = prevDiff ? prevDiff.innerHTML : '';
+        wbHost.innerHTML = wbVersionPanel();
+        if (keep) {
+          const out = wbHost.querySelector('#wb-diff-out');
+          if (out) out.innerHTML = keep;
+        }
+        wbBindVersionPanel();
+      }
     })
     .catch(() => {});
 }
@@ -5137,6 +5167,15 @@ async function applyReviewFindings() {
     const skipped = res.skipped || [];
     creationState.prose = null;
     creationState.proseReview = null;
+    // D4/U2：记下「这次改写从哪一版变过来的」，工作台据此自动画出逐段对比，
+    // 让作者一眼看出哪几段是刚采纳的。shown 保证每章只自动弹一次。
+    creationState.wbLastApply = {
+      chapter: creationState.key,
+      version_id: res.version_id || '',
+      count: res.regions || ids.length,
+      chars: res.chars || 0,
+      shown: false,
+    };
     creationLoad();
     loadProseReview();
     loadProseVersions();
@@ -5699,6 +5738,599 @@ function creationRenderCheck(errors, warnings) {
   return parts.join('');
 }
 
+/* ── U1/U2/U7/D4 章节三栏工作台 ─────────────────────────────
+   左栏：作品 → 卷 → 章，带状态与待办；中栏：阅读/编辑正文；
+   右栏：预算账本、审稿、要点、定稿状态。
+   正文不再塞进 520px 的 textarea，阅读态按段渲染，编辑态才显示大输入框。
+   这里只消费既有接口；只新增一个只读的「读单个历史版本」接口给逐段 diff 用。 */
+
+const WB_STATUS_LABEL = { draft: '草稿', reviewed: '已审', final: '定稿' };
+let wbBeforeUnloadBound = false;
+let wbScrollBound = false;
+
+function wbStatusClass(s) {
+  return s === 'final' ? 'wb-st-final' : (s === 'reviewed' ? 'wb-st-reviewed' : 'wb-st-draft');
+}
+
+function wbStorageKey(kind) {
+  return `workshop.wb.${kind}.${creationState.name}.${creationState.key}`;
+}
+
+function wbPrefsSave() {
+  try {
+    localStorage.setItem('workshop.wb.prefs', JSON.stringify({
+      font: creationState.wbFont, width: creationState.wbWidth,
+    }));
+  } catch { /* 隐身模式写不进去，不影响阅读 */ }
+}
+
+function wbPrefsLoad() {
+  try {
+    const p = JSON.parse(localStorage.getItem('workshop.wb.prefs') || '{}');
+    const f = Number(p.font), w = Number(p.width);
+    if (f >= 1 && f <= 3) creationState.wbFont = f;
+    if (w >= 1 && w <= 3) creationState.wbWidth = w;
+  } catch { /* 坏数据就当没存过 */ }
+}
+
+function wbChapterRow(c) {
+  const cur = c.chapter_id === creationState.key;
+  const st = c.draft_status || 'draft';
+  const chips = [
+    `<span class="wb-chip ${wbStatusClass(st)}">${WB_STATUS_LABEL[st] || st}</span>`,
+    c.pending_notes ? `<span class="wb-chip wb-chip-warn">待裁 ${c.pending_notes}</span>` : '',
+    c.open_reviews ? `<span class="wb-chip wb-chip-warn">审 ${c.open_reviews}</span>` : '',
+    !c.has_brief ? '<span class="wb-chip">未填指令</span>' : '',
+  ].filter(Boolean).join('');
+  return `<a class="wb-ch${cur ? ' wb-cur' : ''}"
+    href="#/work/${encodeURIComponent(creationState.name)}/creation/brief/${encodeURIComponent(c.chapter_id)}"
+    data-wb-chapter="${esc(c.chapter_id)}">
+    <span class="wb-ch-no">${String(c.chapter_no ?? '').padStart(3, '0')}</span>
+    <span class="wb-ch-body">
+      <span class="wb-ch-title">${esc(c.title || '未命名')}</span>
+      <span class="wb-ch-meta">${chips}</span>
+    </span>
+  </a>`;
+}
+
+function wbNavHTML() {
+  const d = creationState.data || {};
+  const chapters = d.chapters || [];
+  const volumes = d.volumes || [];
+  let groups = [];
+  if (volumes.length) {
+    groups = volumes.map((v) => {
+      const inner = (v.vol && typeof v.vol === 'object') ? v.vol : v;
+      const vno = inner.vol;
+      return {
+        vol: vno,
+        title: inner.title || `第 ${vno} 卷`,
+        rows: chapters.filter((c) => String(c.vol) === String(vno)),
+      };
+    }).filter((g) => g.rows.length);
+  }
+  if (!groups.length) groups = [{ vol: 0, title: '章节', rows: chapters }];
+  return `<div class="wb-nav-head">
+      <strong>${esc(creationState.name)}</strong>
+      <span class="muted">作品 · 卷 · 章</span>
+    </div>
+    <div class="wb-nav-scroll">${groups.map((g) => `
+      <details class="wb-vol" open>
+        <summary><span>${esc(g.title)}</span><span class="muted">${g.rows.length} 章</span></summary>
+        ${g.rows.map(wbChapterRow).join('')}
+      </details>`).join('')}</div>`;
+}
+
+function wbSplitParas(text) {
+  return String(text || '').replace(/\r\n/g, '\n').split(/\n+/)
+    .map((s) => s.trim()).filter(Boolean);
+}
+
+function wbParagraphHTML(text) {
+  const paras = wbSplitParas(text);
+  if (!paras.length) {
+    return '<p class="muted wb-empty">这一章还没有正文。切到编辑态手写，或在右栏「写这一章」。</p>';
+  }
+  return paras.map((p, i) =>
+    `<p id="wb-p-${i + 1}" data-p="${i + 1}">${esc(p)}</p>`).join('');
+}
+
+function wbVersionPanel() {
+  const versions = (creationState.proseVersions && creationState.proseVersions.versions) || [];
+  const last = creationState.wbLastApply
+    && creationState.wbLastApply.chapter === creationState.key ? creationState.wbLastApply : null;
+  const ids = new Set(versions.map((v) => String(v.version_id)));
+  const aDefault = last && ids.has(String(last.version_id))
+    ? String(last.version_id) : (versions[0] ? String(versions[0].version_id) : '__current__');
+  const option = (v, selected) => `<option value="${esc(v.version_id)}" ${selected ? 'selected' : ''}>
+      ${esc(v.version_id)} · ${esc(v.created_at || '')} · ${v.chars || 0} 字</option>`;
+  return `<details class="wb-vers" ${last ? 'open' : ''}>
+    <summary>版本与改写痕迹 <span class="muted">${versions.length} 个历史版本</span></summary>
+    ${last ? `<div class="wb-applied">刚采纳 ${last.count || 0} 条改写（${last.chars || 0} 字）。
+      <button class="btn ghost sm" type="button" data-wb-open-diff>查看逐段对比</button></div>` : ''}
+    ${versions.length ? `
+      <div class="wb-vers-row">
+        <select id="wb-diff-a" aria-label="对比起点">
+          ${versions.map((v) => option(v, String(v.version_id) === aDefault)).join('')}
+          <option value="__current__" ${aDefault === '__current__' ? 'selected' : ''}>当前正文</option>
+        </select>
+        <span class="muted">→</span>
+        <select id="wb-diff-b" aria-label="对比终点">
+          <option value="__current__" selected>当前正文</option>
+          ${versions.map((v) => option(v, false)).join('')}
+        </select>
+        <button class="btn ghost sm" type="button" id="wb-diff-run">逐段对比</button>
+      </div>
+      <div id="wb-diff-out" class="wb-diff"></div>
+      <ul class="wb-vlist">${versions.map((v) => `<li>
+        <code>${esc(v.version_id)}</code>
+        <span class="muted">${esc(v.created_at || '')} · ${v.chars || 0} 字</span>
+        <button class="btn ghost xs" type="button" data-wb-compare="${esc(v.version_id)}">对比当前</button>
+        <button class="btn ghost xs" type="button" data-wb-restore="${esc(v.version_id)}">回退到此版</button>
+      </li>`).join('')}</ul>`
+      : '<p class="muted" style="margin:8px 0 0">还没有历史版本。每次保存正文都会先把旧稿存成一版。</p>'}
+  </details>`;
+}
+
+function wbRenderBrief(read) {
+  if (creationState.mode === 'raw') {
+    return `<details class="wb-brief" open>
+      <summary>本章创作指令 · 原文</summary>
+      <section class="sec">
+        <div class="sec-head"><h2>原文</h2><span class="grow"></span>
+          <span class="muted">手写注释会保留；表单保存会重新生成 YAML。</span></div>
+        <div class="sec-body">
+          <textarea id="creation-text" spellcheck="false"
+            style="min-height:360px;font:13px/1.6 Consolas,Menlo,monospace"
+            >${esc(read.text || '')}</textarea>
+          <div id="creation-check" style="margin-top:10px">${creationRenderCheck(read.errors, read.warnings)}</div>
+        </div>
+      </section>
+    </details>`;
+  }
+  if (!creationState.draft) creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
+  return `<details class="wb-brief">
+    <summary>本章创作指令 <span class="muted">${creationState.dirty ? '有未保存改动' : '展开编辑'}</span></summary>
+    ${creationRenderSuggest()}
+    ${creationRenderForm(creationState.draft)}
+  </details>`;
+}
+
+function creationRenderWorkbench(read) {
+  creationState.suggest = read.suggest || null;
+  const prose = creationState.prose;
+  const loaded = !!prose;
+  const serverText = (prose && prose.exists) ? (prose.text || '') : '';
+  if (!creationState.wbDirty && !creationState.wbText) creationState.wbText = serverText;
+  const text = creationState.wbDirty ? creationState.wbText : serverText;
+  const chars = text.replace(/\s/g, '').length;
+  const paras = wbSplitParas(text);
+  const errs = (prose && prose.errors) || [];
+  const warns = (prose && prose.warnings) || [];
+  return `<div class="wb" id="wb-root">
+    <aside class="wb-left" id="wb-left">${wbNavHTML()}</aside>
+    <section class="wb-center" id="creation-editor">
+      <div class="wb-center-head">
+        <div>
+          <h2>${esc(read.data && read.data.title ? read.data.title : creationState.key)}</h2>
+          <p class="muted">${esc((read.data && read.data.one_line) || '')}</p>
+        </div>
+        <span class="wb-meta">${chars} 字 · ${paras.length} 段</span>
+      </div>
+      <div class="wb-toolbar" role="toolbar" aria-label="正文阅读与编辑">
+        <div class="seg" role="group" aria-label="阅读或编辑">
+          <button type="button" data-wb-mode="read" aria-current="${creationState.wbMode === 'read'}">阅读</button>
+          <button type="button" data-wb-mode="edit" aria-current="${creationState.wbMode === 'edit'}">编辑</button>
+        </div>
+        <select id="wb-para-jump" aria-label="跳转段落">
+          <option value="0">段落…</option>
+          ${paras.map((_, i) => `<option value="${i + 1}">第 ${i + 1} 段</option>`).join('')}
+        </select>
+        <span class="grow"></span>
+        <div class="wb-prefs" role="group" aria-label="字号">
+          ${[1, 2, 3].map((n) => `<button type="button" class="btn ghost xs"
+            data-wb-font="${n}" aria-current="${creationState.wbFont === n}">${['小', '中', '大'][n - 1]}</button>`).join('')}
+        </div>
+        <div class="wb-prefs" role="group" aria-label="行宽">
+          ${[1, 2, 3].map((n) => `<button type="button" class="btn ghost xs"
+            data-wb-width="${n}" aria-current="${creationState.wbWidth === n}">${['窄', '中', '宽'][n - 1]}</button>`).join('')}
+        </div>
+        <button class="btn primary sm" type="button" id="draft-save" ${loaded ? '' : 'disabled'}>保存正文</button>
+        <span class="save-state" id="wb-save-state" role="status" aria-live="polite">
+          ${creationState.wbDirty ? '未保存' : (prose && prose.exists ? '已保存' : '')}</span>
+      </div>
+      <article id="wb-read"
+        class="wb-prose wb-fs-${creationState.wbFont} wb-w-${creationState.wbWidth}"
+        ${creationState.wbMode === 'edit' ? 'hidden' : ''}>${wbParagraphHTML(text)}</article>
+      <div id="wb-editwrap" ${creationState.wbMode === 'read' ? 'hidden' : ''}>
+        <textarea id="draft-text" class="wb-textarea" spellcheck="false"
+          ${loaded ? '' : 'disabled'}
+          placeholder="正文写在这里。保存会先把旧稿存进历史版本，不会覆盖。">${esc(text)}</textarea>
+      </div>
+      <div id="wb-local-banner"></div>
+      ${errs.length || warns.length ? `<div class="wb-check">
+        ${errs.length ? `<div class="bad">${errs.map((x) => `<p>✗ ${esc(x)}</p>`).join('')}</div>` : ''}
+        ${warns.length ? `<div class="warn">${warns.map((x) => `<p>! ${esc(x)}</p>`).join('')}</div>` : ''}
+      </div>` : ''}
+      <div id="wb-vers-host">${wbVersionPanel()}</div>
+      ${wbRenderBrief(read)}
+    </section>
+    <aside class="wb-right" id="wb-right">
+      ${creationRenderDraft()}
+      <div id="creation-review-host">${creationRenderReview()}</div>
+      <div id="creation-notes-host">${creationRenderNotes()}</div>
+    </aside>
+  </div>`;
+}
+
+function wbCurrentText() {
+  const ta = document.getElementById('draft-text');
+  if (ta) return ta.value;
+  return creationState.wbText || '';
+}
+
+function wbSetReadFromText() {
+  const text = wbCurrentText();
+  creationState.wbText = text;
+  const readBox = document.getElementById('wb-read');
+  if (readBox) readBox.innerHTML = wbParagraphHTML(text);
+  const jump = document.getElementById('wb-para-jump');
+  if (jump) {
+    const paras = wbSplitParas(text);
+    jump.innerHTML = '<option value="0">段落…</option>'
+      + paras.map((_, i) => `<option value="${i + 1}">第 ${i + 1} 段</option>`).join('');
+  }
+  const meta = document.querySelector('.wb-center-head .wb-meta');
+  if (meta) meta.textContent = `${text.replace(/\s/g, '').length} 字 · ${wbSplitParas(text).length} 段`;
+}
+
+function wbScheduleLocalSave() {
+  clearTimeout(creationState.wbLocalTimer);
+  creationState.wbLocalTimer = setTimeout(() => {
+    if (!creationState.wbDirty) return;
+    try {
+      localStorage.setItem(wbStorageKey('buf'), JSON.stringify({
+        text: creationState.wbText, at: Date.now(),
+      }));
+    } catch { /* 写不进去就退回手动保存 */ }
+    const box = document.getElementById('wb-save-state');
+    if (box) box.textContent = '未保存 · 本地已保留';
+  }, 2000);
+}
+
+async function wbSaveProse() {
+  const ta = document.getElementById('draft-text');
+  if (!ta) return;
+  const text = ta.value;
+  const btn = document.getElementById('draft-save');
+  if (!text.trim() && creationState.prose && creationState.prose.exists
+      && (creationState.prose.text || '').trim()) {
+    creationSay('空正文不能覆盖已有内容。要清空请先把旧稿存成版本。');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const res = await api(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/${encodeURIComponent(creationState.key)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }
+    );
+    creationState.wbDirty = false;
+    creationState.wbText = text;
+    creationState.prose = null;
+    creationState.prosePlan = null;
+    creationState.prosePlanError = null;
+    try { localStorage.removeItem(wbStorageKey('buf')); } catch { /* 忽略 */ }
+    creationSay((res && res.version_id)
+      ? `正文已保存；旧稿存为版本 ${res.version_id}。`
+      : '正文已保存（内容没有变化）。');
+    await creationLoad();
+  } catch (e) {
+    creationSay(`保存失败：${e.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '保存正文'; }
+  }
+}
+
+async function wbLoadVersionText(versionId) {
+  const d = await getJSON(
+    `/api/works/${encodeURIComponent(creationState.name)}/creation/draft`
+    + `/${encodeURIComponent(creationState.key)}/versions/${encodeURIComponent(versionId)}`
+  );
+  return d.text || '';
+}
+
+/* 逐段 LCS。正文按自然段比对；段数 * 段数 超过阈值就退化成
+   「相同前缀 + 相同后缀 + 中间整段标改」，避免长章节把主线程卡住。 */
+function wbLcsOps(a, b) {
+  const n = a.length, m = b.length;
+  const ops = [];
+  if (n * m > 250000) {
+    let p = 0;
+    while (p < n && p < m && a[p] === b[p]) { ops.push({ t: 'eq', a: p, b: p }); p += 1; }
+    let ea = n - 1, eb = m - 1;
+    const tail = [];
+    while (ea >= p && eb >= p && a[ea] === b[eb]) {
+      tail.unshift({ t: 'eq', a: ea, b: eb }); ea -= 1; eb -= 1;
+    }
+    for (let i = p; i <= ea; i += 1) ops.push({ t: 'del', a: i });
+    for (let j = p; j <= eb; j += 1) ops.push({ t: 'add', b: j });
+    return ops.concat(tail);
+  }
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ t: 'eq', a: i, b: j }); i += 1; j += 1; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ t: 'del', a: i }); i += 1; }
+    else { ops.push({ t: 'add', b: j }); j += 1; }
+  }
+  while (i < n) { ops.push({ t: 'del', a: i }); i += 1; }
+  while (j < m) { ops.push({ t: 'add', b: j }); j += 1; }
+  return ops;
+}
+
+function wbDiffHTML(aText, bText, aLabel, bLabel) {
+  const A = wbSplitParas(aText), B = wbSplitParas(bText);
+  const ops = wbLcsOps(A, B);
+  const adds = ops.filter((o) => o.t === 'add').length;
+  const dels = ops.filter((o) => o.t === 'del').length;
+  const rows = ops.map((o) => {
+    if (o.t === 'eq') return `<p class="df-eq">${esc(A[o.a])}</p>`;
+    if (o.t === 'del') return `<p class="df-del"><span class="df-tag">−</span>${esc(A[o.a])}</p>`;
+    return `<p class="df-add"><span class="df-tag">+</span>${esc(B[o.b])}</p>`;
+  }).join('');
+  return `<div class="wb-diff-head">${esc(aLabel)} → ${esc(bLabel)}
+    <span class="df-add-t">+${adds} 段</span> <span class="df-del-t">−${dels} 段</span></div>${rows}`;
+}
+
+async function wbRunDiff(baseId, otherId) {
+  const out = document.getElementById('wb-diff-out');
+  const selA = document.getElementById('wb-diff-a');
+  const selB = document.getElementById('wb-diff-b');
+  const a = baseId || (selA && selA.value) || '__current__';
+  const b = otherId || (selB && selB.value) || '__current__';
+  if (!out) return;
+  // 版本列表异步回来时会把 #wb-vers-host 整块重画，调用时抓到的节点可能已经被换掉。
+  // 每次写入都重新找一次，否则结果写进一个不在文档里的旧节点——界面看起来「没反应」。
+  const paint = (html) => {
+    const el = document.getElementById('wb-diff-out');
+    if (el) el.innerHTML = html;
+  };
+  paint('<p class="muted">正在读版本并比对…</p>');
+  try {
+    const [aText, bText] = await Promise.all([
+      a === '__current__' ? wbCurrentText() : wbLoadVersionText(a),
+      b === '__current__' ? wbCurrentText() : wbLoadVersionText(b),
+    ]);
+    paint(wbDiffHTML(
+      aText, bText,
+      a === '__current__' ? '当前正文' : a,
+      b === '__current__' ? '当前正文' : b,
+    ));
+  } catch (e) {
+    paint(notice('bad', `对比失败：${esc(e.message)}`));
+  }
+}
+
+/* 版本面板会随着版本列表异步返回而重画，所以绑定单独抽出来，
+   重画之后重新绑一次，避免「第一次进来按钮点了没反应」。 */
+function wbBindVersionPanel() {
+  const diffBtn = document.getElementById('wb-diff-run');
+  if (diffBtn) diffBtn.addEventListener('click', () => wbRunDiff());
+  document.querySelectorAll('[data-wb-compare]').forEach((btn) => {
+    btn.addEventListener('click', () => wbRunDiff(btn.dataset.wbCompare, '__current__'));
+  });
+  const openDiff = document.querySelector('[data-wb-open-diff]');
+  if (openDiff && creationState.wbLastApply) {
+    openDiff.addEventListener('click',
+      () => wbRunDiff(creationState.wbLastApply.version_id, '__current__'));
+  }
+  document.querySelectorAll('[data-wb-restore]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const vid = btn.dataset.wbRestore;
+      const ok = await askConfirm({
+        title: `回退到版本 ${vid}`,
+        html: '<p style="margin:0">当前正文会先备份成一版，再把这一版恢复回来。</p>',
+        confirmLabel: '回退',
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await api(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft`
+          + `/${encodeURIComponent(creationState.key)}/versions/${encodeURIComponent(vid)}/restore`,
+          { method: 'POST' });
+        creationState.wbDirty = false;
+        creationState.prose = null;
+        try { localStorage.removeItem(wbStorageKey('buf')); } catch { /* 忽略 */ }
+        creationSay(`已回退到 ${vid}；回退前的正文已进历史版本。`);
+        await creationLoad();
+      } catch (e) {
+        creationSay(`回退失败：${e.message}`);
+      }
+    });
+  });
+}
+
+function creationBindWorkbench(read) {
+  if (creationState.kind !== 'brief' || !creationState.key
+      || !document.getElementById('wb-root')) return;
+  wbPrefsLoad();
+  const ta = document.getElementById('draft-text');
+  if (!ta) return;
+  const serverText = (creationState.prose && creationState.prose.exists)
+    ? (creationState.prose.text || '') : '';
+
+  // 本地自动保留：刷新/关页回来先恢复，再让作者决定保存还是丢弃。
+  if (creationState.wbLocalChecked !== creationState.key) {
+    creationState.wbLocalChecked = creationState.key;
+    let buf = null;
+    try { buf = JSON.parse(localStorage.getItem(wbStorageKey('buf')) || 'null'); } catch { buf = null; }
+    if (buf && typeof buf.text === 'string' && buf.text !== serverText) {
+      ta.value = buf.text;
+      creationState.wbText = buf.text;
+      creationState.wbDirty = true;
+      const box = document.getElementById('wb-local-banner');
+      if (box) {
+        box.innerHTML = `<div class="wb-local">有一份本地未保存草稿（${buf.at ? new Date(buf.at).toLocaleString() : '时间未知'}），已先恢复。
+          <button class="btn ghost xs" type="button" data-wb-drop-local>丢弃本地草稿</button></div>`;
+      }
+      document.getElementById('wb-read').innerHTML = wbParagraphHTML(buf.text);
+    }
+  }
+
+  // 阅读/编辑切换
+  document.querySelectorAll('[data-wb-mode]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      creationState.wbMode = btn.dataset.wbMode;
+      const readBox = document.getElementById('wb-read');
+      const editBox = document.getElementById('wb-editwrap');
+      if (creationState.wbMode === 'read') {
+        wbSetReadFromText();
+        if (readBox) readBox.hidden = false;
+        if (editBox) editBox.hidden = true;
+      } else {
+        if (readBox) readBox.hidden = true;
+        if (editBox) editBox.hidden = false;
+        ta.focus();
+      }
+      document.querySelectorAll('[data-wb-mode]').forEach((b) =>
+        b.setAttribute('aria-current', String(b.dataset.wbMode === creationState.wbMode)));
+    });
+  });
+
+  // 字号 / 行宽
+  document.querySelectorAll('[data-wb-font]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      creationState.wbFont = Number(btn.dataset.wbFont) || 2;
+      const box = document.getElementById('wb-read');
+      if (box) box.className = `wb-prose wb-fs-${creationState.wbFont} wb-w-${creationState.wbWidth}`;
+      document.querySelectorAll('[data-wb-font]').forEach((b) =>
+        b.setAttribute('aria-current', String(Number(b.dataset.wbFont) === creationState.wbFont)));
+      wbPrefsSave();
+    });
+  });
+  document.querySelectorAll('[data-wb-width]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      creationState.wbWidth = Number(btn.dataset.wbWidth) || 2;
+      const box = document.getElementById('wb-read');
+      if (box) box.className = `wb-prose wb-fs-${creationState.wbFont} wb-w-${creationState.wbWidth}`;
+      document.querySelectorAll('[data-wb-width]').forEach((b) =>
+        b.setAttribute('aria-current', String(Number(b.dataset.wbWidth) === creationState.wbWidth)));
+      wbPrefsSave();
+    });
+  });
+
+  // 段落跳转
+  const jump = document.getElementById('wb-para-jump');
+  if (jump) {
+    jump.addEventListener('change', () => {
+      const no = Number(jump.value);
+      if (!no) return;
+      const p = document.getElementById(`wb-p-${no}`);
+      if (!p) return;
+      p.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      p.classList.add('wb-flash');
+      setTimeout(() => p.classList.remove('wb-flash'), 1200);
+    });
+  }
+
+  // 输入：只改本地状态，2 秒后写 localStorage；不自动写服务端版本。
+  ta.addEventListener('input', () => {
+    creationState.wbText = ta.value;
+    creationState.wbDirty = true;
+    const state = document.getElementById('wb-save-state');
+    if (state) state.textContent = '未保存';
+    wbScheduleLocalSave();
+  });
+  if (!wbBeforeUnloadBound) {
+    wbBeforeUnloadBound = true;
+    window.addEventListener('beforeunload', (e) => {
+      if (!creationState.wbDirty) return;
+      e.preventDefault();
+      e.returnValue = '';
+    });
+  }
+
+  // 保存
+  const saveBtn = document.getElementById('draft-save');
+  if (saveBtn) saveBtn.addEventListener('click', wbSaveProse);
+  const dropLocal = document.querySelector('[data-wb-drop-local]');
+  if (dropLocal) {
+    dropLocal.addEventListener('click', () => {
+      try { localStorage.removeItem(wbStorageKey('buf')); } catch { /* 忽略 */ }
+      creationState.wbDirty = false;
+      creationState.wbText = serverText;
+      ta.value = serverText;
+      const readBox = document.getElementById('wb-read');
+      if (readBox) readBox.innerHTML = wbParagraphHTML(serverText);
+      const box = document.getElementById('wb-local-banner');
+      if (box) box.innerHTML = '';
+      if (saveBtn) saveBtn.disabled = !creationState.prose;
+    });
+  }
+
+  wbBindVersionPanel();
+
+  // 刚采纳改写：自动把「改动前那一版 → 当前」的逐段 diff 画出来。
+  const last = creationState.wbLastApply;
+  // 等正文真的读回来再比对。刚采纳完的第一帧 prose 还是 null，此时「当前正文」
+  // 是空字符串，会把整篇都标成删除，反而看不出改的是哪一处。
+  if (last && last.chapter === creationState.key && last.version_id && !last.shown
+      && creationState.prose) {
+    last.shown = true;
+    setTimeout(() => wbRunDiff(last.version_id, '__current__'), 0);
+  }
+
+  // 章节切换：未保存先问；切走前记住滚动位置。
+  document.querySelectorAll('[data-wb-chapter]').forEach((a) => {
+    a.addEventListener('click', async (ev) => {
+      if (a.dataset.wbChapter === creationState.key) { ev.preventDefault(); return; }
+      // 必须先同步挡住默认跳转。这个回调是 async 的，等到 askConfirm 那一步
+      // 已经让出主线程，浏览器会先把 hash 改掉——确认框还没答，人已经到下一章了。
+      ev.preventDefault();
+      try {
+        localStorage.setItem(wbStorageKey('pos'), String(window.scrollY));
+      } catch { /* 忽略 */ }
+      if (creationState.wbDirty) {
+        const ok = await askConfirm({
+          title: '正文还没保存',
+          html: '<p style="margin:0">切到别的章会留在这里的本地草稿里，回来还能恢复；但服务端还是旧稿。</p>',
+          confirmLabel: '切过去',
+          cancelLabel: '留在本章',
+        });
+        if (!ok) return;
+      }
+      await creationGoto('brief', a.dataset.wbChapter);
+    });
+  });
+
+  // 滚动位置记忆（每章一份，只存浏览位置，不写服务端）
+  try {
+    const pos = Number(localStorage.getItem(wbStorageKey('pos')) || 0);
+    if (pos > 0) requestAnimationFrame(() => window.scrollTo(0, pos));
+  } catch { /* 忽略 */ }
+  // 每次重画都会调用本函数；滚动监听只能挂一次，否则保存一次就多一串监听器。
+  if (!wbScrollBound) {
+    wbScrollBound = true;
+    window.addEventListener('scroll', () => {
+      clearTimeout(creationState.wbScrollTimer);
+      creationState.wbScrollTimer = setTimeout(() => {
+        try { localStorage.setItem(wbStorageKey('pos'), String(window.scrollY)); } catch { /* 忽略 */ }
+      }, 250);
+    }, { passive: true });
+  }
+}
+
 /* 整页画一遍：顶栏 → 作品条 → 流水线 → 编辑区 → 工具抽屉。
    只读内存里的状态，不再去读一次盘——所以新增/删除一个字段之后可以立刻重画，
    分区徽章、汇总 pill、流水线上的数字会一起跟着变。
@@ -5748,12 +6380,14 @@ function creationRenderPage(read) {
         title="保存（Ctrl/⌘ + S）">${esc(SAVE_LABELS[kind] || '保存')}</button>
     </div>
     ${creationStations()}
-    <div class="cd-main">
+    <div class="cd-main${kind === 'brief' && creationState.key ? ' wb-main' : ''}">
       ${creationRenderGuide()}
-      <div class="work">
-        ${creationRenderSidebar()}
-        <div class="editor" id="creation-editor">${creationRenderEditor(read)}</div>
-      </div>
+      ${kind === 'brief' && creationState.key
+        ? creationRenderWorkbench(read)
+        : `<div class="work">
+            ${creationRenderSidebar()}
+            <div class="editor" id="creation-editor">${creationRenderEditor(read)}</div>
+          </div>`}
       ${creationRenderExtras()}
     </div>
     <div id="creation-tools-host">${creationRenderTools()}</div>
@@ -5781,6 +6415,7 @@ function creationRepaint() {
   creationBindTools();
   creationBindAssist();
   creationBindDraft();
+  creationBindWorkbench(read);
   creationBindKb();
 }
 
@@ -9573,8 +10208,16 @@ document.addEventListener('keydown', (e) => {
   if (!(e.metaKey || e.ctrlKey) || String(e.key).toLowerCase() !== 's') return;
   if (!document.getElementById('creation-root')) return;
   e.preventDefault();
-  if (creationState.mode === 'raw') creationSaveRaw(creationState.read || {});
-  else creationSaveForm();
+  if (creationState.mode === 'raw') { creationSaveRaw(creationState.read || {}); return; }
+  // 章节工作台里有三份东西：正文、本章指令表单。谁脏就存谁；
+  // 都干净时按当前所在的编辑界面走，避免「按了保存却存了另一份」。
+  if (creationState.kind === 'brief' && creationState.key
+      && document.getElementById('wb-root')) {
+    if (creationState.dirty) creationSaveForm();
+    else wbSaveProse();
+    return;
+  }
+  creationSaveForm();
 });
 
 /* 停在 #/import 时再点「导入作品」标签，hash 没变 → 不触发 hashchange → 路由不重跑。
