@@ -36,6 +36,7 @@ from typing import Any
 
 import yaml
 
+from .context_budget import DEFAULT_BUDGET_CHARS, ContextBlock, build_context
 from .primitives import yaml_scalar
 
 SETTING_SCHEMA_VERSION = "setting-v1"
@@ -1124,7 +1125,12 @@ ANCHOR_HEADER = (
 ANCHOR_OPENING_LABEL = "开局（第一章的处境，后面会变）："
 ANCHOR_DIRECTION_LABEL = "走向（每一章都要往前推）："
 ANCHOR_WORLD_LABEL = "世界（钉死不偏离）："
-WRITE_BRIEF_ORDER = ("anchor", "recap", "part", "cast", "foreshadow", "hook", "prev")
+WRITE_BRIEF_ORDER = (
+    "anchor", "recap", "part", "cast", "foreshadow", "hook", "future", "prev"
+)
+
+# 写前必读里，哪几块是「丢了就必然写歪」的。其余的是可选材料，预算不够时按比例裁。
+WRITE_BRIEF_REQUIRED = ("anchor", "part")
 
 
 def render_story_anchor(work_dir: str | Path) -> str:
@@ -1197,11 +1203,16 @@ def render_story_anchor(work_dir: str | Path) -> str:
     return "\n".join(lines)
 
 
-def render_recap(work_dir: str | Path, *, upto_chapter_no: int = 0, max_chars: int = 2500) -> str:
+def render_recap(work_dir: str | Path, *, upto_chapter_no: int = 0,
+                 max_chars: int | None = None) -> str:
     """前情：前面各卷讲了什么。只到 `upto_chapter_no` 为止——**不剧透后面**。
 
     写第 3 卷时把第 5 卷的卷末总结也喂进去，等于提前把结局告诉模型，
     它会忍不住往那儿赶。
+
+    `max_chars` 默认不再设硬上限：总量由 `context_budget` 统一分配。
+    调用方若坚持自己设上限，超出时会在正文末尾**明说**哪几卷没注入，
+    不再 break 之后当作什么都没发生。
     """
     from .chapter_brief import chapter_id_of
     from .volume import load_all_volumes
@@ -1210,6 +1221,7 @@ def render_recap(work_dir: str | Path, *, upto_chapter_no: int = 0, max_chars: i
     volumes, _broken = load_all_volumes(wd / "70-volume")
     parts: list[str] = []
     used = 0
+    skipped_vols: list[str] = []
     for no in sorted(volumes):
         v = volumes[no].get("vol") or {}
         vol_no = int(v.get("vol") or no)
@@ -1236,13 +1248,21 @@ def render_recap(work_dir: str | Path, *, upto_chapter_no: int = 0, max_chars: i
             block += "\n  逐章：" + "；".join(chapters)
         if v.get("closing") and (not upto_chapter_no or (v.get("end_chapter") or 0) <= upto_chapter_no):
             block += f"\n  卷末：{v['closing']}"
-        if used + len(block) > max_chars and parts:
+        if max_chars and used + len(block) > max_chars and parts:
+            skipped_vols = [
+                str(int((volumes[n].get("vol") or {}).get("vol") or n))
+                for n in sorted(volumes) if n >= no
+            ]
             break
         parts.append(block)
         used += len(block) + 1
     if not parts:
         return ""
-    return "【前情】这本书到目前讲过的东西（按顺序，不要重复交代）\n" + "\n".join(parts)
+    text = "【前情】这本书到目前讲过的东西（按顺序，不要重复交代）\n" + "\n".join(parts)
+    if skipped_vols:
+        text += (f"\n\n（前情超过了调用方设定的 {max_chars} 字上限，"
+                 f"第 {'、'.join(skipped_vols)} 卷没有注入）")
+    return text
 
 
 def render_cast_state(work_dir: str | Path, *, absent_alarm: int = 3) -> str:
@@ -1283,8 +1303,12 @@ def render_open_foreshadows(work_dir: str | Path, *, limit: int = 12) -> str:
     return "\n".join(lines)
 
 
-def render_prev_tail(work_dir: str | Path, *, before_chapter_no: int = 0, chars: int = 900) -> str:
-    """上一章正文的末段——衔接最实在的依据，比任何摘要都准。"""
+def render_prev_tail(work_dir: str | Path, *, before_chapter_no: int = 0,
+                     chars: int = 900, full: bool = False) -> str:
+    """上一章正文的末段——衔接最实在的依据，比任何摘要都准。
+
+    `full=True` 时注入全文（C3 的四档之一），字数额度仍由上下文预算统一管。
+    """
     from .chapter_brief import chapter_id_of, load_all_briefs
 
     if not before_chapter_no:
@@ -1306,35 +1330,177 @@ def render_prev_tail(work_dir: str | Path, *, before_chapter_no: int = 0, chars:
     text = path.read_text(encoding="utf-8").strip()
     if not text:
         return ""
+    if full:
+        return (f"【上一章全文】（第 {prev[0]} 章 {chapter_id_of(prev[1], prev[0])}，"
+                f"共 {len(text)} 字。接得上，也要知道哪些话已经说过了）\n{text}")
+    n = max(1, int(chars))
     return (f"【上一章末段】（第 {prev[0]} 章 {chapter_id_of(prev[1], prev[0])}，"
-            f"只给你末尾 {min(chars, len(text))} 字，保证接得上）\n…{text[-chars:]}")
+            f"只给你末尾 {min(n, len(text))} 字，保证接得上）\n…{text[-n:]}")
+
+
+def render_future_blueprints(work_dir: str | Path, *, after_chapter_no: int = 0,
+                             count: int = 3) -> str:
+    """后面 N 章的蓝图。只用来**防吃书**：人名、事件、伏笔不能提前写。
+
+    和「前情」相反，这块是故意给模型看未来的。不给的话，它会在第 1 章
+    就把第 3 章才该出现的人写出来，或者提前回收一个还没埋的伏笔。
+    """
+    from .chapter_brief import load_all_briefs
+
+    if not after_chapter_no or count <= 0:
+        return ""
+    wd = Path(work_dir)
+    briefs, _broken = load_all_briefs(wd / BRIEF_DIR)
+    later = [
+        (cid, b) for cid, b in briefs.items()
+        if int(b.get("chapter_no") or 0) > after_chapter_no
+    ]
+    later.sort(key=lambda kv: (
+        int(kv[1].get("chapter_no") or 0),
+        int(kv[1].get("vol") or 0),
+        kv[0],
+    ))
+    if not later:
+        return ""
+    lines = [
+        "【未来章蓝图】下面这些是**后面**才发生的事，只用来避开冲突；"
+        "本章一个字都不要提前写，也不要把还没埋的伏笔先回收。"
+    ]
+    for cid, b in later[:count]:
+        cno = int(b.get("chapter_no") or 0)
+        title = str(b.get("title") or "（未名）")
+        one = str(b.get("one_line") or "").strip()
+        cast = [str(x) for x in ((b.get("settings") or {}).get("characters") or []) if str(x).strip()]
+        line = f"· 第 {cno} 章 {title}"
+        if one:
+            line += f"：{one}"
+        if cast:
+            line += f"（出场：{'、'.join(cast)}）"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _prev_tail_config(brief: dict[str, Any] | None) -> tuple[int, bool]:
+    """C3：上一章末段 500 / 1000 / 1500 / full 四档，默认 900。"""
+    raw = (brief or {}).get("prev_tail_chars", 900)
+    if isinstance(raw, str) and raw.strip() in ("full", "全文"):
+        return 0, True
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return raw, False
+    return 900, False
+
+
+def _future_count(brief: dict[str, Any] | None) -> int:
+    raw = (brief or {}).get("future_blueprint_count", 3)
+    if isinstance(raw, int) and not isinstance(raw, bool) and 0 <= raw <= 10:
+        return raw
+    return 3
+
+
+_WRITE_BRIEF_META: dict[str, tuple[str, str, str]] = {
+    "anchor": ("全书锚点", "60-setting/setting.yaml",
+               "设定集里还没有能钉住全书走向的内容"),
+    "recap": ("前情回顾", "70-volume/*.yaml",
+              "前面还没有可回顾的卷/章"),
+    "part": ("本段任务", "70-volume/*.yaml",
+             "这一章还不属于任何已规划的段落"),
+    "cast": ("角色动态", "80-brief/*.yaml",
+             "还没有可统计的出场记录"),
+    "foreshadow": ("待回收伏笔", "80-brief/*.yaml",
+                   "台账里没有还挂着的伏笔"),
+    "hook": ("钩子轮换", "80-brief/*.yaml",
+             "还没有足够的章节来判断钩子轮换"),
+    "future": ("未来章蓝图", "80-brief/<后续章节>.yaml",
+               "后面还没有已写的章指令"),
+    "prev": ("上一章正文", "90-draft/<上一章>.md",
+             "上一章正文还没落盘"),
+}
+
+WRITE_BRIEF_FOOTER = (
+    "\n\n（以上是动笔前必须读完的东西。写到与它冲突的地方，先停下来——"
+    "要么改这一段，要么回头改真源，不要带着矛盾往下写。）"
+)
+
+
+def _write_brief_blocks(
+    work_dir: str | Path,
+    *,
+    chapter_no: int = 0,
+    prev_chapter_no: int = 0,
+    brief: dict[str, Any] | None = None,
+) -> list[ContextBlock]:
+    wd = Path(work_dir)
+    prev_chars, prev_full = _prev_tail_config(brief)
+    candidates = {
+        "anchor": render_story_anchor(wd),
+        "recap": render_recap(wd, upto_chapter_no=prev_chapter_no or 0),
+        "part": render_part_task(wd, chapter_no=chapter_no),
+        "cast": render_cast_state(wd),
+        "foreshadow": render_open_foreshadows(wd),
+        "hook": render_hook_rotation(wd, chapter_no=chapter_no),
+        "future": render_future_blueprints(
+            wd, after_chapter_no=chapter_no, count=_future_count(brief)
+        ),
+        "prev": render_prev_tail(
+            wd, before_chapter_no=chapter_no, chars=prev_chars, full=prev_full
+        ),
+    }
+    blocks: list[ContextBlock] = []
+    for key in WRITE_BRIEF_ORDER:
+        label, source, empty_note = _WRITE_BRIEF_META[key]
+        blocks.append(
+            ContextBlock(
+                id=key,
+                label=label,
+                kind="required" if key in WRITE_BRIEF_REQUIRED else "optional",
+                text=candidates.get(key, ""),
+                source=source,
+                empty_note=empty_note,
+            )
+        )
+    return blocks
+
+
+def render_write_brief_report(
+    work_dir: str | Path,
+    *,
+    chapter_no: int = 0,
+    prev_chapter_no: int = 0,
+    brief: dict[str, Any] | None = None,
+    budget_chars: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """把「写前必读」装进预算，返回 (实际文本, 预算报告)。
+
+    报告与文本来自同一次装配，字数恒等由 `context_budget.build_context`
+    自检（`exact` 字段）。计划接口、生成接口、manifest、界面都读这一份。
+    """
+    blocks = _write_brief_blocks(
+        work_dir, chapter_no=chapter_no, prev_chapter_no=prev_chapter_no, brief=brief
+    )
+    return build_context(
+        blocks,
+        budget_chars=budget_chars or DEFAULT_BUDGET_CHARS,
+        footer=WRITE_BRIEF_FOOTER,
+    )
 
 
 def render_write_brief(
-    work_dir: str | Path, *, chapter_no: int = 0, prev_chapter_no: int = 0
+    work_dir: str | Path,
+    *,
+    chapter_no: int = 0,
+    prev_chapter_no: int = 0,
+    brief: dict[str, Any] | None = None,
+    budget_chars: int | None = None,
 ) -> str:
-    """把「写前必读」组装成给模型的一段输入。
-
-    起草卷表、起草逐章指令、写正文——三处用的是**同一段**，
-    这样它读到的东西不会因为从哪个入口进来而不同。
-    """
-    wd = Path(work_dir)
-    blocks = {
-        "anchor": render_story_anchor(wd),
-        "recap": render_recap(wd, upto_chapter_no=prev_chapter_no or 0),
-        "cast": render_cast_state(wd),
-        "foreshadow": render_open_foreshadows(wd),
-        "part": render_part_task(wd, chapter_no=chapter_no),
-        "hook": render_hook_rotation(wd, chapter_no=chapter_no),
-        "prev": render_prev_tail(wd, before_chapter_no=chapter_no),
-    }
-    kept = [blocks[k] for k in WRITE_BRIEF_ORDER if blocks[k]]
-    if not kept:
-        return ""
-    return "\n\n".join(kept) + (
-        "\n\n（以上是动笔前必须读完的东西。写到与它冲突的地方，先停下来——"
-        "要么改这一段，要么回头改真源，不要带着矛盾往下写。）"
+    """兼容旧调用：只要文本。总量超预算时照样抛错，不会静默裁掉必需块。"""
+    text, _report = render_write_brief_report(
+        work_dir,
+        chapter_no=chapter_no,
+        prev_chapter_no=prev_chapter_no,
+        brief=brief,
+        budget_chars=budget_chars,
     )
+    return text
 
 
 # ── 全书级硬闸 ──────────────────────────────────────────────

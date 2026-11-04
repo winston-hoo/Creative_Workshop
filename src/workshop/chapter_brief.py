@@ -121,6 +121,12 @@ timeline: ""
 # 字数区间。跟设定集的 target.chars_per_chapter 比一比，差太多会提示。
 word_target: [{low}, {high}]
 
+# 上一章正文注入多少：500 / 1000 / 1500，或 full（全文）。不写默认 900。
+# 选了 full 也有可能被上下文预算按比例裁，计划卡里会写明裁了多少。
+prev_tail_chars: 900
+# 未来几章的蓝图只用来防吃书（人名/事件/伏笔别提前写）：默认 3，0 = 不注入。
+future_blueprint_count: 3
+
 narrative:
   perspective: {yaml_scalar(perspective)}   # 第一人称 | 第三限知 | 第三全知
   tone: ""                       # 例：轻松搞笑、冷峻克制
@@ -234,6 +240,28 @@ def validate_brief(
 
     if not str(data.get("timeline") or "").strip():
         warnings.append("没写 timeline（时间线衔接）——断在这里，正文就会自己编时间")
+
+    prev_tail = data.get("prev_tail_chars")
+    if prev_tail is not None:
+        if isinstance(prev_tail, str):
+            if prev_tail.strip() not in ("full", "全文"):
+                errors.append(
+                    f"prev_tail_chars「{prev_tail}」不认识：只能写 100–12000 的整数，或 full/全文"
+                )
+        elif not (isinstance(prev_tail, int) and not isinstance(prev_tail, bool)
+                  and 100 <= prev_tail <= 12000):
+            errors.append(
+                f"prev_tail_chars「{prev_tail}」不合约定：只能是 100–12000 的整数，或 full/全文"
+            )
+
+    future_count = data.get("future_blueprint_count")
+    if future_count is not None and not (
+        isinstance(future_count, int) and not isinstance(future_count, bool)
+        and 0 <= future_count <= 10
+    ):
+        errors.append(
+            f"future_blueprint_count「{future_count}」不合约定：只能是 0–10 的整数"
+        )
 
     low = _int_or_none((data.get("word_target") or [None, None])[0]) if isinstance(data.get("word_target"), list) else None
     high = _int_or_none((data.get("word_target") or [None, None])[1]) if isinstance(data.get("word_target"), list) else None

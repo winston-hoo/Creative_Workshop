@@ -76,6 +76,7 @@ class DraftPlan:
     blocker: str = ""
     warnings: list[str] = field(default_factory=list)
     preview: str = ""
+    context_report: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +96,7 @@ class DraftPlan:
             "blocker": self.blocker,
             "warnings": self.warnings,
             "preview": self.preview,
+            "context_report": self.context_report,
             "ready": bool(self.model_id) and not self.blocker,
         }
 
@@ -115,6 +117,7 @@ def build_draft_plan(
     brief_errors: list[str] | None = None,
     brief_exists: bool = True,
     context_block: str = "",
+    context_report: dict[str, Any] | None = None,
     word_range: list[int] | None = None,
 ) -> DraftPlan:
     """算出写这一章大概多少 token、多少钱。**不发起任何调用。**"""
@@ -181,6 +184,7 @@ def build_draft_plan(
         blocker=blocker,
         warnings=warnings,
         preview=brief_text,
+        context_report=context_report or {},
     )
 
 

@@ -669,6 +669,74 @@ body.cd-on main { padding: 0; }
 .cdt :focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 3px; }
 .cdt .btn:focus-visible, .cdt .station:focus-visible { outline-offset: 1px; }
 
+/* ══ U5 上下文预算 ═══════════════════════════════════════════
+   堆叠条：必需/可选/被截断/未用完。宽度按字符数 / 预算算，
+   所以所有片段 + 未用完 = 100%。悬停给数值，点块展开原因。 */
+
+.cdt .bud-box {
+  margin: 4px 0 12px; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); box-shadow: var(--sh-1);
+}
+.cdt .bud-bar {
+  display: flex; width: 100%; height: 14px; margin: 8px 0 6px;
+  border-radius: 7px; overflow: hidden; background: var(--sunk);
+  border: 1px solid var(--line);
+}
+.cdt .bud-seg { display: block; height: 100%; transition: filter .15s; }
+.cdt .bud-seg:hover { filter: brightness(1.08) saturate(1.1); }
+.cdt .bud-req { background: var(--brand); }
+.cdt .bud-opt { background: var(--ok); }
+.cdt .bud-trim { background: var(--warn); }
+.cdt .bud-off { background: var(--line-strong); }
+.cdt .bud-rest { background: var(--sunk); }
+
+.cdt .bud-legend {
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  margin-bottom: 8px; font-size: 11.5px; color: var(--ink-3);
+}
+.cdt .bud-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.cdt .bud-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--line-strong); flex: 0 0 auto;
+}
+.cdt .bud-dot.bud-req { background: var(--brand); }
+.cdt .bud-dot.bud-opt { background: var(--ok); }
+.cdt .bud-dot.bud-trim { background: var(--warn); }
+.cdt .bud-dot.bud-off { background: var(--line-strong); }
+.cdt .bud-dot.bud-rest { background: var(--sunk); border: 1px solid var(--line-strong); }
+
+.cdt .bud-list { display: flex; flex-direction: column; gap: 2px; }
+.cdt .bud-row { border-top: 1px solid var(--line); }
+.cdt .bud-row:first-child { border-top: 0; }
+.cdt .bud-row summary {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 2px; cursor: pointer; list-style: none;
+  font-size: 12px; line-height: 1.5;
+}
+.cdt .bud-row summary::-webkit-details-marker { display: none; }
+.cdt .bud-row summary:hover { background: var(--sunk); border-radius: 4px; }
+.cdt .bud-row .bud-name { color: var(--ink); font-weight: 600; min-width: 68px; }
+.cdt .bud-row .bud-kind {
+  font-size: 10.5px; color: var(--ink-3); padding: 0 5px;
+  border: 1px solid var(--line); border-radius: 999px;
+}
+.cdt .bud-row .bud-nums {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+  margin-left: auto; white-space: nowrap;
+}
+.cdt .bud-row .bud-status { font-size: 11px; color: var(--ink-3); min-width: 62px; text-align: right; }
+.cdt .bud-row.trimmed .bud-status { color: var(--warn); }
+.cdt .bud-row.omitted .bud-status { color: var(--ink-3); }
+.cdt .bud-detail {
+  padding: 0 2px 8px 16px; font-size: 11.5px; line-height: 1.6;
+  color: var(--ink-2);
+}
+.cdt .bud-detail code {
+  font-family: var(--mono); font-size: 10.5px;
+  background: var(--sunk); padding: 1px 4px; border-radius: 3px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cdt * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }

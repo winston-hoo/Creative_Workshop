@@ -2335,6 +2335,7 @@ const creationState = {
   kb: { ref: '', section: 'characters', rows: null, counts: null, picked: {}, loaded: false, loading: false },
   prose: null,         // 已写的正文（brief 层）；draft 是表单草稿，别混
   prosePlan: null,
+  prosePlanError: null,  // 计划被预算挡下时的可读原因，原样显示，不吞
   toolsOpen: false,    // 右侧工具抽屉（素材库 / 助手）开着没有
   toolsPane: 'kb',     // 抽屉里当前在看哪个页签
   rerenderForm: null,  // 草稿被别处换掉之后的整页重画（见 creationDraftChanged）
@@ -3235,6 +3236,7 @@ async function creationRefreshPanels() {
   // 置空之后卡片显示「正在算计划…」，由 creationBindDraft 重新取一份。
   if (creationState.kind === 'brief') {
     creationState.prosePlan = null;
+    creationState.prosePlanError = null;
     creationState.prose = null;
   }
   creationRepaint();
@@ -3930,9 +3932,67 @@ async function kbImport() {
   }
 }
 
+/* U5：上下文预算可视化。
+   数据直接来自接口的 `context_report`，和生成时落盘的 `.context.json` 是同一份；
+   这里不重新估算，避免界面、计划、实际注入三处各说各话。 */
+function creationRenderBudget(report) {
+  if (!report || !Array.isArray(report.blocks) || !report.blocks.length) return '';
+  const budget = Math.max(1, Number(report.budget_chars) || 0);
+  const used = Number(report.used_chars) || 0;
+  const pct = (n) => `${Math.max(0, Math.min(100, (Number(n) || 0) / budget * 100)).toFixed(3)}%`;
+  const cls = (b) => (b.status === 'trimmed' ? 'bud-trim'
+    : b.status === 'omitted' ? 'bud-off'
+      : b.kind === 'required' ? 'bud-req' : 'bud-opt');
+  const label = (s) => ({ included: '已注入', trimmed: '按预算截断', omitted: '未注入' }[s] || s || '—');
+  const segs = (report.blocks || []).filter((b) => (b.chars || 0) > 0).map((b) =>
+    `<span class="bud-seg ${cls(b)}" style="width:${pct(b.chars)}"`
+    + ` title="${esc(b.label)}：${num(b.chars)} 字"></span>`).join('');
+  const rest = Math.max(0, budget - used);
+  const restSeg = rest > 0
+    ? `<span class="bud-seg bud-rest" style="width:${pct(rest)}"`
+      + ` title="预算未用完：${num(rest)} 字"></span>` : '';
+  const rows = (report.blocks || []).map((b) => `
+    <details class="bud-row ${esc(b.status || '')}">
+      <summary>
+        <span class="bud-dot ${cls(b)}"></span>
+        <span class="bud-name">${esc(b.label || b.id)}</span>
+        <span class="bud-kind">${b.kind === 'required' ? '必需' : '可选'}</span>
+        <span class="bud-nums">${num(b.chars || 0)} / ${num(b.original_chars || 0)} 字</span>
+        <span class="bud-status">${esc(label(b.status))}</span>
+      </summary>
+      <div class="bud-detail">
+        <p style="margin:0">${esc(b.reason || '没有记录原因')}</p>
+        ${b.source ? `<p class="muted" style="margin:4px 0 0">来源：<code>${esc(b.source)}</code></p>` : ''}
+        ${b.sha256 ? `<p class="muted" style="margin:4px 0 0">原文指纹：<code>${esc(String(b.sha256).slice(0, 12))}</code></p>` : ''}
+      </div>
+    </details>`).join('');
+  const exact = report.exact === false
+    ? notice('warn', '这份预算账对不上：块字数与总注入字数不一致，先别信它。') : '';
+  return `<div class="bud-box">
+    <div class="spread" style="align-items:baseline">
+      <b>上下文预算</b>
+      <span class="muted" style="font-size:12px">
+        用了 ${num(used)} / ${num(budget)} 字${rest > 0 ? `，还剩 ${num(rest)} 字` : '，预算已用满'}
+      </span>
+    </div>
+    <div class="bud-bar" role="img"
+      aria-label="上下文预算占用 ${num(used)} / ${num(budget)} 字">${segs}${restSeg}</div>
+    <div class="bud-legend">
+      <span><i class="bud-dot bud-req"></i>必需</span>
+      <span><i class="bud-dot bud-opt"></i>可选</span>
+      <span><i class="bud-dot bud-trim"></i>被截断</span>
+      <span><i class="bud-dot bud-rest"></i>未用完</span>
+      <span class="muted">点任一块看原因与来源</span>
+    </div>
+    ${exact}
+    <div class="bud-list">${rows}</div>
+  </div>`;
+}
+
 function creationRenderDraft() {
   if (creationState.kind !== 'brief' || !creationState.key) return '';
   const plan = creationState.prosePlan || {};
+  const planErr = creationState.prosePlanError;
   const cost = plan.est_cost_cny == null ? '（没填单价，算不出费用）' : `约 ¥${plan.est_cost_cny}`;
   const words = (plan.word_range || [2800, 4000]).join('–');
   const existing = plan.has_draft
@@ -3944,13 +4004,19 @@ function creationRenderDraft() {
     <h3>写这一章</h3>
     <p class="lead">按上面的指令 + 设定集 + 本卷目录写正文。<b>一次只出一章</b>，写完就停——
       连吐十章，第一章不满意后面九章全废。</p>
+    ${planErr ? notice('bad',
+      `<b>上下文预算把这张计划挡下了</b><br>${esc(planErr)}`
+      + '<br><span class="muted">这是算出来的结果，不是猜的：必需材料装不下就不会发起生成。'
+      + '先精简设定集/本段任务，或调高预算，再回来算一次。</span>') : ''}
     <div class="muted num" style="margin-bottom:8px">
-      ${plan.model ? `本次调用：${esc(plan.model)} · 输入约 ${num(plan.est_input_tokens || 0)} token`
-        + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token · ${cost}`
-        + `（目标 ${words} 字）` : '正在算计划…'}
+      ${planErr ? '计划未生成（原因见上）'
+        : plan.model ? `本次调用：${esc(plan.model)} · 输入约 ${num(plan.est_input_tokens || 0)} token`
+          + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token · ${cost}`
+          + `（目标 ${words} 字）` : '正在算计划…'}
     </div>
     ${blockers.length ? blockers.map((b, i) =>
       notice(plan.blocker && i === 0 ? 'bad' : 'warn', esc(b))).join('') : ''}
+    ${plan.context_report ? creationRenderBudget(plan.context_report) : ''}
     ${existing}
     ${creationNotSaved() ? `
     <div class="row" style="justify-content:space-between;align-items:center;margin-top:8px">
@@ -4019,8 +4085,17 @@ function creationBindDraft() {
   if (!creationState.prosePlan) {
     getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}/plan`)
-      .then((p) => { creationState.prosePlan = p; creationLoad(); })
-      .catch(() => {});
+      .then((p) => {
+        creationState.prosePlan = p;
+        creationState.prosePlanError = null;
+        creationLoad();
+      })
+      .catch((e) => {
+        // 预算超限是 422，不是「网络抖了一下」。原文显示，别让按钮一直转圈。
+        creationState.prosePlan = {};
+        creationState.prosePlanError = e.message || '计划请求失败';
+        creationLoad();
+      });
   }
   if (!creationState.prose) {
     getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
@@ -4152,6 +4227,7 @@ async function draftSave() {
     note.textContent = res.saved ? '已保存。' : '没保存';
     creationState.prose = null;
     creationState.prosePlan = null;
+    creationState.prosePlanError = null;
     creationLoad();
   } catch (e) {
     note.textContent = `保存失败：${e.message}`;

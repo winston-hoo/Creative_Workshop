@@ -3249,12 +3249,17 @@ def _assist_context(paths: Paths, name: str, layer: str, key: str = "") -> str:
 
     wd = _creation_work_dir(paths, name)
     chapter_no = 0
+    brief_doc: dict[str, Any] | None = None
     if layer == "brief" and key:
-        chapter_no = int((creation_document(paths, name, "brief", key) or {}).get("chapter_no") or 0)
+        brief_doc = creation_document(paths, name, "brief", key) or {}
+        chapter_no = int(brief_doc.get("chapter_no") or 0)
 
     parts: list[str] = []
+    # 同一份章指令配置（C3 末段字数 / C4 未来蓝图数）在助手路径也要生效，
+    # 否则作者在指令里选了「只看末段 500 字」，问助手时却还是 900 字。
     brief_block = render_write_brief(
-        wd, chapter_no=chapter_no, prev_chapter_no=max(0, chapter_no - 1)
+        wd, chapter_no=chapter_no, prev_chapter_no=max(0, chapter_no - 1),
+        brief=brief_doc,
     )
     if brief_block:
         parts.append(brief_block)
@@ -3483,10 +3488,27 @@ def _draft_inputs(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
     }
 
 
+def _draft_context_bundle(
+    ctx: dict[str, Any], *, budget_chars: int | None = None
+) -> tuple[str, dict[str, Any]]:
+    """计划与生成共用同一次装配：文本和预算报告必须来自同一份，不能各算一遍。"""
+    from workshop.creation import render_write_brief_report
+
+    cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
+    return render_write_brief_report(
+        ctx["work_dir"],
+        chapter_no=cno,
+        prev_chapter_no=max(0, cno - 1),
+        brief=ctx["brief"],
+        budget_chars=budget_chars,
+    )
+
+
 def draft_plan(
     paths: Paths, name: str, chapter_id: str, *,
     refs: list[str] | None = None, level: str = "k3",
     provider_id: str | None = None, model_id: str | None = None,
+    budget_chars: int | None = None,
 ) -> dict[str, Any]:
     """写这一章的免费计划：多少 token、多少钱、会喂进去什么。**不调模型。**"""
     from workshop.batch import _pick_price, price_bucket
@@ -3505,10 +3527,9 @@ def draft_plan(
     if ctx["setting_errors"]:
         errors = [f"设定集有 {len(ctx['setting_errors'])} 项阻断：{ctx['setting_errors'][0]}"] + errors
 
-    from workshop.creation import render_write_brief as _rwb
-    _cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
-    _ctx = _rwb(_creation_work_dir(paths, name), chapter_no=_cno,
-                 prev_chapter_no=max(0, _cno - 1))
+    from workshop.context_budget import load_manifest, manifest_path
+
+    _ctx, _report = _draft_context_bundle(ctx, budget_chars=budget_chars)
     plan = build_draft_plan(
         chapter_id=chapter_id, title=ctx["title"], setting=ctx["setting"],
         volume=ctx["volume"], brief=ctx["brief"], refs_block=block,
@@ -3516,8 +3537,11 @@ def draft_plan(
         price_input_per_mtok=_pick_price(model_cfg, bucket, "input"),
         price_output_per_mtok=_pick_price(model_cfg, bucket, "output"),
         bucket=bucket, brief_errors=errors, brief_exists=ctx["brief_exists"],
-        context_block=_ctx,
+        context_block=_ctx, context_report=_report,
     ).to_dict()
+    context_manifest = manifest_path(ctx["work_dir"], chapter_id)
+    plan["context_manifest_path"] = str(context_manifest)
+    plan["context_manifest_exists"] = load_manifest(ctx["work_dir"], chapter_id) is not None
 
     existing = load_draft(ctx["work_dir"], chapter_id)
     plan["refs_missing"] = missing
@@ -3532,6 +3556,7 @@ def run_draft(
     refs: list[str] | None = None, level: str = "k3",
     provider_id: str | None = None, model_id: str | None = None,
     max_tokens: int = 8000, temperature: float = 0.8,
+    budget_chars: int | None = None,
 ) -> dict[str, Any]:
     """写这一章（**会花钱**）。跑完落盘并做机械自检。只出一章，不往下串。"""
     from datetime import datetime, timezone
@@ -3567,10 +3592,23 @@ def run_draft(
         secrets=store.known_values, rate_limit=provider.rate_limit,
     )
     block, _missing = _setting_refs_block(paths, refs or [], level)
-    from workshop.creation import render_write_brief as _rwb
-    _cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
-    _ctx = _rwb(_creation_work_dir(paths, name), chapter_no=_cno,
-                 prev_chapter_no=max(0, _cno - 1))
+    _ctx, _report = _draft_context_bundle(ctx, budget_chars=budget_chars)
+
+    # A4：生成前先落一份「这次到底喂了什么」。模型失败也留着这份证据；
+    # 成功后再覆盖成终态，写进 usage / finish_reason。
+    from workshop.context_budget import save_manifest
+
+    manifest_extra = {
+        "phase": "assembled",
+        "work": name,
+        "provider": provider.id,
+        "model": model,
+        "budget_chars": _report.get("budget_chars"),
+        "refs_level": level,
+        "refs": refs or [],
+    }
+    save_manifest(ctx["work_dir"], chapter_id, _report, extra=manifest_extra)
+
     messages = build_draft_messages(
         setting=ctx["setting"], volume=ctx["volume"], brief=ctx["brief"],
         refs_block=block, title=ctx["title"], context_block=_ctx,
@@ -3580,6 +3618,12 @@ def run_draft(
         max_tokens=max_tokens, temperature=temperature,
     )
     if result.error or not result.text.strip():
+        save_manifest(
+            ctx["work_dir"], chapter_id, _report,
+            extra={**manifest_extra, "phase": "failed",
+                   "error": result.error or "模型没返回内容",
+                   "usage": result.usage},
+        )
         return {"ok": False, "error": result.error or "模型没返回内容", "usage": result.usage}
 
     errors, warnings, stats = check_draft(
@@ -3588,6 +3632,12 @@ def run_draft(
     if result.truncated:
         errors = ["模型是被 max_tokens 截断的，末尾是断的——这一章没写完"] + errors
 
+    save_manifest(
+        ctx["work_dir"], chapter_id, _report,
+        extra={**manifest_extra, "phase": "generated",
+               "usage": result.usage, "finish_reason": result.finish_reason,
+               "truncated": result.truncated},
+    )
     saved = save_draft(
         ctx["work_dir"], chapter_id, text=result.text,
         meta={

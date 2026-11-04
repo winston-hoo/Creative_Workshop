@@ -58,6 +58,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from server import services  # noqa: E402
 from workshop import __version__  # noqa: E402
+from workshop.context_budget import ContextBudgetError  # noqa: E402
 from workshop.entities import DEFAULT_BLOCK_SIZE as _ENTITY_BLOCK  # noqa: E402
 from workshop.outline import DEFAULT_BLOCK_SIZE as DEFAULT_BLOCK_SIZE  # noqa: E402
 
@@ -931,6 +932,8 @@ class DraftGenerateBody(BaseModel):
     model: str | None = None
     max_tokens: int = 8000
     temperature: float = 0.8
+    # 调试/验收用：不传就用默认 8000。正常界面不暴露这个参数。
+    budget_chars: int | None = Field(default=None, ge=1, le=200000)
 
 
 class DraftWriteBody(BaseModel):
@@ -944,14 +947,17 @@ def api_draft_plan(
     level: str = Query("k3"),
     provider: str | None = Query(None),
     model: str | None = Query(None),
+    budget: int | None = Query(None, ge=1, le=200000),
 ) -> dict:
     """写这一章的免费计划。**不调模型。** 设定集或指令有阻断时 ready=False。"""
     try:
         return services.draft_plan(
             PATHS, safe_name(name), chapter_id,
             refs=[r for r in refs.split(",") if r], level=level,
-            provider_id=provider, model_id=model,
+            provider_id=provider, model_id=model, budget_chars=budget,
         )
+    except ContextBudgetError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -964,7 +970,10 @@ def api_draft_generate(name: str, chapter_id: str, body: DraftGenerateBody) -> d
             PATHS, safe_name(name), chapter_id, refs=body.refs, level=body.level,
             provider_id=body.provider, model_id=body.model,
             max_tokens=body.max_tokens, temperature=body.temperature,
+            budget_chars=body.budget_chars,
         )
+    except ContextBudgetError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
