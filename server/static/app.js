@@ -3970,7 +3970,7 @@ function creationRenderBudget(report) {
     ? notice('warn', '这份预算账对不上：块字数与总注入字数不一致，先别信它。') : '';
   return `<div class="bud-box">
     <div class="spread" style="align-items:baseline">
-      <b>上下文预算</b>
+      <b>写前必读预算</b>
       <span class="muted" style="font-size:12px">
         用了 ${num(used)} / ${num(budget)} 字${rest > 0 ? `，还剩 ${num(rest)} 字` : '，预算已用满'}
       </span>
@@ -3983,6 +3983,7 @@ function creationRenderBudget(report) {
       <span><i class="bud-dot bud-trim"></i>被截断</span>
       <span><i class="bud-dot bud-rest"></i>未用完</span>
       <span class="muted">点任一块看原因与来源</span>
+      <span class="muted">只算这 8 块；设定集/卷表/本章指令/参照素材不在这 8000 字里，见上方 token 估算</span>
     </div>
     ${exact}
     <div class="bud-list">${rows}</div>
