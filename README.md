@@ -482,7 +482,8 @@ python tests/test_setting_assist.py
   `%LOCALAPPDATA%\创作工坊\craft`。同名 `.md` **覆盖内置**；外部包没有的篇目照旧读内置，不是整库失效。
   外部包不入 git（`.gitignore` 里的 `/craft/`），也不进 exe。
 - **加自己的篇目**两步：`CATALOG` 里加一条（`label` 必填，再给一个 `always` 或某个触发条件），放同名 `.md`。
-- 默认预算 `DEFAULT_CRAFT_BUDGET = 10000`；选谁不选谁看 `CATALOG` 里的标记。
+- 预算按阶段分：`STAGE_BUDGETS`（细纲/正文/审稿各自「全量篇目实测长度 × 1.07」），
+  唯一来源在 `craft.py`；选谁不选谁看 `CATALOG` 里的标记。
 
 | 文件 | 篇目 | 什么时候带上 |
 |---|---|---|

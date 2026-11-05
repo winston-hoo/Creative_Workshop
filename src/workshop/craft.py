@@ -94,11 +94,14 @@ CATALOG: dict[str, dict[str, Any]] = {
     "review-dimensions": {"label": "章节审查维度", "when": "审稿时（不给生成用）", "review_only": True, "order": 96},
 }
 
-# 预算是「别让技法压住这一章要写什么」的闸门，但也不该把该给的篇目砍掉：
-# 一章最多会选到 4 篇 always + 黄金开篇 + 对话规范 + 承接，加起来约 9200 字。
-# 上限取 10000 —— 最长的一次选择装得下，其余情况照旧按预算裁。
+# 预算按「该阶段可能选到的全部篇目」的实测渲染长度算（含【技法·标题】与段间空行）：
+#   本机安装的技法包（workshop/craft/，外部覆盖内置）：
+#     细纲 3 篇 5,325 字；正文最全 7 篇 14,587 字；审稿 2 篇 12,800 字。
+#   内置包更小：3,910 / 9,173 / 3,525 字（打包版同样装得下）。
+# 每个阶段在实测值上加约 7% 余量，留给标点与标题差异；不再用「最长一次约 9k」的
+# 旧口径 —— 那个数只对内置包成立，外部包一接上就把 plot-structures 挤掉了。
 # `tests/test_craft.py` 有断言兜住这条：哪天加篇目把最长选择顶出去，测试会红。
-DEFAULT_CRAFT_BUDGET = 10000
+_STAGE_BUDGET_BASIS = {"brief": 5325, "draft": 14587, "review": 12800}
 
 # C6：同一份技法库按**阶段**分发。细纲要结构，正文要行文，审稿要审查。
 # 三组集合不重叠的部分是刻意的：把「开头够不够黄金」喂给审稿，它会去评一件
@@ -124,9 +127,9 @@ STAGE_LABELS = {
     "review": "审稿（审查技法）",
 }
 
-# 细纲要给的是「按什么结构拆」，三篇结构篇目合计约 11.8k 字，上限放宽到 12k；
-# 正文沿用 10k；审稿只有两篇，用不到上限。
-STAGE_BUDGETS = {"draft": DEFAULT_CRAFT_BUDGET, "brief": 12000, "review": DEFAULT_CRAFT_BUDGET}
+# 各阶段预算的唯一来源：上表的实测长度 × 1.07。调用方不要再另抄一份数字。
+STAGE_BUDGETS = {stage: int(chars * 1.07) for stage, chars in _STAGE_BUDGET_BASIS.items()}
+DEFAULT_CRAFT_BUDGET = max(STAGE_BUDGETS.values())
 
 
 def _external_dir() -> Path | None:

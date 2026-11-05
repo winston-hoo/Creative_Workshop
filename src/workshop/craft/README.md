@@ -35,10 +35,11 @@
 `CATALOG` 里的 `always` / `first_chapter` / `first_of_volume` / `on_dialogue` / `on_carry_over` /
 `on_new_character` / `review_only` 决定选哪几篇，改选法看 `src/workshop/craft.py`。
 
-**篇目少给会被点名。** 预算 10000 字（`DEFAULT_CRAFT_BUDGET`）装不下的篇目会在提示词末尾列出——
+**篇目少给会被点名。** 预算装不下的篇目会在提示词末尾列出——
 「这一章不需要对话规范」和「技法库超预算没给」是两回事，混成一句作者会去调高上限，
-而调多高都改变不了「这一章没有对话」这个事实。上限取值只需满足一条：**最长的一次选择
-（4 篇 `always` + 黄金开篇 + 对话规范 + 承接）必须整整齐齐装得下**，`tests/test_craft.py` 有断言兜住。
+而调多高都改变不了「这一章没有对话」这个事实。预算按阶段算（`STAGE_BUDGETS`，唯一来源）：
+细纲 3 篇、正文最全 7 篇、审稿 2 篇，各自按「全量篇目实测长度 × 1.07」取值。
+`tests/test_craft.py` 有断言兜住：最长的一次选择必须整整齐齐装得下。
 
 ## 接外部技法包
 

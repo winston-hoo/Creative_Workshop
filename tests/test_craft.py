@@ -148,10 +148,34 @@ def test_stage_injection() -> None:
               "计划块给出字数与预算")
 
 
+def test_stage_budgets_fit_full_selection() -> None:
+    """预算必须容得下该阶段的最全选择；不然「always」的篇目会被静默砍掉。"""
+    print("阶段预算容纳全量")
+    with builtin_only():
+        cues = {
+            "core_plot": ["他开口说了一句话"],
+            "carry_over": [{"id": "F-001"}],
+            "narrative": {"focus": ["对话"]},
+        }
+        expected = {
+            "brief": {"golden-opening", "emotion-curve", "plot-structures"},
+            "draft": {"golden-opening", "chapter-guide", "emotion-curve",
+                      "hook-techniques", "plot-structures", "dialogue-writing", "continuity"},
+            "review": {"quality-checklist", "review-dimensions"},
+        }
+        for stage, names in expected.items():
+            meta = craft.plan_block(stage=stage, chapter_no=1, brief=cues)
+            check(set(meta["names"]) == names, f"{stage} 全量篇目都在（实际 {meta['names']}）")
+            check(meta["dropped"] == [], f"{stage} 没有因预算被丢的篇目（实际 {meta['dropped']}）")
+            check(meta["chars"] <= meta["budget"],
+                  f"{stage} 实际 {meta['chars']} 字不超过预算 {meta['budget']}")
+
+
 def main() -> int:
     print("=" * 58)
     for fn in (test_builtin_complete, test_external_overrides_builtin,
-               test_pick_and_render, test_stage_injection):
+               test_pick_and_render, test_stage_injection,
+               test_stage_budgets_fit_full_selection):
         fn()
         print()
 
