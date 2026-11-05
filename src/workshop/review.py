@@ -375,11 +375,24 @@ def normalize_items(
 # ── 提示词 ──────────────────────────────────────────────────
 
 
+def _review_system_text(work_dir: str | Path | None = None) -> str:
+    """审稿系统提示。文本在 `prompts/review.system.md`，支持项目级覆盖（E1）。
+
+    引文长度下限用模板变量 `{{min_evidence}}` 注入，保证和 locator 用的是同一个数。
+    """
+    from .prompt_registry import render
+
+    return render(
+        "review.system", variables={"min_evidence": MIN_EVIDENCE_CHARS}, work_dir=work_dir
+    )["text"]
+
+
 def build_review_messages(
     *, prose: str, brief: dict[str, Any], setting: dict[str, Any],
     craft_block: str = "", word_range: list[int] | None = None,
+    work_dir: str | Path | None = None,
 ) -> list[dict[str, str]]:
-    """审正文。规则写死在这里：**引文必须逐字**，建议必须能直接替换。"""
+    """审正文。规则在 `prompts/review.system.md`：**引文必须逐字**，建议必须能直接替换。"""
     target = "、".join(str(x) for x in (word_range or [])) or "未给"
     setting_brief = json.dumps(
         {
@@ -398,20 +411,7 @@ def build_review_messages(
         },
         ensure_ascii=False,
     )
-    system = (
-        "你是网文主编，只做一件事：给这一章正文挑出**能立刻动手改**的问题。"
-        "你的输出要被人逐条勾选后直接写回正文，所以每一条都必须能落到具体句子。\n"
-        "铁律：\n"
-        "1. evidence 必须是从下方正文里**逐字复制**的连续片段，"
-        f"长度 {MIN_EVIDENCE_CHARS}–60 字，且在整章里只出现一次；不要概括、不要加省略号、不要改标点。\n"
-        "2. suggestion 是**用来直接替换 evidence 的改写文本**，语义要贴合上下文，"
-        "不要写「建议增加细节」这种没法执行的指令。\n"
-        "3. 宁可只提 3 条真问题，不要凑 10 条套话；每条都要指出位置。\n"
-        "4. 只输出 JSON，不要 markdown 围栏，不要解释。\n"
-        '格式：{"summary":"一句话总评","items":[{"type":"opening|function|hook|character|'
-        'dialogue|continuity|pacing|language|logic|other","severity":"blocker|major|minor",'
-        '"evidence":"正文原句","problem":"问题是什么","suggestion":"替换这句的改写"}]}'
-    )
+    system = _review_system_text(work_dir)
     user = (
         (f"【设定摘要】{setting_brief}\n\n" if setting_brief else "")
         + (f"【本章任务】{command}（目标字数 {target}）\n\n" if command else "")
@@ -442,6 +442,7 @@ def run_review(
     craft_block: str = "",
     max_tokens: int = DEFAULT_REVIEW_MAX_TOKENS,
     existing_items: list[dict[str, Any]] | None = None,
+    work_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """调一次审稿。JSON 解析失败**重试一次**（D1）；两次都不行就明确报错。"""
     import time
@@ -451,7 +452,7 @@ def run_review(
 
     messages = build_review_messages(
         prose=prose, brief=brief, setting=setting, craft_block=craft_block,
-        word_range=(brief or {}).get("word_target"),
+        word_range=(brief or {}).get("word_target"), work_dir=work_dir,
     )
     attempts: list[dict[str, Any]] = []
     last_error: Exception | None = None

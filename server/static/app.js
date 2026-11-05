@@ -4174,6 +4174,25 @@ function creationRenderDraft() {
   const taskRunning = creationState.proseTask
     && ['running', 'cancelling'].includes(creationState.proseTask.status);
   const blockers = (plan.blocker ? [plan.blocker] : []).concat(plan.warnings || []);
+  const stage = plan.stage || {};
+  const beatsStage = plan.beats_stage || {};
+  const craft = plan.craft || {};
+  const craftParts = [];
+  if (craft.brief) {
+    craftParts.push(`细纲 ${num((craft.brief.names || []).length)} 篇 / ${num(craft.brief.chars || 0)} 字`);
+  }
+  if (craft.draft) {
+    craftParts.push(`正文 ${num((craft.draft.names || []).length)} 篇 / ${num(craft.draft.chars || 0)} 字`);
+  }
+  const craftLine = craftParts.length
+    ? `<br>技法注入：${esc(craftParts.join(' · '))}`
+      + '<span class="muted">（正文那份计入上面的输入估算；细纲那份算在细纲调用里）</span>'
+    : '';
+  const beatsLine = plan.model
+    ? (beatsStage.available === false
+      ? `<br><span style="color:var(--danger)">细纲阶段不可用：${esc(beatsStage.reason || '未配置')}——点下去会在第一步就停。</span>`
+      : `<br>细纲用 ${esc(beatsStage.model || '')}${beatsStage.source_label ? `（${esc(beatsStage.source_label)}）` : ''}`)
+    : '';
 
   return `<div class="blk" id="creation-draft-host">
     <h3>写这一章</h3>
@@ -4185,9 +4204,12 @@ function creationRenderDraft() {
       + '先精简设定集/本段任务，或调高预算，再回来算一次。</span>') : ''}
     <div class="muted num" style="margin-bottom:8px">
       ${planErr ? '计划未生成（原因见上）'
-        : plan.model ? `本次调用：${esc(plan.model)} · 输入约 ${num(plan.est_input_tokens || 0)} token`
+        : plan.model ? `正文用：${esc(plan.model)}${stage.source_label ? `（${esc(stage.source_label)}）` : ''}`
+          + ` · 输入约 ${num(plan.est_input_tokens || 0)} token`
           + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token · ${cost}`
           + `（目标 ${words} 字）` : '正在算计划…'}
+      ${planErr ? '' : beatsLine}
+      ${planErr ? '' : craftLine}
     </div>
     ${blockers.length ? blockers.map((b, i) =>
       notice(plan.blocker && i === 0 ? 'bad' : 'warn', esc(b))).join('') : ''}
@@ -4213,44 +4235,6 @@ function creationRenderDraft() {
         ${taskRunning ? '正在生成…' : `${plan.has_draft && plan.ready ? '重写这一章' : '写这一章'}${plan.ready ? `（${cost}）` : ''}`}</button>
     </div>
     <div id="draft-note" style="margin-top:8px"></div>
-  </div>`;
-}
-
-function creationRenderDraftResult() {
-  const d = creationState.prose;
-  if (!d || !d.exists) return '';
-  const stats = d.stats || {};
-  const meta = d.meta || {};
-  const usage = meta.usage || {};
-  return `<div class="blk">
-    <div class="spread" style="margin-bottom:10px">
-      <div>
-        <h3 style="margin:0 0 2px">${esc(creationState.key)} 正文
-          ${creationRenderDraftStatus(d.status)}</h3>
-        <span class="muted" style="font-size:12px">
-          ${num(stats.chars || 0)} 字（目标 ${(stats.word_range || []).join('–')}）
-          ${stats.in_range ? '· 在区间内' : '· 不在区间内'}
-          ${meta.model ? `· ${esc(meta.model)}` : ''}
-          ${usage.completion_tokens ? `· 输出 ${num(usage.completion_tokens)} token` : ''}
-        </span>
-      </div>
-      <button class="btn primary" id="draft-save">保存正文</button>
-    </div>
-    ${(d.errors || []).length ? notice('bad',
-      `<b>${d.errors.length} 项要处理</b><ul style="margin:6px 0 0 18px">${
-        d.errors.map((e) => `<li>${esc(e)}</li>`).join('')}</ul>`) : ''}
-    ${(d.warnings || []).length ? notice('warn',
-      `<ul style="margin:0 0 0 18px">${d.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>`) : ''}
-    <textarea id="draft-text" spellcheck="false"
-      style="width:100%;min-height:520px;font:15px/1.9 Georgia,'Songti SC',serif;
-             padding:14px;border-radius:10px;border:1px solid var(--border-strong);
-             background:var(--surface);color:var(--text);resize:vertical"
-      >${esc(d.text || '')}</textarea>
-    <div id="draft-save-note" class="muted" style="font-size:12px;margin-top:6px">
-      直接在这里改。自检只查字数、禁令字面命中、该出场的人漏了谁——钩子和情节机器查不了。
-    </div>
-    <div id="creation-review-host">${creationRenderReview()}</div>
-    <div id="creation-notes-host">${creationRenderNotes()}</div>
   </div>`;
 }
 
@@ -4342,10 +4326,8 @@ function creationBindDraft() {
       draftGenerate();
     };
   }
-  // 工作台里 #draft-save 在中栏工具条，由 creationBindWorkbench 走 wbSaveProse；
-  // 这里再绑一次会变成「一次点击存两遍」，而且旧函数要的 #draft-save-note 在新布局里不存在。
-  const save = document.getElementById('draft-save');
-  if (save && !document.getElementById('wb-root')) save.onclick = () => draftSave();
+  // 保存正文的按钮在中栏工具条（#draft-save），由 creationBindWorkbench 走 wbSaveProse。
+  // 旧版「结果卡 + draftSave」已删除：brief 页面固定渲染三栏工作台，那条分支永远走不到。
   const wb = document.getElementById('draft-writeback');
   if (wb) wb.onclick = () => draftWriteback();
   const rv = document.getElementById('draft-review');
@@ -5274,30 +5256,6 @@ async function draftGenerate(options = {}) {
   }
 }
 
-async function draftSave() {
-  const ta = document.getElementById('draft-text');
-  const note = document.getElementById('draft-save-note');
-  const btn = document.getElementById('draft-save');
-  btn.disabled = true;
-  try {
-    const res = await api(
-      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
-      + `${encodeURIComponent(creationState.key)}`,
-      { method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: ta.value }) }
-    );
-    note.textContent = res.saved ? '已保存。' : '没保存';
-    creationState.prose = null;
-    creationState.prosePlan = null;
-    creationState.prosePlanError = null;
-    creationLoad();
-  } catch (e) {
-    note.textContent = `保存失败：${e.message}`;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 /* 伏笔账：作者最需要的一句话是「现在还有几条挂着没收」。
    链路校验只管单条对不对，回答不了这个。 */
 /* 人物动向：长篇最隐蔽的失败不是写错，是**写着写着人不见了**。
@@ -5432,8 +5390,7 @@ function creationRenderEditor(read) {
     if (!creationState.draft) creationState.draft = JSON.parse(JSON.stringify(read.data || {}));
     return creationRenderSuggest()
       + creationRenderForm(creationState.draft)
-      + creationRenderDraft()
-      + creationRenderDraftResult();
+      + creationRenderDraft();
   }
   return `<section class="sec">
     <div class="sec-head">
@@ -7450,11 +7407,14 @@ async function renderSettings() {
 
 function drawSettings() {
   const d = settingsState.data;
+  const flash = settingsState.flash;
+  settingsState.flash = null;
   view.innerHTML = `
     <h1>设置</h1>
     <p class="lead">模型服务商、密钥与限速。改完即刻生效，不需要重启服务。</p>
 
     ${notice('info', d.notes.map((n) => esc(n)).join('<br>'))}
+    ${flash ? notice('ok', esc(flash)) : ''}
 
     <div class="card">
       <div class="spread" style="margin-bottom:10px">
@@ -7476,6 +7436,20 @@ function drawSettings() {
       </div>
     </div>
 
+    <div class="card" id="stage-card">
+      <div class="spread" style="margin-bottom:10px">
+        <h3 style="margin:0">阶段模型</h3>
+        <span class="muted" style="font-size:12px">写一章会依次走这四步</span>
+      </div>
+      <p class="muted" style="margin:0 0 6px">
+        细纲 → 正文 → 审稿 → 要点抽取。每一步的要求不同：细纲要结构判断，正文要长输出，
+        审稿要稳定 JSON，抽取要便宜。单独给某一阶段配模型；没配的阶段回落到上面的默认模型。
+      </p>
+      <div id="stage-rows">
+        ${(d.stages || []).map((row) => stageRowHtml(row, d)).join('')}
+      </div>
+    </div>
+
     <div class="card">
       <div class="spread" style="margin-bottom:10px">
         <h3 style="margin:0">服务商列表</h3>
@@ -7489,6 +7463,19 @@ function drawSettings() {
       <div id="provider-list">
         ${d.providers.map((p) => providerCard(p, d)).join('')}
       </div>
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:10px">
+        <h3 style="margin:0">提示词</h3>
+        <span class="muted" style="font-size:12px">优先级：项目 &gt; 全局 &gt; 内置</span>
+      </div>
+      <p class="muted" style="margin:0 0 10px">
+        每条提示词都可以不改代码就替换：放在 <code>作品/prompts/&lt;id&gt;.md</code> 覆盖这一部，
+        放在数据根的 <code>prompts/&lt;id&gt;.md</code> 覆盖所有作品。
+        模板里的 <code>{{变量}}</code> 是必填的，缺了会明确报错而不是把字面量交给模型。
+      </p>
+      ${(d.prompts || []).map((p) => promptRowHtml(p)).join('')}
     </div>
 
     <div class="card">
@@ -7508,6 +7495,7 @@ function drawSettings() {
   `;
 
   wireBindingSelects();
+  wireStageMatrix();
   document.getElementById('save-binding').onclick = saveDefaultBinding;
   document.getElementById('add-provider').onclick = () => {
     const box = document.getElementById('provider-form');
@@ -7576,23 +7564,162 @@ function wireBindingSelects() {
   fill();
 }
 
+const STAGE_SOURCE_NOTE = {
+  stage: '这一阶段单独指定',
+  default: '回落到默认任务绑定',
+  request: '本次请求显式指定',
+  unset: '还没有配置',
+};
+
+function stageRowHtml(row, d) {
+  const providers = d.providers || [];
+  const p = providers.find((x) => x.id === row.provider) || providers[0];
+  const selectedModel = row.provider ? row.model : null;
+  const caps = row.capabilities || {};
+  const capText = [
+    row.max_context ? `上下文 ${num(row.max_context)}` : '',
+    row.max_output ? `输出 ${num(row.max_output)}` : '',
+    caps.structured_output || caps.json_mode ? '结构化输出' : '',
+  ].filter(Boolean).join(' · ');
+  return `<div class="stage-row" data-stage="${esc(row.stage)}">
+    <div class="stage-line">
+      <div style="min-width:0">
+        <b>${esc(row.label || row.stage)}</b>
+        <span class="chip ${row.available ? 'ok' : 'bad'}">${row.available ? '可用' : '不可用'}</span>
+        <span class="muted" style="font-size:12px">${esc(STAGE_SOURCE_NOTE[row.source] || row.source_label || '')}</span>
+      </div>
+      <div class="row wrap" style="gap:6px">
+        <select data-stage-provider aria-label="${esc(row.label)}服务商">
+          ${providers.map((x) => `<option value="${esc(x.id)}" ${x.id === (p && p.id) ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
+        </select>
+        <select data-stage-model aria-label="${esc(row.label)}模型">
+          ${modelOptions(p, selectedModel)}
+        </select>
+        <button type="button" class="btn sm primary" data-stage-save>保存</button>
+        <button type="button" class="btn sm" data-stage-reset ${row.configured ? '' : 'disabled'}
+          title="移除这一阶段的单独配置，回落到默认任务绑定">恢复默认</button>
+        <button type="button" class="btn sm" data-stage-test ${p ? '' : 'disabled'}
+          title="只发一句合成测试句，不碰作品原文">测试</button>
+      </div>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      推荐：${esc(row.recommendation || '')}
+      ${capText ? `<br>当前模型：${esc(capText)}` : ''}
+      ${row.source !== 'unset' ? `<br>实际生效：${esc(row.provider_name || '')} / ${esc(row.model || '')}` : ''}
+    </div>
+    ${row.unavailable_reason ? notice('warn', `当前不可用：${esc(row.unavailable_reason)}`) : ''}
+    ${(row.risks || []).map((r) => notice('warn', esc(r))).join('')}
+    <div class="muted" data-stage-msg style="font-size:12px;margin-top:4px"></div>
+  </div>`;
+}
+
+function promptRowHtml(p) {
+  const sourceText = { builtin: '内置', global: '全局覆盖', project: '项目覆盖' }[p.source] || p.source;
+  const vars = (p.placeholders || []).map((v) => `{{${v}}}`).join('、');
+  return `<div class="stage-row">
+    <div class="stage-line">
+      <div style="min-width:0">
+        <b>${esc(p.label)}</b>
+        <span class="chip ${p.overridden ? 'warn' : ''}">${esc(sourceText)}</span>
+        <span class="muted" style="font-size:12px">${esc(p.id)} · 用于 ${esc(p.used_by)}</span>
+      </div>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:4px;word-break:break-all">
+      文件：<code>${esc(p.path)}</code>
+      ${vars ? `<br>必填变量：${esc(vars)}` : '<br>无必填变量'}
+    </div>
+  </div>`;
+}
+
+function wireStageMatrix() {
+  const d = settingsState.data;
+  const providers = d.providers || [];
+  view.querySelectorAll('[data-stage]').forEach((rowEl) => {
+    const stage = rowEl.dataset.stage;
+    const pSel = rowEl.querySelector('[data-stage-provider]');
+    const mSel = rowEl.querySelector('[data-stage-model]');
+    if (pSel && mSel) {
+      pSel.onchange = () => {
+        mSel.innerHTML = modelOptions(providers.find((x) => x.id === pSel.value), null);
+      };
+    }
+    const save = rowEl.querySelector('[data-stage-save]');
+    if (save) save.onclick = () => saveStageBinding(stage, rowEl);
+    const reset = rowEl.querySelector('[data-stage-reset]');
+    if (reset) {
+      reset.onclick = () => saveStageBinding(stage, rowEl, { clear: true });
+    }
+    const test = rowEl.querySelector('[data-stage-test]');
+    if (test) {
+      test.onclick = () => testStageModel(stage, rowEl, test);
+    }
+  });
+}
+
+async function saveStageBinding(stage, rowEl, opts) {
+  const clear = !!(opts && opts.clear);
+  const pSel = rowEl.querySelector('[data-stage-provider]');
+  const mSel = rowEl.querySelector('[data-stage-model]');
+  const msg = rowEl.querySelector('[data-stage-msg]');
+  const btn = rowEl.querySelector(clear ? '[data-stage-reset]' : '[data-stage-save]');
+  if (!clear && (!pSel || !mSel || !mSel.value)) {
+    if (msg) msg.innerHTML = `<span style="color:var(--danger)">先在服务商的模型清单里加上模型，再绑定。</span>`;
+    return;
+  }
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const r = await api('/api/settings/stages', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(clear
+        ? { stage, clear: true }
+        : { stage, provider: pSel.value, model: mSel.value }),
+    });
+    settingsState.data = await getJSON('/api/settings');
+    settingsState.flash = r.hint || '已保存。';
+    drawSettings();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+    if (msg) msg.innerHTML = `<span style="color:var(--danger)">保存失败：${esc(e.message)}</span>`;
+  }
+}
+
+async function testStageModel(stage, rowEl, btn) {
+  const pSel = rowEl.querySelector('[data-stage-provider]');
+  const mSel = rowEl.querySelector('[data-stage-model]');
+  const msg = rowEl.querySelector('[data-stage-msg]');
+  if (!pSel || !mSel || !msg) return;
+  await withBusy(btn, '<span class="spinner"></span>测试中…', async () => {
+    try {
+      const r = await api(
+        `/api/settings/providers/${encodeURIComponent(pSel.value)}/test`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: mSel.value || null }) },
+      );
+      msg.innerHTML = r.ok
+        ? notice('ok', `「${esc(r.model || mSel.value)}」连通正常，端点、鉴权、模型名三项都通过。`)
+        : stepList(r);
+    } catch (e) {
+      msg.innerHTML = notice('bad', `测试失败：${esc(e.message)}`);
+    }
+  });
+}
+
 async function saveDefaultBinding() {
   const prov = document.getElementById('binding-provider');
   const model = document.getElementById('binding-model');
   if (!prov) return;
-  const btn = document.getElementById('save-binding');
   try {
     await api('/api/settings/binding', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider: prov.value, model: model.value || null }),
     });
-    btn.textContent = '已保存 ✓';
-    btn.disabled = true;
-    setTimeout(() => {
-      btn.textContent = '保存默认';
-      btn.disabled = false;
-    }, 1500);
+    // 生效确认：重新读一遍服务端配置，让阶段矩阵里「回落到默认绑定」的几行跟着变。
+    settingsState.data = await getJSON('/api/settings');
+    settingsState.flash = '默认模型已保存：没有单独配置的阶段会自动跟着变。';
+    drawSettings();
   } catch (e) {
     await tellUser('保存失败', `<p style="margin:0">${esc(e.message)}</p>`);
   }

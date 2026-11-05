@@ -351,31 +351,17 @@ def _clean_confidence(value: Any) -> float:
 # ── 提示词 ──────────────────────────────────────────────────
 
 
-EXTRACT_SYSTEM = """你是长篇小说的连续性编辑。读完这一章正文，只做一件事：
-把「下一章写作时必须记得的、这一章已经确认的」东西抽成结构化要点。
+def extract_system_text(work_dir: str | Path | None = None) -> str:
+    """要点抽取系统提示。文本在 `prompts/notes.extract.system.md`，支持项目级覆盖（E1）。"""
+    from .prompt_registry import render
 
-# 三类要点
-- fact：已经发生、后续必须当成事实的事（谁做了什么、什么东西被拿走/毁掉、谁死了）。
-- state：角色/势力此刻的状态（位置、伤势、体压/等级、掌握的东西、关系变化）。
-  必须能在后续章节里被直接当作「当前状态」使用。
-- foreshadow：这一章新埋下或推进了的伏笔。
-
-# 铁律
-1. 只写**正文里能证实**的内容。正文没写的、靠推测补的一律不要。
-2. ref 必须从给定的「可关联对象」里原样选一个；不要自造人名。
-3. 一条只说一件事。不要合并两个事实，也不要写成剧情梗概。
-4. 每条 text 控制在 6–80 字；写具体状态，不写「气氛紧张」这种空话。
-5. 不要输出对本章的点评、建议、总结，只要 JSON。
-6. 最多 8 条，宁少勿凑。
-
-# 输出格式
-{"items":[{"type":"fact|state|foreshadow","ref":"关联对象","text":"要点","evidence":"正文里逐字出现的短句（可选）","confidence":0.0-1.0}]}
-"""
+    return render("notes.extract.system", work_dir=work_dir)["text"]
 
 
 def build_extract_messages(
     *, prose: str, brief: dict[str, Any], setting: dict[str, Any],
     refs: list[dict[str, str]],
+    work_dir: str | Path | None = None,
 ) -> list[dict[str, str]]:
     ref_lines = []
     for row in refs:
@@ -396,7 +382,7 @@ def build_extract_messages(
         + "【正文】\n" + (prose or "")
     )
     return [
-        {"role": "system", "content": EXTRACT_SYSTEM},
+        {"role": "system", "content": extract_system_text(work_dir)},
         {"role": "user", "content": user},
     ]
 
@@ -423,6 +409,7 @@ def run_extract(
     chapter_no: int,
     prior_notes: list[dict[str, Any]] | None = None,
     max_tokens: int = 3000,
+    work_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """调一次要点抽取。JSON 坏掉重试一次；两次都不行就明确报错。"""
     import time
@@ -430,7 +417,9 @@ def run_extract(
     from .errors import ErrorKind
     from .llm import build_thinking_extra
 
-    messages = build_extract_messages(prose=prose, brief=brief, setting=setting, refs=refs)
+    messages = build_extract_messages(
+        prose=prose, brief=brief, setting=setting, refs=refs, work_dir=work_dir
+    )
     attempts: list[dict[str, Any]] = []
     last_error: Exception | None = None
     for attempt in range(2):

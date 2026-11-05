@@ -1,0 +1,39 @@
+{
+  "kind": "notes",
+  "note": "要点契约：type/ref/text/evidence 都要对得上；ref 必须是本章或设定集里存在的人/势力/术语/伏笔。",
+  "prose": "林舟把刀插回鞘里，铜扣咔哒一声扣上了。\n窗外雨声更密，他说今夜不出门。",
+  "refs": [
+    {"ref": "林舟", "kind": "character", "note": "主角"},
+    {"ref": "铜扣", "kind": "term", "note": "术语"},
+    {"ref": "F-001", "kind": "foreshadow", "note": "已登记的伏笔编号"}
+  ],
+  "valid": {
+    "items": [
+      {
+        "type": "fact",
+        "ref": "林舟",
+        "text": "林舟决定今夜留在客栈，不出门。",
+        "evidence": "窗外雨声更密，他说今夜不出门。",
+        "confidence": 0.8
+      },
+      {
+        "type": "state",
+        "ref": "铜扣",
+        "text": "刀鞘铜扣已被扣回并暂时固定。",
+        "evidence": "铜扣咔哒一声扣上了",
+        "confidence": 0.7
+      }
+    ]
+  },
+  "invalid": {
+    "why": "ref 指向不存在的人，抽取结果无法挂到任何角色上；证据也不在正文里。",
+    "items": [
+      {
+        "type": "state",
+        "ref": "张三",
+        "text": "张三已经离开客栈。",
+        "evidence": "张三推门走进雨里。"
+      }
+    ]
+  }
+}

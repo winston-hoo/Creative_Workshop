@@ -51,7 +51,24 @@ import shutil  # noqa: E402
 import tempfile  # noqa: E402
 
 import uvicorn  # noqa: E402
-from playwright.sync_api import sync_playwright  # noqa: E402
+
+# 环境依赖：这个测试必须真的驱动 Chromium。没有 playwright 时**显式跳过**，
+# 而不是让整个 `pytest -q` 在收集阶段就中断——后者会把其他 200 多个测试一起拖黑。
+# 复现条件：pip install playwright && playwright install chromium
+try:
+    from playwright.sync_api import sync_playwright  # noqa: E402
+except ImportError as _exc:  # pragma: no cover - 取决于本机环境
+    try:
+        import pytest
+    except ImportError:
+        raise SystemExit(
+            "缺少 playwright，界面冒烟测试无法运行：\n"
+            "  pip install playwright && playwright install chromium"
+        ) from _exc
+    pytest.skip(
+        "环境依赖：未安装 playwright（pip install playwright && playwright install chromium）",
+        allow_module_level=True,
+    )
 
 from server import main as server_main  # noqa: E402
 from server import services  # noqa: E402

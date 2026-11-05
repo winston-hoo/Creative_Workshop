@@ -12,6 +12,9 @@
   GET    /api/works/{name}/anomalies     异常与复核队列
   POST   /api/works/{name}/archive       移出书架（移动，不是删除）
   GET    /api/settings                   服务商与密钥设置（密钥只回掩码）
+  PUT    /api/settings/binding           默认模型（没单配的任务回退到它）
+  PUT    /api/settings/stages            阶段模型（plan/draft/review/extract）
+  GET    /api/settings/prompts           提示词目录与三级来源
   PUT    /api/settings/providers/{id}/key    保存密钥
   DELETE /api/settings/providers/{id}/key    清除密钥
   POST   /api/settings/providers/{id}/test   测试连接（只发合成测试句）
@@ -47,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -414,6 +417,30 @@ def api_save_binding(req: BindingRequest) -> dict:
         return services.save_default_binding(PATHS, provider=req.provider, model=req.model)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+class StageBindingRequest(BaseModel):
+    stage: str = Field(..., description="plan | draft | review | extract")
+    provider: str = Field("", description="服务商 id；清空覆盖时可为空")
+    model: str = Field("", description="模型 id")
+    clear: bool = Field(False, description="恢复默认任务绑定，移除这一阶段的覆盖")
+
+
+@app.put("/api/settings/stages")
+def api_save_stage(req: StageBindingRequest) -> dict:
+    """E2/U6：保存某一阶段的模型，并回读校验是否真的生效。"""
+    try:
+        return services.save_stage_binding(
+            PATHS, stage=req.stage, provider=req.provider, model=req.model, clear=req.clear
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/settings/prompts")
+def api_prompts(work: str | None = Query(None, description="作品名；传了就带上该作品的项目级覆盖")) -> dict:
+    """E1：提示词目录与来源（内置 / 全局 / 项目）。"""
+    return services.prompts_catalog(PATHS, work=safe_name(work) if work else None)
 
 
 @app.put("/api/settings/providers/{provider_id}/key")
@@ -1455,11 +1482,25 @@ def api_discard(token: str) -> dict:
 
 
 @app.get("/")
-def index() -> FileResponse:
+def index() -> HTMLResponse:
+    """首页。资源版本号按文件 mtime 自动填，不靠人手改 `?v=`。
+
+    以前是「改完 JS 记得把 v 加一」，忘一次就得到「改了代码界面没变」，
+    还会怀疑是代码没生效。现在每次请求都读一次 mtime，改完刷新就对了。
+    """
     target = STATIC_DIR / "index.html"
     if not target.exists():
         raise HTTPException(500, "界面文件缺失")
-    return FileResponse(target)
+    html = target.read_text(encoding="utf-8")
+    for placeholder, name in (
+        ("__V_STYLE__", "style.css"),
+        ("__V_CREATION__", "creation.css"),
+        ("__V_APP__", "app.js"),
+    ):
+        asset = STATIC_DIR / name
+        version = str(asset.stat().st_mtime_ns) if asset.exists() else "0"
+        html = html.replace(placeholder, version)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

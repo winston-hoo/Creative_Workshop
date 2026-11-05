@@ -736,6 +736,52 @@ def _resolve_provider_and_model(cfg, requested_provider: str | None, requested_m
     return provider, pick_model_id(cfg, provider, requested_model)
 
 
+def _resolve_stage(cfg, stage: str, requested_provider: str | None = None,
+                   requested_model: str | None = None):
+    """按阶段解析模型（E2）。返回 (provider, model, 解析说明)。
+
+    说明里带 `source`/`source_label`，界面据此解释「这个模型是阶段配的，还是沿用默认绑定」。
+    """
+    from workshop.routing import resolve
+
+    effective = resolve(
+        cfg, stage, requested_provider=requested_provider, requested_model=requested_model
+    )
+    return effective["provider"], effective["model"], {
+        "stage": effective["stage"],
+        "source": effective["source"],
+        "source_label": effective["source_label"],
+    }
+
+
+def _stage_summary(meta: dict[str, Any], provider, model: str) -> dict[str, Any]:
+    """给计划/任务用的阶段说明：前端要把「本阶段实际模型」显示出来。"""
+    return {
+        "stage": meta.get("stage"),
+        "source": meta.get("source"),
+        "source_label": meta.get("source_label"),
+        "provider": provider.id,
+        "provider_name": provider.name,
+        "model": model,
+    }
+
+
+def _build_client(cfg, provider, store, *, timeout_sec: float = 300):
+    """按服务商建 OpenAI 兼容客户端。正文与细纲可能用不同服务商，所以要能分别建。"""
+    from workshop.llm import OpenAICompatProvider
+
+    return OpenAICompatProvider(
+        base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
+        timeout_sec=timeout_sec, auth_scheme=provider.auth_scheme,
+        secrets=store.known_values, rate_limit=provider.rate_limit,
+    )
+
+
+def _require_key(cfg, provider, stage_label: str) -> None:
+    if provider.api_key_ref and not _read_api_key(cfg, provider):
+        raise ValueError(f"「{stage_label}」用的服务商「{provider.name}」还没有配置密钥。")
+
+
 def annotation_plan(
     paths: Paths,
     name: str,
@@ -1126,9 +1172,21 @@ def settings_overview(paths: Paths) -> dict[str, Any]:
         )
 
     binding = (cfg.task_bindings or {}).get("chapter_annotation") or {}
+    from workshop import routing
+
+    # U6：每个阶段实际用哪个模型、来源、能不能用、有什么风险。
+    # 密钥状态从同一个 SecretStore 判断，界面看到的和调用时读到的是同一份。
+    stage_rows = routing.matrix(
+        cfg,
+        key_configured=lambda ref: True if not ref else bool(store.get(ref)),
+    )
+    from workshop.prompt_registry import catalog as prompt_catalog
+
     return {
         "providers": items,
         "binding": {"provider": binding.get("provider"), "model": binding.get("model")},
+        "stages": stage_rows,
+        "prompts": prompt_catalog(),
         "gate_mode": cfg.settings.get("budget_gate_mode") or "token",
         "budget": cfg.settings.get("budget") or {},
         "env_file": str(store.env_file) if store.env_file else str(paths.root / "config" / ".env"),
@@ -1139,6 +1197,85 @@ def settings_overview(paths: Paths) -> dict[str, Any]:
             "限速按服务商配置的「每分钟请求数 / token 数」在客户端排队放行；上游仍返回 429 时会明确报错并提示等待时间。",
         ],
     }
+
+
+def prompts_catalog(paths: Paths, *, work: str | None = None) -> dict[str, Any]:
+    """E1：提示词目录。带来源（内置/全局/项目）与占位符，设置页据此显示是否被覆盖。"""
+    from workshop.prompt_registry import catalog
+
+    work_dir = paths.work_dir(work) if work else None
+    rows = catalog(work_dir=work_dir)
+    return {
+        "work": work or None,
+        "prompts": rows,
+        "levels": ["项目（作品/prompts）", "全局（数据根/prompts）", "内置（随程序发布）"],
+    }
+
+
+def save_stage_binding(
+    paths: Paths, *, stage: str, provider: str = "", model: str = "", clear: bool = False,
+) -> dict[str, Any]:
+    """E2/U6：给某一阶段绑定模型。保存前严格校验，保存后重新解析一遍作为「生效确认」。
+
+    清空（clear=True）不是删除整个 stages 段，而是移除这一阶段的覆盖，
+    让它回落到默认任务绑定——界面上的「恢复默认」走这条。
+    """
+    from workshop import routing
+    from workshop.config import load_config, save_custom_config
+
+    cfg = load_config(paths.root / "providers.yaml")
+    if stage not in routing.STAGE_IDS:
+        raise ValueError(f"未知阶段「{stage}」，可选：{', '.join(routing.STAGE_IDS)}")
+
+    custom = _load_custom(paths)
+    bindings = dict(custom.get("task_bindings") or {})
+    stages = dict(bindings.get("stages") or {})
+
+    if clear:
+        stages.pop(stage, None)
+    else:
+        routing.validate(cfg, stage, provider, model)
+        stages[stage] = {"provider": provider, "model": model}
+
+    if stages:
+        bindings["stages"] = stages
+    else:
+        bindings.pop("stages", None)
+    if bindings:
+        custom["task_bindings"] = bindings
+    else:
+        custom.pop("task_bindings", None)
+    save_custom_config(paths.root / "providers.yaml", custom)
+
+    # 生效确认：从磁盘重新加载，重新解析这一阶段。写进去了但解析不到，是静默失效。
+    fresh = load_config(paths.root / "providers.yaml")
+    store = _secret_store(paths)
+    rows = routing.matrix(fresh, key_configured=lambda ref: True if not ref else bool(store.get(ref)))
+    row = next((r for r in rows if r["stage"] == stage), None)
+    if row is None:
+        raise ValueError(f"保存后读不到阶段「{stage}」，配置可能被写坏了。")
+    if not clear and not row.get("provider"):
+        raise ValueError(
+            f"保存后这一阶段仍然没有可用服务商：{row.get('unavailable_reason') or '未知原因'}"
+        )
+    return {
+        "ok": True,
+        "stage": stage,
+        "cleared": clear,
+        "effective": row,
+        "stages": rows,
+        "binding": {
+            "provider": (fresh.task_bindings or {}).get("chapter_annotation", {}).get("provider"),
+            "model": (fresh.task_bindings or {}).get("chapter_annotation", {}).get("model"),
+        },
+        "hint": (
+            "已恢复默认任务绑定，这一阶段不再单独指定模型。"
+            if clear
+            else f"已生效：{row.get('provider_name')} / {row.get('model')}"
+            + ("" if row.get("available") else f"（当前不可用：{row.get('unavailable_reason')}）")
+        ),
+    }
+
 
 
 def create_provider(paths: Paths, *, name: str, base_url: str, models: list[str],
@@ -3548,7 +3685,7 @@ def draft_plan(
 
     ctx = _draft_inputs(paths, name, chapter_id)
     cfg = load_config(paths.root / "providers.yaml")
-    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
+    provider, model, stage_meta = _resolve_stage(cfg, "draft", provider_id, model_id)
     block, missing = _setting_refs_block(paths, refs or [], level)
     model_cfg = provider.model(model) or {}
     bucket = price_bucket(provider)
@@ -3598,6 +3735,44 @@ def draft_plan(
         "beats": (saved_beats or {}).get("beats") or [],
     }
     plan["max_continue_rounds"] = int(MAX_CONTINUE_ROUNDS)
+
+    # C6：技法按阶段分发，并把「给了哪几篇、占多少字」写进计划——
+    # 正文的注入量已经算进估算 token（draft.build_draft_plan 里同一份 craft_block），
+    # 细纲是另一次调用，单独列出字数，避免把两次调用的预算混成一个数。
+    from workshop import craft as craft_mod
+
+    cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
+    first_vol = bool((ctx["brief"] or {}).get("first_of_volume"))
+    craft_rows = {}
+    for stage in ("brief", "draft"):
+        meta = craft_mod.plan_block(
+            stage=stage, chapter_no=cno, is_first_of_volume=first_vol, brief=ctx["brief"]
+        )
+        craft_rows[stage] = {k: v for k, v in meta.items() if k != "text"}
+    plan["craft"] = craft_rows
+    plan["stage"] = {
+        "stage": "draft",
+        **stage_meta,
+        "provider": provider.id,
+        "provider_name": provider.name,
+        "model": model,
+    }
+    # 细纲（节拍）是另一阶段：可能换了更便宜的模型。计划里要能提前看见，
+    # 否则作者只会看到「正文用 A」，点下去实际先用 B 生成细纲。
+    try:
+        plan_provider, plan_model, plan_stage_meta = _resolve_stage(cfg, "plan")
+        plan["beats_stage"] = {
+            "stage": "plan",
+            **plan_stage_meta,
+            "provider": plan_provider.id,
+            "provider_name": plan_provider.name,
+            "model": plan_model,
+            "available": True,
+        }
+    except ValueError as exc:
+        plan["beats_stage"] = {
+            "stage": "plan", "available": False, "reason": str(exc),
+        }
     plan["last_run"] = _last_run_summary(ctx["work_dir"], chapter_id)
     return plan
 
@@ -3669,19 +3844,33 @@ def run_draft(
         raise ValueError(f"设定集有 {len(ctx['setting_errors'])} 项阻断没解决：{ctx['setting_errors'][0]}")
 
     cfg = load_config(paths.root / "providers.yaml")
-    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
-    if provider.api_key_ref and not _read_api_key(cfg, provider):
-        raise ValueError(_no_key_msg(provider))
+    # E2：正文与细纲是两个阶段，可以各自配模型；它们的服务商也可能不同。
+    provider, model, draft_stage = _resolve_stage(cfg, "draft", provider_id, model_id)
+    _require_key(cfg, provider, "正文生成")
+    plan_provider, plan_model, plan_stage = _resolve_stage(cfg, "plan")
+    _require_key(cfg, plan_provider, "写前细纲")
 
     store = SecretStore(paths.root / "config")
     setup_logging(store.known_values)
-    client = OpenAICompatProvider(
-        base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
-        timeout_sec=300, auth_scheme=provider.auth_scheme,
-        secrets=store.known_values, rate_limit=provider.rate_limit,
+    client = _build_client(cfg, provider, store)
+    plan_client = client if plan_provider.id == provider.id else _build_client(
+        paths, cfg, plan_provider, store
     )
     block, _missing = _setting_refs_block(paths, refs or [], level)
     _ctx, _report = _draft_context_bundle(ctx, budget_chars=budget_chars)
+
+    # C6：细纲只吃结构技法，正文吃行文技法；两份选择都写进 manifest，
+    # 调用账里能解释「这次到底注入了哪几篇、多少字」。
+    from workshop import craft as craft_mod
+
+    cno = int((ctx["brief"] or {}).get("chapter_no") or 0)
+    first_vol = bool((ctx["brief"] or {}).get("first_of_volume"))
+    craft_brief = craft_mod.plan_block(
+        stage="brief", chapter_no=cno, is_first_of_volume=first_vol, brief=ctx["brief"]
+    )
+    craft_draft = craft_mod.plan_block(
+        stage="draft", chapter_no=cno, is_first_of_volume=first_vol, brief=ctx["brief"]
+    )
 
     calls: list[dict[str, Any]] = []
     beats_meta: dict[str, Any] = {
@@ -3695,6 +3884,12 @@ def run_draft(
         "work": name,
         "provider": provider.id,
         "model": model,
+        "stage": _stage_summary(draft_stage, provider, model),
+        "beats_stage": _stage_summary(plan_stage, plan_provider, plan_model),
+        "craft": {
+            "brief": {k: v for k, v in craft_brief.items() if k != "text"},
+            "draft": {k: v for k, v in craft_draft.items() if k != "text"},
+        },
         "budget_chars": _report.get("budget_chars"),
         "refs_level": level,
         "refs": refs or [],
@@ -3827,9 +4022,10 @@ def run_draft(
             except (ValueError, OSError):
                 prev_tail = ""
             beats_result = beats_mod.generate_beats(
-                client=client, model_id=model, setting=ctx["setting"],
+                client=plan_client, model_id=plan_model, setting=ctx["setting"],
                 volume=ctx["volume"], brief=ctx["brief"],
                 word_range=None, prev_tail=prev_tail,
+                craft_block=craft_brief["text"], work_dir=ctx["work_dir"],
                 cancel_event=task.cancel_event if task is not None else None,
                 cancel_check=(lambda: bool(task.cancel_event.is_set())) if task is not None else None,
             )
@@ -3840,7 +4036,7 @@ def run_draft(
                 beats_list = beats_result["beats"]
                 saved_meta = beats_mod.save_beats(
                     ctx["work_dir"], chapter_id, beats=beats_list, brief=ctx["brief"],
-                    model=model, source="model", usage=beats_result.get("usage") or {},
+                    model=plan_model, source="model", usage=beats_result.get("usage") or {},
                 )
                 beats_meta = {
                     "source": "model", "count": len(beats_list),
@@ -3873,6 +4069,7 @@ def run_draft(
             setting=ctx["setting"], volume=ctx["volume"], brief=ctx["brief"],
             refs_block=block, title=ctx["title"], context_block=_ctx,
             beats=beats_mod.render_beats_for_prompt(beats_list) if beats_list else "",
+            craft=craft_draft["text"], work_dir=ctx["work_dir"],
         )
         result = generate_draft(
             client=client, model_id=model, messages=messages,
@@ -4151,17 +4348,13 @@ def review_draft(
         raise ValueError("这一章已定稿。要再审，先点「重新打开」。")
 
     cfg = load_config(paths.root / "providers.yaml")
-    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
-    if provider.api_key_ref and not _read_api_key(cfg, provider):
-        raise ValueError(_no_key_msg(provider))
+    # E2：审稿是独立阶段，不吃正文那次的模型；没配就落回默认。
+    provider, model, review_stage = _resolve_stage(cfg, "review", provider_id, model_id)
+    _require_key(cfg, provider, "正文审稿")
 
     store = SecretStore(paths.root / "config")
     setup_logging(store.known_values)
-    client = OpenAICompatProvider(
-        base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
-        timeout_sec=180, auth_scheme=provider.auth_scheme,
-        secrets=store.known_values, rate_limit=provider.rate_limit,
-    )
+    client = _build_client(cfg, provider, store, timeout_sec=180)
 
     chapter_no = int((ctx["brief"] or {}).get("chapter_no") or 0)
     vol_start = int(((ctx["volume"] or {}).get("vol") or {}).get("start_chapter") or 0)
@@ -4174,7 +4367,7 @@ def review_draft(
     result = review_mod.run_review(
         client=client, model_id=model, prose=prose,
         brief=ctx["brief"], setting=ctx["setting"], craft_block=block,
-        max_tokens=max_tokens,
+        max_tokens=max_tokens, work_dir=ctx["work_dir"],
         existing_items=review_mod.all_items(payload),
     )
 
@@ -4477,7 +4670,6 @@ def extract_notes(
     from workshop import notes as notes_mod
     from workshop.config import load_config
     from workshop.draft import load_draft
-    from workshop.llm import OpenAICompatProvider
     from workshop.secrets import SecretStore, setup_logging
 
     ctx = _draft_inputs(paths, name, chapter_id)
@@ -4487,17 +4679,13 @@ def extract_notes(
         raise ValueError(f"{chapter_id} 还没有正文，抽不出要点。先写这一章。")
 
     cfg = load_config(paths.root / "providers.yaml")
-    provider, model = _resolve_provider_and_model(cfg, provider_id, model_id)
-    if provider.api_key_ref and not _read_api_key(cfg, provider):
-        raise ValueError(_no_key_msg(provider))
+    # E2：要点抽取是独立阶段，通常配便宜的小模型。
+    provider, model, extract_stage = _resolve_stage(cfg, "extract", provider_id, model_id)
+    _require_key(cfg, provider, "章节要点抽取")
 
     store = SecretStore(paths.root / "config")
     setup_logging(store.known_values)
-    client = OpenAICompatProvider(
-        base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
-        timeout_sec=180, auth_scheme=provider.auth_scheme,
-        secrets=store.known_values, rate_limit=provider.rate_limit,
-    )
+    client = _build_client(cfg, provider, store, timeout_sec=180)
 
     prior: list[dict[str, Any]] = []
     from pathlib import Path as _Path
@@ -4514,7 +4702,7 @@ def extract_notes(
         client=client, model_id=model, provider_id=provider.id, prose=prose,
         brief=ctx["brief"], setting=ctx["setting"], refs=_note_refs(ctx),
         chapter_id=chapter_id, vol=vol_no, chapter_no=chapter_no,
-        prior_notes=prior, max_tokens=max_tokens,
+        prior_notes=prior, max_tokens=max_tokens, work_dir=ctx["work_dir"],
     )
     payload = notes_mod.save_extraction(
         ctx["work_dir"], chapter_id, items=result["items"],
@@ -4596,7 +4784,6 @@ def run_finalize(
     from workshop import draft_store, finalize as finalize_mod, notes as notes_mod
     from workshop.config import load_config
     from workshop.draft import count_chars, load_draft
-    from workshop.llm import OpenAICompatProvider
     from workshop.secrets import SecretStore, setup_logging
 
     ctx = _draft_inputs(paths, name, chapter_id)
@@ -4615,18 +4802,14 @@ def run_finalize(
             finalize_mod.sha256(prose)
         if not (existing.get("notes") and same and not force):
             cfg = load_config(paths.root / "providers.yaml")
-            provider, model = _resolve_provider_and_model(cfg, None, None)
-            if provider.api_key_ref and not _read_api_key(cfg, provider):
-                raise ValueError(_no_key_msg(provider))
+            # E2：定稿后的要点抽取走 extract 阶段，与「手动抽要点」用同一套配置。
+            provider, model, _extract_stage = _resolve_stage(cfg, "extract")
+            _require_key(cfg, provider, "章节要点抽取")
 
             def _extract() -> dict[str, Any]:
                 store = SecretStore(paths.root / "config")
                 setup_logging(store.known_values)
-                client = OpenAICompatProvider(
-                    base_url=provider.base_url, api_key=_read_api_key(cfg, provider),
-                    timeout_sec=180, auth_scheme=provider.auth_scheme,
-                    secrets=store.known_values, rate_limit=provider.rate_limit,
-                )
+                client = _build_client(cfg, provider, store, timeout_sec=180)
                 prior: list[dict[str, Any]] = []
                 for path in sorted((ctx["work_dir"] / "90-draft").glob("*.notes.json")):
                     other = path.name[: -len(".notes.json")]
@@ -4636,7 +4819,7 @@ def run_finalize(
                     brief=ctx["brief"], setting=ctx["setting"], refs=_note_refs(ctx),
                     chapter_id=chapter_id, vol=int(ctx["vol_no"] or 0),
                     chapter_no=int((ctx["brief"] or {}).get("chapter_no") or 0),
-                    prior_notes=prior, max_tokens=3000,
+                    prior_notes=prior, max_tokens=3000, work_dir=ctx["work_dir"],
                 )
                 notes_mod.save_extraction(
                     ctx["work_dir"], chapter_id, items=result["items"],

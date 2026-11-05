@@ -157,6 +157,8 @@ def build_beat_messages(
     brief: dict[str, Any],
     word_range: list[int] | None = None,
     prev_tail: str = "",
+    craft_block: str = "",
+    work_dir: str | Path | None = None,
 ) -> list[dict[str, str]]:
     """细纲调用的消息。刻意比正文短很多——这次调用是「策划」，不是「写作」。"""
     setting = setting or {}
@@ -201,20 +203,19 @@ def build_beat_messages(
                         f"基调 {style.get('tone')}" if style.get("tone") else "") if x))
     if prev_tail:
         parts.append("【上一章末尾（只为接得上，不是本章内容）】\n…" + prev_tail[-500:])
+    # C6：细纲阶段只喂结构技法（情节结构/情绪曲线/钩子/开篇），不喂行文技法。
+    # 放到目标字数之前，模型先看到「按什么结构拆」，再看到「拆几拍」。
+    if craft_block:
+        parts.append("【技法参考·只影响结构，不要写进节拍内容】\n" + craft_block)
     parts.append(f"【目标字数】{rng[0]}–{rng[1]} 字。节拍数量按这个篇幅定，5–8 个。")
 
-    system = (
-        "你是网文写手的写前策划。你只做一件事：把作者给的本章任务拆成连续节拍。\n"
-        "硬约束：\n"
-        "- 只输出 JSON，不要解释、不要代码围栏\n"
-        "- 严格输出 {\"beats\": [...]} 结构\n"
-        f"- beats 里放 {BEATS_MIN}–{BEATS_MAX} 个对象，顺序就是正文顺序\n"
-        "- 每个对象字段：no（从 1 递增）、title（不超过 8 字的短标签）、"
-        "goal（这个节拍要发生什么，不超过 40 字）、must（可选，必须点到的人/物/信息数组）\n"
-        "- 必须覆盖【核心情节】里的每一项，不许漏，不许改顺序\n"
-        "- 不要写台词，不要展开描写，不要替正文起草\n"
-        "- 不要新增设定集里没有的人物、势力、物品"
-    )
+    from .prompt_registry import render
+
+    system = render(
+        "beats.system",
+        variables={"beats_min": BEATS_MIN, "beats_max": BEATS_MAX},
+        work_dir=work_dir,
+    )["text"].strip()
     user = "\n".join(parts) + "\n\n现在输出这一章的节拍 JSON。"
     return [
         {"role": "system", "content": system},
@@ -314,6 +315,8 @@ def generate_beats(
     max_tokens: int = BEATS_MAX_TOKENS,
     cancel_check=None,
     cancel_event=None,
+    craft_block: str = "",
+    work_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """调用一次模型产出细纲。**不抛业务错误**：失败就返回 ok=False，由调用方回退。
 
@@ -322,7 +325,8 @@ def generate_beats(
     if cancel_check and cancel_check():
         raise GenerationCancelled("已取消")
     messages = build_beat_messages(
-        setting=setting, volume=volume, brief=brief, word_range=word_range, prev_tail=prev_tail
+        setting=setting, volume=volume, brief=brief, word_range=word_range,
+        prev_tail=prev_tail, craft_block=craft_block, work_dir=work_dir,
     )
     extra = build_thinking_extra("disabled", None)
     try:

@@ -190,21 +190,11 @@ def build_draft_plan(
 
 # ── 提示词 ──────────────────────────────────────────────────
 
-DRAFT_SYSTEM = """你是长篇网络小说的写手。作者给你三层真源，你照着写**这一章**的正文。
+def draft_system_text(work_dir: str | Path | None = None) -> str:
+    """正文系统提示。文本在 `prompts/draft.system.md`，支持项目级覆盖（E1）。"""
+    from .prompt_registry import render
 
-# 硬约束
-- **只输出正文**。不要标题、不要「第 X 章」、不要任何解释、不要总结、不要 markdown 标记。
-- 严格遵守本章指令：核心情节按它给的顺序走，一句话概要就是这一章必须发生的事。
-- 遵守设定集里的文风与禁忌。禁忌是硬红线，不是建议。
-- 本章指令里「禁止出现」的东西一个都不要写。
-- 指令里列了「需承接」的内容，要自然带出来，不要写成前情提要。
-- 章末留钩子。不要把事情收干净——网文的读者是靠这一口气往下翻的。
-- 字数落在作者给的区间里。宁可写到区间上限，也不要写不到下限。
-
-# 不许做的事
-- 不要替作者新增大段设定。缺什么就含糊带过，别自己发明一套力量体系。
-- 不要写「本卷将如何如何」这种作者视角的话。你只是在写这一章。
-"""
+    return render("draft.system", work_dir=work_dir)["text"]
 
 
 def build_draft_messages(
@@ -218,6 +208,7 @@ def build_draft_messages(
     craft: str | None = None,
     context_block: str = "",
     beats: str = "",
+    work_dir: str | Path | None = None,
 ) -> list[dict[str, str]]:
     from .setting_assist import REFS_USAGE_HINT, render_document
 
@@ -260,7 +251,7 @@ def build_draft_messages(
     parts += ["【字数】", f"落在 {rng[0]}–{rng[1]} 字之间。", "",
               "现在只输出这一章的正文。"]
     return [
-        {"role": "system", "content": DRAFT_SYSTEM},
+        {"role": "system", "content": draft_system_text(work_dir)},
         {"role": "user", "content": "\n".join(parts)},
     ]
 

@@ -121,9 +121,37 @@ def test_pick_and_render() -> None:
         check(all(craft.read(n).strip() in full for n in longest), "最长一次选择一篇都没少")
 
 
+def test_stage_injection() -> None:
+    """C6：细纲 / 正文 / 审稿各自只拿自己那几类技法，不互相串。"""
+    print("按阶段注入")
+    with builtin_only():
+        brief_names, _ = craft.pick(chapter_no=1, stage="brief")
+        check(set(brief_names) == {"golden-opening", "emotion-curve", "plot-structures"},
+              f"细纲只拿结构技法（实际 {brief_names}）")
+        check("chapter-guide" not in brief_names, "细纲不拿行文技法")
+
+        draft_names, _ = craft.pick(chapter_no=1, stage="draft")
+        check("chapter-guide" in draft_names, "正文拿行文技法")
+        check("quality-checklist" not in draft_names, "正文不拿审查清单")
+
+        review_names, _ = craft.pick(chapter_no=1, stage="review")
+        check(set(review_names) == {"quality-checklist", "review-dimensions"},
+              f"审稿只拿审查技法（实际 {review_names}）")
+        check(set(review_names).isdisjoint(draft_names), "审稿与正文的技法集合不重叠")
+
+        # prompt-guide 是给设置页看的说明，不属于任何阶段：防止它被顺手塞进提示词。
+        check("prompt-guide" not in draft_names, "prompt-guide 不进入任何阶段")
+
+        meta = craft.plan_block(stage="draft", chapter_no=1, brief={})
+        check(meta["stage"] == "draft" and meta["stage_label"], "计划块带阶段标识")
+        check(meta["chars"] > 0 and meta["budget"] == craft.STAGE_BUDGETS["draft"],
+              "计划块给出字数与预算")
+
+
 def main() -> int:
     print("=" * 58)
-    for fn in (test_builtin_complete, test_external_overrides_builtin, test_pick_and_render):
+    for fn in (test_builtin_complete, test_external_overrides_builtin,
+               test_pick_and_render, test_stage_injection):
         fn()
         print()
 

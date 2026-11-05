@@ -1,0 +1,29 @@
+{
+  "kind": "review",
+  "note": "审稿契约：evidence 必须逐字来自正文；定位不到、或缺少改写建议的条目一律进 invalid。",
+  "prose": "雨从傍晚就开始下，到子时仍没停。林舟站在客栈檐下，看着街面泛起的白雾。\n他把怀里的刀鞘又摸了一遍，鞘口的铜扣已经松了，随时会掉。",
+  "valid": {
+    "summary": "开头气氛到位，但中段动作缺少紧张感。",
+    "items": [
+      {
+        "type": "language",
+        "severity": "major",
+        "evidence": "他把怀里的刀鞘又摸了一遍",
+        "problem": "动作描写平，没带出他此刻的警惕。",
+        "suggestion": "改成「他攥紧刀鞘，铜扣硌得掌心发疼」，让触感带出紧张。"
+      }
+    ]
+  },
+  "invalid": {
+    "why": "evidence 是模型改写过的句子，正文里逐字找不到，不能给作者一条点不过去的意见。",
+    "summary": "……",
+    "items": [
+      {
+        "type": "language",
+        "severity": "major",
+        "evidence": "林舟在雨里大笑三声",
+        "suggestion": "改成他沉默地把刀放回鞘里。"
+      }
+    ]
+  }
+}

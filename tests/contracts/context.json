@@ -1,0 +1,19 @@
+{
+  "kind": "context",
+  "note": "上下文预算契约：必需块必须完整注入；预算装不下必需块时要明确报错，不能靠裁剪假装成功。",
+  "valid": {
+    "budget_chars": 600,
+    "blocks": [
+      {"id": "anchor", "label": "本章锚点", "kind": "required", "text": "这一章必须发生在雨夜客栈，林舟不能离开。", "source": "brief"},
+      {"id": "recap", "label": "前情回顾", "kind": "optional", "text": "上一章林舟在巷战里丢了半枚铜扣，右肩有伤。他回到客栈后一直没睡。", "source": "summary"},
+      {"id": "notes", "label": "已确认要点", "kind": "optional", "text": "• 铜扣已松动。\n• 林舟不信任客栈掌柜。", "source": "notes"}
+    ]
+  },
+  "invalid": {
+    "why": "必需块本身就超出总预算：只给 20 字，却要求完整注入 30 多字的锚点，必须报 ContextBudgetError。",
+    "budget_chars": 20,
+    "blocks": [
+      {"id": "anchor", "label": "本章锚点", "kind": "required", "text": "这一章必须发生在雨夜客栈，林舟不能离开，且必须在子时前做出选择。", "source": "brief"}
+    ]
+  }
+}

@@ -234,6 +234,29 @@ label.check span small { display: block; color: var(--text-3); font-size: 12px; 
 .chip.ok { background: var(--ok-bg); color: var(--ok); }
 .chip.warn { background: var(--warn-bg); color: var(--warn); }
 .chip.bad { background: var(--danger-bg); color: var(--danger); }
+
+/* 设置页·阶段模型矩阵。窄屏时不并排：每行的下拉与按钮各自换行，
+   375px 下也不能把整页顶出横向滚动。 */
+.stage-row { border-top: 1px solid var(--border); padding: 12px 0; }
+.stage-row:first-child { border-top: 0; padding-top: 4px; }
+.stage-line { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.stage-line > * { min-width: 0; }
+.stage-row select {
+  max-width: 100%;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+}
+.stage-row .stage-line .row { max-width: 100%; }
+@media (max-width: 560px) {
+  .stage-line { align-items: stretch; }
+  .stage-line .row { width: 100%; }
+  .stage-row select { flex: 1 1 140px; }
+}
 .chip.info { background: var(--accent-bg); color: var(--accent); }
 
 /* ── 统计卡 ──────────────────────────────────────────── */
