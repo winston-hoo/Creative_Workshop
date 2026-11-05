@@ -884,7 +884,13 @@ def as_text_list(value: Any) -> list[str]:
     return [part.strip() for part in raw.split("、") if part.strip()]
 
 
-def character_presence(work_dir: str | Path, *, brief_only: bool = False) -> dict[str, Any]:
+def character_presence(
+    work_dir: str | Path,
+    *,
+    brief_only: bool = False,
+    briefs: dict[str, dict[str, Any]] | None = None,
+    volumes: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """谁在第几章出场、谁已经连着好几章没露面了。纯脚本，零成本。
 
     `brief_only=True` 只数逐章指令里的出场（真被写出来的），
@@ -900,8 +906,8 @@ def character_presence(work_dir: str | Path, *, brief_only: bool = False) -> dic
     from .volume import load_all_volumes
 
     wd = Path(work_dir)
-    briefs, _broken = load_all_briefs(wd / "80-brief")
-    volumes, _bv = load_all_volumes(wd / "70-volume")
+    briefs = briefs if briefs is not None else load_all_briefs(wd / "80-brief")[0]
+    volumes = volumes if volumes is not None else load_all_volumes(wd / "70-volume")[0]
 
     # 章号 → 出场人物
     by_chapter: dict[int, set[str]] = {}
@@ -950,7 +956,13 @@ def character_presence(work_dir: str | Path, *, brief_only: bool = False) -> dic
     }
 
 
-def consistency_report(work_dir: str | Path) -> list[str]:
+def consistency_report(
+    work_dir: str | Path,
+    *,
+    setting: dict[str, Any] | None = None,
+    volumes: dict[int, dict[str, Any]] | None = None,
+    briefs: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
     """卷表里点过名、但设定集里没有的人与势力。纯脚本，零成本。
 
     这是回填时踩过的那类问题：卷表写着某个名字，设定集里却没有
@@ -961,7 +973,7 @@ def consistency_report(work_dir: str | Path) -> list[str]:
     from .volume import load_all_volumes
 
     wd = Path(work_dir)
-    setting = load_work_setting(wd)
+    setting = setting if setting is not None else load_work_setting(wd)
     known_chars = {str(c.get("name") or "").strip()
                    for c in (setting.get("characters") or []) if isinstance(c, dict)}
     known_factions = {str(f.get("name") or "").strip()
@@ -982,7 +994,7 @@ def consistency_report(work_dir: str | Path) -> list[str]:
             if name not in known:
                 problems.append(f"{where}写着{what}「{name}」，但设定集里没有这个人/势力")
 
-    volumes, _bv = load_all_volumes(wd / "70-volume")
+    volumes = volumes if volumes is not None else load_all_volumes(wd / "70-volume")[0]
     for vol in volumes.values():
         v = vol.get("vol") or {}
         where = f"第 {v.get('vol')} 卷逐章表"
@@ -990,7 +1002,7 @@ def consistency_report(work_dir: str | Path) -> list[str]:
             if isinstance(ch, dict):
                 _check(ch.get("characters"), known_chars, "出场人物", f"{where}第 {ch.get('chapter_no')} 章")
 
-    briefs, _br = load_all_briefs(wd / "80-brief")
+    briefs = briefs if briefs is not None else load_all_briefs(wd / "80-brief")[0]
     for b in briefs.values():
         st = b.get("settings") or {}
         where = f"逐章指令 {b.get('chapter_id')}"
@@ -1010,14 +1022,19 @@ def consistency_report(work_dir: str | Path) -> list[str]:
 # 所以这里是**渲染**，不是存储：永远跟着真源走，不可能过期。
 
 
-def render_synopsis(work_dir: str | Path) -> str:
+def render_synopsis(
+    work_dir: str | Path,
+    *,
+    setting: dict[str, Any] | None = None,
+    volumes: dict[int, dict[str, Any]] | None = None,
+) -> str:
     """把三层真源渲染成一份可读的全书梗概。纯脚本，零成本。"""
     from .chapter_brief import chapter_id_of
     from .volume import load_all_volumes
 
     wd = Path(work_dir)
-    setting = load_work_setting(wd)
-    volumes, _bv = load_all_volumes(wd / "70-volume")
+    setting = setting if setting is not None else load_work_setting(wd)
+    volumes = volumes if volumes is not None else load_all_volumes(wd / "70-volume")[0]
     draft_dir = wd / "90-draft"
     drafted = {p.stem for p in draft_dir.glob("*.md")} if draft_dir.exists() else set()
 
@@ -1556,7 +1573,14 @@ def render_write_brief(
 # 引导靠提示词，拦住必须靠代码——提示词说一百遍"别忘了主角"，也不如一道闸。
 
 
-def story_gates(work_dir: str | Path, *, absent_limit: int = 3) -> tuple[list[str], list[str]]:
+def story_gates(
+    work_dir: str | Path,
+    *,
+    absent_limit: int = 3,
+    setting: dict[str, Any] | None = None,
+    volumes: dict[int, dict[str, Any]] | None = None,
+    briefs: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[str], list[str]]:
     """返回 (阻断, 警告)。纯脚本，零成本。
 
     两道闸：
@@ -1567,7 +1591,7 @@ def story_gates(work_dir: str | Path, *, absent_limit: int = 3) -> tuple[list[st
     from .volume import load_all_volumes
 
     wd = Path(work_dir)
-    setting = load_work_setting(wd)
+    setting = setting if setting is not None else load_work_setting(wd)
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -1575,7 +1599,7 @@ def story_gates(work_dir: str | Path, *, absent_limit: int = 3) -> tuple[list[st
              if isinstance(c, dict) and str(c.get("role") or "").strip() == "主角"]
     # 闸只看**指令**里的出场：真正被写出来的是指令，卷表是计划。
     # 用并集的话，卷表里写着主角、指令里没有，闸就永远不响——实测栽过。
-    cast = character_presence(wd, brief_only=True)
+    cast = character_presence(wd, brief_only=True, briefs=briefs)
     latest = (cast.get("counts") or {}).get("latest_chapter_no") or 0
     if latest and leads:
         names = [str(c.get("name") or "") for c in leads]
@@ -1595,7 +1619,7 @@ def story_gates(work_dir: str | Path, *, absent_limit: int = 3) -> tuple[list[st
             else:
                 errors.append(msg)
 
-    volumes, _broken = load_all_volumes(wd / "70-volume")
+    volumes = volumes if volumes is not None else load_all_volumes(wd / "70-volume")[0]
     ordered = sorted(volumes.values(),
                      key=lambda v: int((v.get("vol") or {}).get("vol") or 0))
     for prev, nxt in zip(ordered, ordered[1:]):

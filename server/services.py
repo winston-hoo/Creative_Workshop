@@ -2842,6 +2842,19 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
 
     # 左侧章节导航要显示每章状态。逐个另发三个请求会让首屏多几十次往返，
     # 这里顺手把状态文件读出来一起返回——都是几十字节的小 JSON。
+    #
+    # P2 起改为先查派生元数据库（.index/meta.db）。它只存由文件重建出来的
+    # 状态/计数，读之前先按 mtime+size+sha 增量同步，所以手改文件也会立刻纠正。
+    # 库损坏或不存在时 `states is None`，整体退回下面的现读文件分支。
+    from workshop import metadata as _metadata
+
+    states: dict[str, dict[str, Any]] | None = None
+    try:
+        if _metadata.sync(paths.root, work=name, scope="states").get("ok"):
+            states = _metadata.chapter_states(paths.root, name)
+    except (OSError, ValueError):
+        states = None
+
     from workshop import draft_store as _draft_store_mod
     from workshop import notes as _notes_mod
     from workshop import review as _review_mod
@@ -2853,27 +2866,34 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
             if not isinstance(row, dict) or not isinstance(row.get("chapter_no"), int):
                 continue
             cid = cb.chapter_id_of(no, row["chapter_no"])
-            has_draft = (wd / "90-draft" / f"{cid}.md").exists()
-            try:
-                draft_status = _draft_store_mod.get_status(wd, cid).get("status") or "draft"
-            except (OSError, ValueError):
-                draft_status = "draft"
-            try:
-                notes_payload = _notes_mod.load_notes(wd, cid)
-                pending_notes = len(
-                    [x for x in (notes_payload.get("notes") or [])
-                     if x.get("status") == "pending"]
-                )
-            except (OSError, ValueError):
-                pending_notes = 0
-            try:
-                review_payload = _review_mod.load_reviews(wd, cid)
-                open_reviews = len(
-                    [x for x in _review_mod.all_items(review_payload)
-                     if x.get("status") == "open"]
-                )
-            except (OSError, ValueError):
-                open_reviews = 0
+            if states is not None:
+                state = states.get(cid) or {}
+                has_draft = bool(state.get("draft_exists"))
+                draft_status = str(state.get("status") or "draft")
+                pending_notes = int(state.get("notes_pending") or 0)
+                open_reviews = int(state.get("review_open") or 0)
+            else:
+                has_draft = (wd / "90-draft" / f"{cid}.md").exists()
+                try:
+                    draft_status = _draft_store_mod.get_status(wd, cid).get("status") or "draft"
+                except (OSError, ValueError):
+                    draft_status = "draft"
+                try:
+                    notes_payload = _notes_mod.load_notes(wd, cid)
+                    pending_notes = len(
+                        [x for x in (notes_payload.get("notes") or [])
+                         if x.get("status") == "pending"]
+                    )
+                except (OSError, ValueError):
+                    pending_notes = 0
+                try:
+                    review_payload = _review_mod.load_reviews(wd, cid)
+                    open_reviews = len(
+                        [x for x in _review_mod.all_items(review_payload)
+                         if x.get("status") == "open"]
+                    )
+                except (OSError, ValueError):
+                    open_reviews = 0
             chapters.append(
                 {
                     "chapter_id": cid,
@@ -2897,14 +2917,24 @@ def creation_overview(paths: Paths, name: str) -> dict[str, Any]:
         )
 
     # 全书级硬闸：主角缺席、卷间接不上。闸要并进 errors 才算真的拦住。
-    _gates = creation_story_gates(paths, name)
-    errors = list(errors) + list(_gates["errors"])
-    warnings = list(warnings) + list(_gates["warnings"])
+    #
+    # 设定集/卷表/逐章指令在上面的流程里已经全部解析过一遍；这里把解析结果
+    # 传下去，避免同一批 YAML 在梗概、人物动向、一致性、硬闸里各解析一次
+    # （200 章时这是最大的一笔纯浪费）。
+    from workshop.creation import render_synopsis, story_gates
+
+    _gate_errors, _gate_warnings = story_gates(
+        wd, setting=setting, volumes=volumes, briefs=briefs
+    )
+    errors = list(errors) + list(_gate_errors)
+    warnings = list(warnings) + list(_gate_warnings)
     return {
-        "foreshadows": foreshadow_ledger(paths, name),
-        "synopsis": creation_synopsis(paths, name),
-        "cast": creation_character_presence(paths, name),
-        "consistency": creation_consistency(paths, name),
+        "foreshadows": foreshadow_ledger(paths, name, briefs=briefs),
+        "synopsis": render_synopsis(wd, setting=setting, volumes=volumes),
+        "cast": creation_character_presence(paths, name, briefs=briefs, volumes=volumes),
+        "consistency": creation_consistency(
+            paths, name, setting=setting, volumes=volumes, briefs=briefs
+        ),
         "work": name,
         "ok": not errors,
         "setting": setting_view,
@@ -5245,40 +5275,76 @@ def kb_import(
     }
 
 
-def foreshadow_ledger(paths: Paths, name: str) -> dict[str, Any]:
+def foreshadow_ledger(
+    paths: Paths, name: str, *, briefs: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """一本伏笔账：埋了哪些、推到哪一步、哪些该收还没收。纯脚本，零成本。"""
     from workshop.chapter_brief import foreshadow_ledger as _ledger
 
     wd = _creation_work_dir(paths, name)
-    return _ledger(wd / "80-brief")
+    return _ledger(wd / "80-brief", briefs=briefs)
 
 
-def creation_character_presence(paths: Paths, name: str) -> dict[str, Any]:
+def creation_character_presence(
+    paths: Paths,
+    name: str,
+    *,
+    briefs: dict[str, Any] | None = None,
+    volumes: dict[int, Any] | None = None,
+) -> dict[str, Any]:
     """人物动向：谁在第几章出场、谁已经连着好几章没露面。纯脚本，零成本。"""
     from workshop.creation import character_presence
 
-    return character_presence(_creation_work_dir(paths, name))
+    return character_presence(
+        _creation_work_dir(paths, name), briefs=briefs, volumes=volumes
+    )
 
 
-def creation_consistency(paths: Paths, name: str) -> list[str]:
+def creation_consistency(
+    paths: Paths,
+    name: str,
+    *,
+    setting: dict[str, Any] | None = None,
+    volumes: dict[int, Any] | None = None,
+    briefs: dict[str, Any] | None = None,
+) -> list[str]:
     """卷表/指令里点过名、但设定集里没有的人与势力。纯脚本，零成本。"""
     from workshop.creation import consistency_report
 
-    return consistency_report(_creation_work_dir(paths, name))
+    return consistency_report(
+        _creation_work_dir(paths, name), setting=setting, volumes=volumes, briefs=briefs
+    )
 
 
-def creation_synopsis(paths: Paths, name: str) -> str:
+def creation_synopsis(
+    paths: Paths,
+    name: str,
+    *,
+    setting: dict[str, Any] | None = None,
+    volumes: dict[int, Any] | None = None,
+) -> str:
     """全书梗概：从三层真源渲染，不新增字段。纯脚本，零成本。"""
     from workshop.creation import render_synopsis
 
-    return render_synopsis(_creation_work_dir(paths, name))
+    return render_synopsis(
+        _creation_work_dir(paths, name), setting=setting, volumes=volumes
+    )
 
 
-def creation_story_gates(paths: Paths, name: str) -> dict[str, Any]:
+def creation_story_gates(
+    paths: Paths,
+    name: str,
+    *,
+    setting: dict[str, Any] | None = None,
+    volumes: dict[int, Any] | None = None,
+    briefs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """全书级硬闸：主角缺席、卷间接不上。纯脚本，零成本。"""
     from workshop.creation import story_gates
 
-    errors, warnings = story_gates(_creation_work_dir(paths, name))
+    errors, warnings = story_gates(
+        _creation_work_dir(paths, name), setting=setting, volumes=volumes, briefs=briefs
+    )
     return {"errors": errors, "warnings": warnings}
 
 
@@ -5324,3 +5390,78 @@ def search_sync(paths: Paths, *, force: bool = False) -> dict[str, Any]:
     from workshop import search
 
     return search.sync(paths.root, force=force)
+
+
+# ── 派生元数据库 ────────────────────────────────────────────
+#
+# 真源仍是 60-setting / 70-volume / 80-brief / 90-draft 下的文件。
+# 这里只暴露查询与同步；库不可用时调用方读到的 `available=False`，
+# 页面本身的读取路径会自动退回现读文件。
+
+
+def meta_status(paths: Paths, *, sync_first: bool = False) -> dict[str, Any]:
+    from workshop import metadata
+
+    return metadata.status(paths.root, sync_first=sync_first)
+
+
+def meta_sync(
+    paths: Paths, *, force: bool = False, work: str | None = None, scope: str = "all"
+) -> dict[str, Any]:
+    from workshop import metadata
+
+    return metadata.sync(paths.root, work=work, force=force, scope=scope)
+
+
+def meta_chapters(paths: Paths, name: str) -> dict[str, Any]:
+    """逐章派生状态（字数、段落、状态、要点/审稿计数、当前版本）。"""
+    from workshop import metadata
+
+    synced = metadata.sync(paths.root, work=name)
+    states = metadata.chapter_states(paths.root, name)
+    if states is None:
+        return {"available": False, "sync": synced, "items": []}
+    items = []
+    for cid in sorted(states):
+        row = states[cid]
+        items.append(
+            {
+                "chapter_id": cid,
+                "draft_exists": bool(row.get("draft_exists")),
+                "chars": int(row.get("chars") or 0),
+                "paragraphs": int(row.get("paragraphs") or 0),
+                "draft_mtime": row.get("draft_mtime") or "",
+                "status": row.get("status") or "draft",
+                "status_updated_at": row.get("status_updated_at") or "",
+                "notes_total": int(row.get("notes_total") or 0),
+                "notes_pending": int(row.get("notes_pending") or 0),
+                "review_total": int(row.get("review_total") or 0),
+                "review_open": int(row.get("review_open") or 0),
+                "reviews_count": int(row.get("reviews_count") or 0),
+                "last_review_at": row.get("last_review_at") or "",
+                "version_count": int(row.get("version_count") or 0),
+                "current_version_id": row.get("current_version_id") or "",
+                "candidate_count": int(row.get("candidate_count") or 0),
+            }
+        )
+    return {"available": True, "sync": synced, "items": items}
+
+
+def meta_tasks(
+    paths: Paths, name: str, *, chapter_id: str | None = None, limit: int = 100
+) -> dict[str, Any]:
+    """任务记录查询：等价于扫 `.tasks/*.json`，但走派生库的索引。"""
+    from workshop import metadata
+
+    synced = metadata.sync(paths.root, work=name)
+    rows = metadata.task_history(paths.root, name, chapter_id=chapter_id, limit=limit)
+    return {"available": rows is not None, "sync": synced, "items": rows or []}
+
+
+def meta_reviews(paths: Paths, name: str, chapter_id: str) -> dict[str, Any]:
+    """每次审稿的条数与状态计数。"""
+    from workshop import metadata
+
+    synced = metadata.sync(paths.root, work=name)
+    rows = metadata.review_counters(paths.root, name, chapter_id)
+    return {"available": rows is not None, "sync": synced, "items": rows or []}

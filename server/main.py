@@ -1555,6 +1555,48 @@ def api_search_sync(force: bool = Query(False)) -> dict:
     return services.search_sync(PATHS, force=force)
 
 
+# ── 派生元数据库 ────────────────────────────────────────────
+#
+# 真源仍是文件；这些接口只查派生元数据或触发同步，读到的都是可重建内容。
+
+
+@app.get("/api/meta/status")
+def api_meta_status(refresh: bool = Query(False)) -> dict:
+    return services.meta_status(PATHS, sync_first=refresh)
+
+
+@app.post("/api/meta/sync")
+def api_meta_sync(
+    force: bool = Query(False),
+    work: str | None = Query(None),
+    scope: str = Query("all", pattern="^(all|states)$"),
+) -> dict:
+    return services.meta_sync(
+        PATHS, force=force, work=safe_name(work) if work else None, scope=scope
+    )
+
+
+@app.get("/api/works/{name}/meta/chapters")
+def api_meta_chapters(name: str) -> dict:
+    return services.meta_chapters(PATHS, safe_name(name))
+
+
+@app.get("/api/works/{name}/meta/tasks")
+def api_meta_tasks(
+    name: str,
+    chapter_id: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+) -> dict:
+    return services.meta_tasks(
+        PATHS, safe_name(name), chapter_id=chapter_id or None, limit=limit
+    )
+
+
+@app.get("/api/works/{name}/meta/reviews/{chapter_id}")
+def api_meta_reviews(name: str, chapter_id: str) -> dict:
+    return services.meta_reviews(PATHS, safe_name(name), chapter_id)
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

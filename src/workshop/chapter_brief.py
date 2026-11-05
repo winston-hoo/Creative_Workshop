@@ -463,14 +463,19 @@ def render_brief_markdown(data: dict[str, Any]) -> str:
 # 这个函数把散在几十个 brief 里的动作汇成一本账：埋了哪些、推到哪一步、哪些该收还没收。
 
 
-def foreshadow_ledger(brief_dir: str | Path) -> dict[str, Any]:
+def foreshadow_ledger(
+    brief_dir: str | Path, *, briefs: dict[str, dict[str, Any]] | None = None
+) -> dict[str, Any]:
     """扫全部逐章指令，算出一本伏笔账。纯脚本，零成本。
 
     生命周期：埋设 → 开启；推进 → 仍开着（记次数）；回收 → 关闭。
     「推进/回收 引用了不存在的 id」不在这里报——那是 `validate_brief_chain` 的活，
     这里重复报一次只会让同一件事出现两遍，作者还得自己判断是不是两个问题。
     """
-    briefs, broken = load_all_briefs(brief_dir)
+    if briefs is None:
+        briefs, broken = load_all_briefs(brief_dir)
+    else:
+        broken = []
     rows = sorted(
         briefs.values(),
         key=lambda b: (int(b.get("vol") or 0), int(b.get("chapter_no") or 0)),
