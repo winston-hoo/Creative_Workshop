@@ -25,7 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .llm import ApiError, ChatResult, OpenAICompatProvider, build_thinking_extra
+from .llm import (
+    MAX_TOKENS_CAP, ApiError, ChatResult, OpenAICompatProvider, build_thinking_extra,
+)
 
 DRAFT_SCHEMA_VERSION = "draft-v1"
 
@@ -269,6 +271,40 @@ CONTINUE_INSTRUCTION = (
     "- 不要写「续」「（未完）」之类的标记，不要解释；\n"
     "- 保持原来的视角、语气与人物状态，直接往下叙事。"
 )
+
+# 输出预算按「本章目标字数上限」反推，而不是给一个拍脑袋的小常数。
+# 实测教训：首轮只给 1200 输出 token，写到一半就被截断，续写一轮等于把整段上下文
+# 再发一次（两轮 prompt token 合计 22,934，输入侧几乎翻倍），比一次给足更贵。
+# 系数 0.968 来自探测报告的中文 token/字实测值；1.3 是标点与轻度扩写的余量；
+# 下限 2048 兜住小目标，上限不超过模型声明的 max_output。
+CJK_TOKENS_PER_CHAR = 0.968
+OUTPUT_TOKEN_MARGIN = 1.3
+MIN_OUTPUT_TOKENS = 2048
+
+
+def derive_max_tokens(
+    word_range: list[int] | None = None,
+    model_cfg: dict[str, Any] | None = None,
+) -> int:
+    """按本章目标字数算这一次的输出上限（含下限与模型上限）。"""
+    rng = word_range if isinstance(word_range, (list, tuple)) and len(word_range) == 2 else [2800, 4000]
+    try:
+        high = int(rng[1])
+    except (TypeError, ValueError):
+        high = 4000
+    if high <= 0:
+        high = 4000
+    want = int(round(high * CJK_TOKENS_PER_CHAR * OUTPUT_TOKEN_MARGIN))
+    size = max(MIN_OUTPUT_TOKENS, want)
+    try:
+        declared = int((model_cfg or {}).get("max_output") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    cap = declared if declared > 0 else MAX_TOKENS_CAP
+    # 模型声明的上限必须遵守；只有它低于下限时才让步，否则请求本身会被上游拒绝。
+    if cap >= MIN_OUTPUT_TOKENS:
+        return int(min(size, cap))
+    return int(max(1024, cap))
 
 
 @dataclass
@@ -593,10 +629,23 @@ def check_draft(
         warnings.append("指令里写了要出场、但正文里找不到的人物：" + "、".join(missing))
 
     foreshadow = brief.get("foreshadow") or []
+    # 偏离量单独落一份，别只藏在 warnings 的一句话里：
+    # 界面要显示「短了/长了多少」，账本也要能回看，而不是去正则里抠字符串。
+    if chars < low:
+        deviation, deviation_kind = chars - low, "short"
+    elif chars > high:
+        deviation, deviation_kind = chars - high, "long"
+    else:
+        deviation, deviation_kind = 0, "ok"
+    base = low if deviation_kind == "short" else high
+    deviation_pct = round(abs(deviation) / base * 100, 1) if base else 0.0
     stats = {
         "chars": chars,
         "word_range": [low, high],
-        "in_range": low <= chars <= high,
+        "in_range": deviation_kind == "ok",
+        "deviation": deviation,
+        "deviation_kind": deviation_kind,
+        "deviation_pct": deviation_pct,
         "characters_appeared": appeared,
         "characters_missing": missing,
         "foreshadow_actions": len(foreshadow),

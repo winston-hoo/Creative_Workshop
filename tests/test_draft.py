@@ -17,10 +17,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from workshop.draft import (  # noqa: E402
+    MIN_OUTPUT_TOKENS,
     build_draft_messages,
     build_draft_plan,
     check_draft,
     count_chars,
+    derive_max_tokens,
     load_draft,
     save_draft,
     strip_wrapping,
@@ -263,6 +265,47 @@ def test_save_and_load(tmp_dir: Path) -> None:
     check(not missing["exists"] and missing["text"] == "", "没写过的章节返回 exists=False，不报错")
 
 
+def test_derive_max_tokens() -> None:
+    """输出上限必须按目标字数反推：小目标不塌到 1200，大目标不超模型上限。"""
+    print("输出上限按目标字数反推")
+
+    cases = [
+        ([800, 1000], {"max_output": 384000}, MIN_OUTPUT_TOKENS, "小目标落到下限"),
+        ([2800, 4000], {"max_output": 384000}, 5034, "常规章节"),
+        ([2800, 4000], {"max_output": 3000}, 3000, "模型上限更小时听模型的"),
+        ([20000, 30000], {"max_output": 384000}, 37752, "大目标按比例放大"),
+        ([400000, 500000], {"max_output": 384000}, 384000, "超过模型上限就截到上限"),
+        ([2800, 4000], None, 5034, "没声明上限时按常规算"),
+        ([50000, 80000], None, 32000, "没声明上限时受全局上限约束"),
+    ]
+    for rng, cfg, want, label in cases:
+        got = derive_max_tokens(rng, cfg)
+        check(got == want, f"{label}：{rng} → {got}（期望 {want}）")
+
+    # 取整边界：2000×0.968×1.3 = 2516.8，四舍五入到 2517
+    check(derive_max_tokens([1000, 2000], {"max_output": 384000}) == 2517, "取整四舍五入")
+    check(derive_max_tokens(None, {"max_output": 384000}) == 5034, "没给区间按 2800–4000")
+    check(MIN_OUTPUT_TOKENS >= 2048, "下限足够一次写完一章（不会回到 1200）")
+
+
+def test_check_draft_deviation_fields() -> None:
+    """字数偏离要落成结构化字段，界面和账本才能直接读。"""
+    print("字数偏离字段")
+
+    _, _, short = check_draft("字" * 60, brief=_brief())
+    check(short["deviation_kind"] == "short", "短于下限标 short")
+    check(short["deviation"] == 60 - 2800, f"偏离量是负的（实际 {short['deviation']}）")
+    check(short["deviation_pct"] == round(2740 / 2800 * 100, 1),
+          f"偏离百分比按目标下限算（实际 {short['deviation_pct']}）")
+
+    _, _, ok = check_draft("字" * 3000, brief=_brief())
+    check(ok["deviation_kind"] == "ok" and ok["deviation"] == 0, "落在区间内就是 ok")
+
+    _, _, long = check_draft("字" * 45, brief=_brief(), word_range=[10, 20])
+    check(long["deviation_kind"] == "long" and long["deviation"] == 25,
+          f"超出上限标 long 并给正偏离（实际 {long['deviation']}）")
+
+
 def main() -> int:
     import tempfile
 
@@ -280,6 +323,8 @@ def main() -> int:
         test_draft_plan_blocks_without_brief,
         test_draft_plan_counts_and_cost,
         test_messages_carry_three_layers,
+        test_derive_max_tokens,
+        test_check_draft_deviation_fields,
     ):
         fn()
         print()

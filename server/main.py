@@ -973,9 +973,11 @@ class DraftGenerateBody(BaseModel):
     level: str = "k3"
     provider: str | None = None
     model: str | None = None
-    max_tokens: int = 8000
+    # 不传就按本章 word_target 反推（见 workshop.draft.derive_max_tokens）；
+    # 显式传值只留给调试，正常界面不暴露。
+    max_tokens: int | None = None
     temperature: float = 0.8
-    # 调试/验收用：不传就用默认 8000。正常界面不暴露这个参数。
+    # 调试/验收用：不传就用默认值。正常界面不暴露这个参数。
     budget_chars: int | None = Field(default=None, ge=1, le=200000)
     # B3/A2：从候选的断点继续写，而不是从头重写。
     resume_candidate: str = ""

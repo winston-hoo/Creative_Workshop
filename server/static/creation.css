@@ -142,6 +142,9 @@ body.cd-on main { padding: 0; }
   margin: 0; font-family: var(--serif); font-size: 17px; font-weight: 600;
   letter-spacing: .01em; color: var(--ink);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  /* 书名再长也要能缩：flex 项的 min-width:auto 会让 nowrap 文本撑到全宽，
+     375px 下把面包屑顶出容器。 */
+  flex: 1 1 auto; min-width: 0;
 }
 
 /* 未保存状态：常驻、可见，滚到哪儿都在 */

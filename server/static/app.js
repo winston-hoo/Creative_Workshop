@@ -4019,8 +4019,15 @@ function creationRenderBudget(report) {
 /* U5：调用账。细纲、正文首轮、每一轮续写各花多少，必须分开列——
    合起来只给一个总数的话，作者看到费用翻倍，却不知道钱花在「多写了一次细纲」
    还是「模型复读了三轮」。数据和 manifest 的 calls 是同一份。 */
-function creationRenderCallLedger(calls) {
+function creationRenderCallLedger(calls, stats) {
   if (!Array.isArray(calls) || !calls.length) return '';
+  const wr = (stats && Array.isArray(stats.word_range)) ? stats.word_range : null;
+  const wordText = wr
+    ? ` · 字数 ${num(stats.chars)} / 目标 ${num(wr[0])}–${num(wr[1])}`
+      + (stats.in_range === false
+        ? `（${stats.deviation_kind === 'short' ? '短' : '长'} ${num(Math.abs(Number(stats.deviation) || 0))} 字）`
+        : '')
+    : '';
   const label = (r) => (r.stage === 'beats' ? '写前细纲'
     : r.stage === 'continue' ? `续写第 ${Number(r.round) || 1} 轮`
       : '正文首轮');
@@ -4039,7 +4046,7 @@ function creationRenderCallLedger(calls) {
   return `<div class="ledger">
     <div class="spread" style="align-items:baseline">
       <b>调用账本</b>
-      <span class="muted" style="font-size:12px">共 ${calls.length} 次调用；续写与细纲各占一行</span>
+      <span class="muted" style="font-size:12px">共 ${calls.length} 次调用；续写与细纲各占一行${wordText}</span>
     </div>
     <table class="ledger-table">
       <thead><tr><th>用途</th><th>本轮新增</th><th>token 入+出</th><th>结束原因</th><th>耗时</th><th>去重/错误</th></tr></thead>
@@ -4124,7 +4131,7 @@ function creationRenderTask(task) {
     ${task.candidate_id ? `<p class="muted" style="margin:4px 0 0;font-size:12px">
       候选已保留：<code>${esc(task.candidate_id)}</code>（见下方恢复候选）</p>` : ''}
     ${running && task.cancellable ? '<div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn" id="draft-cancel">停止生成</button></div>' : ''}
-    ${creationRenderCallLedger(task.calls || [])}
+    ${creationRenderCallLedger(task.calls || [], task.stats || null)}
   </div>`;
 }
 
@@ -4160,6 +4167,27 @@ function creationRenderRecovery() {
     ${cands.length ? `<div class="recover-title">候选（${cands.length}）</div>${candRows}` : ''}
     ${versions.length ? `<div class="recover-title">历史版本（${versions.length}）</div>${verRows}` : ''}
   </div>`;
+}
+
+/* 字数偏离：升级成一张卡片，而不是埋在 warnings 列表里的普通一条。
+   **只提示，不自动补写**：补写要多花一次调用，作者没点头不花钱。 */
+function creationRenderWordDeviation(stats) {
+  if (!stats || !Array.isArray(stats.word_range) || stats.word_range.length !== 2) return '';
+  const chars = Number(stats.chars) || 0;
+  const low = Number(stats.word_range[0]) || 0;
+  const high = Number(stats.word_range[1]) || 0;
+  const short = chars < low;
+  const long = chars > high;
+  if (!short && !long) return '';
+  const delta = short ? low - chars : chars - high;
+  const pct = Number(stats.deviation_pct);
+  return notice('warn',
+    `<b>字数偏离目标：${short ? '短了' : '长了'} ${num(delta)} 字</b>`
+    + (Number.isFinite(pct) && pct > 0 ? `（${num(pct)}%）` : '')
+    + `<br>目标 ${num(low)}–${num(high)} 字，实际 ${num(chars)} 字。`
+    + (short ? '多半是没写完或提前收尾，读的时候留意结尾有没有断。'
+      : '超出上限不一定是错，但多半夹了可以删的铺陈。')
+    + '<span class="muted">　只提示，不会自动补写（自动补写会再花一次调用）。</span>');
 }
 
 function creationRenderDraft() {
@@ -4206,18 +4234,22 @@ function creationRenderDraft() {
       ${planErr ? '计划未生成（原因见上）'
         : plan.model ? `正文用：${esc(plan.model)}${stage.source_label ? `（${esc(stage.source_label)}）` : ''}`
           + ` · 输入约 ${num(plan.est_input_tokens || 0)} token`
-          + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token · ${cost}`
+          + ` · 输出按上限估 ${num(plan.est_output_tokens || 0)} token`
+          + (plan.max_tokens ? `（单次上限 ${num(plan.max_tokens)}）` : '')
+          + ` · ${cost}`
           + `（目标 ${words} 字）` : '正在算计划…'}
       ${planErr ? '' : beatsLine}
       ${planErr ? '' : craftLine}
     </div>
+    ${creationRenderWordDeviation((creationState.prose || {}).stats)}
     ${blockers.length ? blockers.map((b, i) =>
       notice(plan.blocker && i === 0 ? 'bad' : 'warn', esc(b))).join('') : ''}
     ${plan.context_report ? creationRenderBudget(plan.context_report) : ''}
     <div id="creation-task-host">${creationRenderTask(creationState.proseTask)}</div>
     ${creationRenderBeats(plan.beats)}
     ${creationRenderCallLedger((creationState.proseTask && creationState.proseTask.calls)
-      || (plan.last_run && plan.last_run.calls) || [])}
+      || (plan.last_run && plan.last_run.calls) || [],
+    (creationState.prose && creationState.prose.stats) || null)}
     ${existing}
     ${creationNotSaved() ? `
     <div class="row" style="justify-content:space-between;align-items:center;margin-top:8px">

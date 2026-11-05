@@ -3681,7 +3681,9 @@ def draft_plan(
     """写这一章的免费计划：多少 token、多少钱、会喂进去什么。**不调模型。**"""
     from workshop.batch import _pick_price, price_bucket
     from workshop.config import load_config
-    from workshop.draft import MAX_CONTINUE_ROUNDS, build_draft_plan, load_draft
+    from workshop.draft import (
+        MAX_CONTINUE_ROUNDS, build_draft_plan, derive_max_tokens, load_draft,
+    )
 
     ctx = _draft_inputs(paths, name, chapter_id)
     cfg = load_config(paths.root / "providers.yaml")
@@ -3707,6 +3709,10 @@ def draft_plan(
         bucket=bucket, brief_errors=errors, brief_exists=ctx["brief_exists"],
         context_block=_ctx, context_report=_report,
     ).to_dict()
+    # 输出上限按目标字数反推，计划里直接可见（只读，不调模型）。
+    plan["max_tokens"] = derive_max_tokens(
+        (ctx["brief"] or {}).get("word_target"), model_cfg
+    )
     context_manifest = manifest_path(ctx["work_dir"], chapter_id)
     plan["context_manifest_path"] = str(context_manifest)
     plan["context_manifest_exists"] = load_manifest(ctx["work_dir"], chapter_id) is not None
@@ -3797,7 +3803,7 @@ def run_draft(
     paths: Paths, name: str, chapter_id: str, *,
     refs: list[str] | None = None, level: str = "k3",
     provider_id: str | None = None, model_id: str | None = None,
-    max_tokens: int = 8000, temperature: float = 0.8,
+    max_tokens: int | None = None, temperature: float = 0.8,
     budget_chars: int | None = None,
     task: Any | None = None,
     resume_candidate: str = "",
@@ -3847,6 +3853,15 @@ def run_draft(
     # E2：正文与细纲是两个阶段，可以各自配模型；它们的服务商也可能不同。
     provider, model, draft_stage = _resolve_stage(cfg, "draft", provider_id, model_id)
     _require_key(cfg, provider, "正文生成")
+    # 输出预算由本章目标字数反推：一次给够，比「写一半→续写再发一遍上下文」更省。
+    # 调用方显式传值（调试）时照旧尊重传进来的数。
+    max_tokens_derived = max_tokens is None
+    if max_tokens is None:
+        from workshop.draft import derive_max_tokens
+
+        max_tokens = derive_max_tokens(
+            (ctx["brief"] or {}).get("word_target"), provider.model(model) or {}
+        )
     plan_provider, plan_model, plan_stage = _resolve_stage(cfg, "plan")
     _require_key(cfg, plan_provider, "写前细纲")
 
@@ -3895,6 +3910,9 @@ def run_draft(
         "refs": refs or [],
         "calls": calls,
         "beats": beats_meta,
+        # 输出上限与来源写进账本：事后要能回答「这一次为什么只给了这么多」。
+        "max_tokens": max_tokens,
+        "max_tokens_source": "word_range" if max_tokens_derived else "explicit",
         "max_continue_rounds": MAX_CONTINUE_ROUNDS,
     }
 
@@ -4128,6 +4146,7 @@ def run_draft(
                 "truncated": False, "continued": result.continued,
                 "continue_rounds": result.continue_rounds,
                 "max_continue_rounds": MAX_CONTINUE_ROUNDS,
+                "max_tokens": max_tokens,
                 "refs_level": level, "refs": refs or [],
                 "beats": beats_meta, "calls": calls,
                 **resume_meta,
@@ -4139,6 +4158,8 @@ def run_draft(
             usage=result.usage, finish_reason=result.finish_reason,
             truncated=False, continued=result.continued,
             continue_rounds=result.continue_rounds,
+            # 字数偏离也进账本：界面之外，事后回看 manifest 同样能看到短了/长了多少。
+            word_stats=stats,
         )
         # 新正文写进来，之前那次审稿的结论就作废了。状态自动退回草稿，
         # 免得界面上还挂着「已审」而正文其实是重写的另一份。
@@ -4197,7 +4218,7 @@ def start_draft(
     paths: Paths, name: str, chapter_id: str, *,
     refs: list[str] | None = None, level: str = "k3",
     provider_id: str | None = None, model_id: str | None = None,
-    max_tokens: int = 8000, temperature: float = 0.8,
+    max_tokens: int | None = None, temperature: float = 0.8,
     budget_chars: int | None = None,
     resume_candidate: str = "",
     force_beats: bool = False,
