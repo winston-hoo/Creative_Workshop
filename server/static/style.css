@@ -935,3 +935,111 @@ main.annot-page { padding-bottom: 20px; }
 .tab:focus-visible, .btn:focus-visible { outline-offset: 1px; }
 /* 可点但没写成 <button> 的行/块 */
 [data-anchor], .worknav a, .anchors a { -webkit-tap-highlight-color: transparent; }
+
+/* ── 全文检索 ──────────────────────────────────────────
+   结果卡片单列铺满；列表里的片段与命中页的正文都用 <mark> 标命中。
+   窄屏下输入框与按钮各占一行，避免把 375px 顶出横向滚动。 */
+.search-page { max-width: 880px; }
+.search-head { margin-bottom: 14px; }
+.search-head p { margin: 4px 0 0; }
+.search-bar { display: flex; gap: 8px; margin-bottom: 12px; }
+.search-bar input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+}
+.search-filters { margin-bottom: 12px; }
+.search-filters .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.search-filters .chip {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  padding: 5px 12px;
+  font-size: 12px;
+}
+.search-filters .chip:hover { background: var(--surface-2); }
+.search-filters .chip.active {
+  background: var(--accent-bg);
+  border-color: rgba(37, 99, 235, 0.3);
+  color: var(--accent);
+  font-weight: 600;
+}
+.search-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 10px;
+}
+.search-scope select { max-width: 100%; }
+.search-scope .muted { flex: 1 1 220px; min-width: 0; }
+.search-meta { margin: 6px 0 10px; line-height: 1.6; }
+.search-hit {
+  display: block;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  text-decoration: none;
+  color: var(--text);
+  box-shadow: var(--shadow);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.search-hit:hover { border-color: var(--border-strong); box-shadow: var(--shadow-hover); }
+.hit-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.hit-head strong { font-size: 14px; }
+.hit-head .muted { margin-left: auto; min-width: 0; overflow-wrap: anywhere; }
+.search-hit .badge {
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  white-space: nowrap;
+}
+.hit-snippet {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.hit-snippet mark, .hit-body mark {
+  background: #fff2a8;
+  color: inherit;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+.search-hit-nav { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+.search-hit-nav .muted { flex: 1 1 220px; min-width: 0; }
+.search-hit-nav .btn { padding: 5px 10px; font-size: 12px; }
+.search-hit-title { margin-bottom: 12px; }
+.hit-body {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  font-size: 15px;
+  line-height: 1.9;
+  box-shadow: var(--shadow);
+  overflow-wrap: anywhere;
+}
+.hit-body p { margin: 0 0 1em; }
+.hit-body p:last-child { margin-bottom: 0; }
+
+@media (max-width: 640px) {
+  .search-bar { flex-wrap: wrap; }
+  .search-bar input { flex: 1 1 100%; }
+  .search-bar button { width: 100%; }
+  .hit-head .muted { margin-left: 0; width: 100%; }
+  .hit-body { padding: 14px; font-size: 14px; }
+}

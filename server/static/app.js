@@ -10226,6 +10226,358 @@ function renderHelp() {
   `;
 }
 
+/* ── 全文检索 ──────────────────────────────────────────────
+   索引在服务端本地建，不调用模型。输入即搜（250ms 防抖），回车立即搜。
+   命中页按偏移高亮并滚动到命中那段；超长文档只取命中附近的 2 万字。 */
+
+const SEARCH_TYPE_LABELS = {
+  chapter: '正文',
+  setting: '设定',
+  volume: '卷表',
+  brief: '章指令',
+  foreshadow: '伏笔',
+  notes: '要点',
+  review: '审稿',
+};
+
+const searchState = {
+  q: '',
+  types: new Set(),
+  work: '',
+  seq: 0,
+  timer: null,
+  status: null,
+  works: [],
+};
+
+function searchHashParams() {
+  const raw = (location.hash || '').split('?')[1] || '';
+  return new URLSearchParams(raw);
+}
+
+function searchTypeLabel(type) {
+  return SEARCH_TYPE_LABELS[type] || type || '未知';
+}
+
+function searchChipsHtml() {
+  const all = searchState.types.size === 0 ? ' active' : '';
+  const one = Object.entries(SEARCH_TYPE_LABELS)
+    .map(([key, label]) =>
+      `<button type="button" class="chip${searchState.types.has(key) ? ' active' : ''}" data-type="${key}">${esc(label)}</button>`)
+    .join('');
+  return `<button type="button" class="chip${all}" data-type="">全部</button>${one}`;
+}
+
+function searchStatusHtml(st) {
+  if (!st) return '读取索引状态…';
+  if (!st.ready) {
+    return '索引尚未建立；第一次检索会自动建立（只读本地文件，不花钱）';
+  }
+  const counts = Object.entries(st.by_type || {})
+    .map(([k, n]) => `${searchTypeLabel(k)} ${num(n)}`)
+    .join(' · ');
+  const errs = (st.errors || []).length ? ` · ${st.errors.length} 个文件读取失败` : '';
+  return `索引就绪：${num(st.docs)} 条文档 / ${num(st.works)} 部作品${counts ? `（${counts}）` : ''}${errs}`;
+}
+
+function renderSearchStatus(st) {
+  const el = document.getElementById('search-status');
+  if (el) el.innerHTML = searchStatusHtml(st);
+}
+
+function renderSearchChips() {
+  const box = document.getElementById('search-types');
+  if (box) box.innerHTML = searchChipsHtml();
+}
+
+function renderSearchWorkOptions() {
+  const sel = document.getElementById('search-work');
+  if (!sel) return;
+  const names = searchState.works.map((w) => w.name);
+  if (searchState.work && !names.includes(searchState.work)) searchState.work = '';
+  sel.innerHTML =
+    `<option value="">全部作品</option>` +
+    names
+      .map((n) => `<option value="${esc(n)}"${n === searchState.work ? ' selected' : ''}>${esc(n)}</option>`)
+      .join('');
+}
+
+function searchResultsPrompt(html) {
+  const box = document.getElementById('search-results');
+  if (box) box.innerHTML = html;
+}
+
+function searchSnippetHtml(snippet) {
+  if (!snippet) return '<span class="muted">（无片段）</span>';
+  const before = (snippet.prefix ? '…' : '') + esc(snippet.before || '');
+  const match = snippet.match ? `<mark>${esc(snippet.match)}</mark>` : '';
+  const after = esc(snippet.after || '') + (snippet.suffix ? '…' : '');
+  return before + match + after;
+}
+
+function searchHitCard(item) {
+  const params = new URLSearchParams({
+    id: item.doc_id,
+    q: searchState.q,
+    o: String(item.offset || 0),
+    l: String(item.length || 0),
+  });
+  return `<a class="search-hit" href="#/search/hit?${params.toString().replace(/&/g, '&amp;')}">
+    <div class="hit-head">
+      <span class="badge">${esc(searchTypeLabel(item.source_type))}</span>
+      <strong>${esc(item.title || item.ref || item.doc_id)}</strong>
+      <span class="muted">${esc(item.work)} · ${esc(item.ref || '')}</span>
+    </div>
+    <div class="hit-snippet">${searchSnippetHtml(item.snippet)}</div>
+  </a>`;
+}
+
+function renderSearchResults(data) {
+  const box = document.getElementById('search-results');
+  if (!box) return;
+  const total = data.total || 0;
+  const items = data.items || [];
+  const docs = data.index ? data.index.docs : 0;
+
+  if (!searchState.q) {
+    box.innerHTML = notice('', '输入关键词开始检索。人名、术语、伏笔编号、审稿引文都能查。');
+    return;
+  }
+  if (!docs) {
+    box.innerHTML = notice('', '索引里还没有内容。先写一章、保存设定集或跑一次审稿，再回来检索。');
+    return;
+  }
+  if (!total) {
+    box.innerHTML = notice('', `没有找到「${esc(searchState.q)}」。换个词，或放宽来源类型/作品范围。`);
+    return;
+  }
+  const more = total > items.length
+    ? `<br><span class="muted">共 ${num(total)} 条，当前只显示前 ${num(items.length)} 条。收窄关键词或按来源过滤。</span>`
+    : '';
+  box.innerHTML =
+    `<div class="search-meta muted">共 ${num(total)} 条 · 查询 ${data.took_ms} ms · 同步 ${data.index ? data.index.sync_ms : 0} ms${more}</div>` +
+    items.map(searchHitCard).join('');
+}
+
+async function searchRun() {
+  const input = document.getElementById('search-q');
+  searchState.q = input ? input.value.trim() : searchState.q;
+  if (!searchState.q) {
+    searchResultsPrompt(notice('', '输入关键词开始检索。人名、术语、伏笔编号、审稿引文都能查。'));
+    return;
+  }
+  const seq = ++searchState.seq;
+  searchResultsPrompt(notice('', '正在检索…'));
+  const params = new URLSearchParams({ q: searchState.q, limit: '50' });
+  if (searchState.types.size) params.set('type', [...searchState.types].join(','));
+  if (searchState.work) params.set('work', searchState.work);
+  try {
+    const data = await getJSON('/api/search?' + params.toString());
+    if (seq !== searchState.seq) return; // 只认最后一次输入，旧响应直接丢掉
+    searchState.status = {
+      ready: true,
+      docs: data.index ? data.index.docs : 0,
+      works: data.index ? data.index.works : 0,
+      by_type: data.index ? data.index.by_type : {},
+      errors: [],
+    };
+    renderSearchStatus(searchState.status);
+    renderSearchResults(data);
+  } catch (e) {
+    if (seq !== searchState.seq) return;
+    searchResultsPrompt(notice('bad', `检索失败：${esc(e.message)}`));
+  }
+}
+
+function searchSchedule() {
+  clearTimeout(searchState.timer);
+  searchState.timer = setTimeout(searchRun, 250);
+}
+
+async function renderSearch() {
+  setTab('search');
+  const params = searchHashParams();
+  if (params.get('q') != null) searchState.q = params.get('q');
+  view.innerHTML = `
+    <div class="search-page">
+      <div class="search-head">
+        <h1>全书检索</h1>
+        <p class="muted">人名、术语、伏笔编号、审稿引文都能查。索引建在本地，不调用模型。</p>
+      </div>
+      <form class="search-bar" id="search-form">
+        <input id="search-q" type="search" autocomplete="off" spellcheck="false"
+               value="${esc(searchState.q)}" placeholder="搜人名、术语、伏笔编号…">
+        <button class="primary" type="submit">检索</button>
+      </form>
+      <div class="search-filters">
+        <div class="chips" id="search-types">${searchChipsHtml()}</div>
+        <div class="search-scope">
+          <select id="search-work"><option value="">全部作品</option></select>
+          <span class="muted" id="search-status">读取索引状态…</span>
+          <button type="button" class="ghost" id="search-resync">重建索引</button>
+        </div>
+      </div>
+      <div id="search-results"></div>
+    </div>`;
+
+  const input = document.getElementById('search-q');
+  input.addEventListener('input', () => {
+    searchState.q = input.value.trim();
+    searchSchedule();
+  });
+  document.getElementById('search-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    clearTimeout(searchState.timer);
+    searchRun();
+  });
+  document.getElementById('search-types').addEventListener('click', (e) => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    const type = chip.dataset.type || '';
+    if (!type) searchState.types.clear();
+    else if (searchState.types.has(type)) searchState.types.delete(type);
+    else searchState.types.add(type);
+    renderSearchChips();
+    searchRun();
+  });
+  document.getElementById('search-work').addEventListener('change', (e) => {
+    searchState.work = e.target.value;
+    searchRun();
+  });
+  document.getElementById('search-resync').addEventListener('click', (e) => {
+    withBusy(e.currentTarget, '重建中…', async () => {
+      try {
+        const st = await getJSON('/api/search/status?refresh=true');
+        searchState.status = st;
+        renderSearchStatus(st);
+        searchRun();
+      } catch (err) {
+        renderSearchStatus({ ready: false, errors: [err.message] });
+      }
+    });
+  });
+
+  if (searchState.q) {
+    searchResultsPrompt(notice('', '正在检索…'));
+    searchRun();
+  } else {
+    searchResultsPrompt(notice('', '输入关键词开始检索。人名、术语、伏笔编号、审稿引文都能查。'));
+  }
+
+  try {
+    const [st, works] = await Promise.all([
+      getJSON('/api/search/status'),
+      getJSON('/api/works'),
+    ]);
+    searchState.status = st;
+    searchState.works = (works || []).filter((w) => w.kind === 'original');
+    renderSearchStatus(st);
+    renderSearchWorkOptions();
+  } catch (e) {
+    renderSearchStatus({ ready: false, errors: [e.message] });
+  }
+}
+
+function searchParagraphAt(text, offset) {
+  let index = 0;
+  const re = /\n[ \t]*\n/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index >= offset) break;
+    index += 1;
+  }
+  return index;
+}
+
+function searchMarkedHtml(text, start, length) {
+  const has = start >= 0 && length > 0 && start < text.length;
+  const end = has ? Math.min(text.length, start + length) : start;
+  const marked = has
+    ? text.slice(0, start) + '\u0001' + text.slice(start, end) + '\u0002' + text.slice(end)
+    : text;
+  const safe = esc(marked).replace(/\r\n/g, '\n');
+  const blocks = safe
+    .split(/\n[ \t]*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => `<p>${block.replace(/\n/g, '<br>')}</p>`)
+    .join('');
+  return blocks
+    .replace(/\u0001/g, '<mark class="search-hit-mark">')
+    .replace(/\u0002/g, '</mark>');
+}
+
+function searchJumpHref(doc) {
+  const loc = doc.locator || {};
+  const work = encodeURIComponent(doc.work || '');
+  if (doc.source_type === 'setting' || loc.kind === 'setting') {
+    return `#/work/${work}/creation/setting`;
+  }
+  if (loc.kind === 'volume') {
+    return `#/work/${work}/creation/volume/${encodeURIComponent(String(loc.vol || 1))}`;
+  }
+  const chapterId = loc.chapter_id;
+  if (chapterId) {
+    return `#/work/${work}/creation/brief/${encodeURIComponent(String(chapterId))}`;
+  }
+  return '';
+}
+
+async function renderSearchHit() {
+  setTab('search');
+  const params = searchHashParams();
+  const docId = params.get('id') || '';
+  const q = params.get('q') || '';
+  const offset = Number(params.get('o') || 0);
+  const length = Number(params.get('l') || 0);
+  if (!docId) return renderSearch();
+
+  view.innerHTML = `<div class="search-page"><div class="muted">正在读取命中内容…</div></div>`;
+  let doc;
+  try {
+    doc = await getJSON('/api/search/doc?id=' + encodeURIComponent(docId));
+  } catch (e) {
+    view.innerHTML = `<div class="search-page">
+      ${notice('bad', `读取失败：${esc(e.message)}`)}
+      <a class="btn" href="#/search?q=${encodeURIComponent(q)}">返回检索</a>
+    </div>`;
+    return;
+  }
+
+  const full = String(doc.raw || '');
+  let raw = full;
+  let base = 0;
+  let truncated = false;
+  if (full.length > 20000) {
+    base = Math.max(0, Math.min(full.length - 20000, offset - 5000));
+    raw = full.slice(base, base + 20000);
+    truncated = true;
+  }
+  const localOffset = offset - base;
+  const paragraph = searchParagraphAt(raw, localOffset);
+  const jump = searchJumpHref(doc);
+  const jumpLabel = doc.source_type === 'setting' ? '打开设定集' : '打开创作台 · 这一章';
+
+  view.innerHTML = `
+    <div class="search-page">
+      <div class="search-hit-nav">
+        <a href="#/search?q=${encodeURIComponent(q)}">← 返回检索</a>
+        <span class="muted">${esc(doc.work)} · ${esc(searchTypeLabel(doc.source_type))} · ${esc(doc.ref || '')}</span>
+        ${jump ? `<a class="btn sm" href="${jump}">${jumpLabel}</a>` : ''}
+      </div>
+      <div class="search-hit-title">
+        <h1>${esc(doc.title || doc.ref || doc.doc_id)}</h1>
+        <p class="muted">定位：第 ${paragraph + 1} 段 · 偏移 ${localOffset}${truncated ? '（原文较长，只显示命中附近 2 万字）' : ''}</p>
+      </div>
+      <div class="hit-body">${searchMarkedHtml(raw, localOffset, length)}</div>
+    </div>`;
+
+  requestAnimationFrame(() => {
+    const mark = document.querySelector('.hit-body mark');
+    if (mark) mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+}
+
 /* ── 路由 ──────────────────────────────────────────────── */
 
 function setTab(name) {
@@ -10267,6 +10619,13 @@ function route() {
       stopTaskPolling();
       chapterState.data = null;
       return renderImport();
+    }
+    if (parts[0] === 'search') {
+      stopTaskPolling();
+      chapterState.data = null;
+      // 路由按 '/' 切，查询串会粘在最后一段上：`hit?id=...`。
+      if ((parts[1] || '').split('?')[0] === 'hit') return renderSearchHit();
+      return renderSearch();
     }
     if (parts[0] === 'genres') return renderGenreLab();
     if (parts[0] === 'help') return renderHelp();

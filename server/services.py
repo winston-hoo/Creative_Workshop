@@ -48,6 +48,11 @@ class Paths:
     def uploads(self) -> Path:
         return self.root / UPLOAD_ROOT_NAME
 
+    @property
+    def index_dir(self) -> Path:
+        """全文索引目录。派生数据，不进版本管理，删掉即可重建。"""
+        return self.root / ".index"
+
     def work_dir(self, name: str) -> Path:
         return self.workspaces / name
 
@@ -5275,3 +5280,47 @@ def creation_story_gates(paths: Paths, name: str) -> dict[str, Any]:
 
     errors, warnings = story_gates(_creation_work_dir(paths, name))
     return {"errors": errors, "warnings": warnings}
+
+
+# ── 全文检索 ────────────────────────────────────────────────
+#
+# 检索是纯本地索引，不调用模型。这里只做薄封装，业务在 workshop.search。
+
+
+def search_status(paths: Paths, *, sync_first: bool = False) -> dict[str, Any]:
+    from workshop import search
+
+    return search.status(paths.root, sync_first=sync_first)
+
+
+def search_query(
+    paths: Paths,
+    text: str,
+    *,
+    source_types: str = "",
+    work: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    from workshop import search
+
+    return search.query(
+        paths.root,
+        text,
+        source_types=source_types,
+        work=work,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def search_load_doc(paths: Paths, doc_id: str) -> dict[str, Any] | None:
+    from workshop import search
+
+    return search.load_doc(paths.root, doc_id)
+
+
+def search_sync(paths: Paths, *, force: bool = False) -> dict[str, Any]:
+    from workshop import search
+
+    return search.sync(paths.root, force=force)

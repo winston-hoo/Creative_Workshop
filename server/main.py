@@ -31,6 +31,10 @@
   GET    /api/works/{name}/entities          最近一次实体统计
   GET    /api/works/{name}/outline           最近一次大纲
   GET    /api/works/{name}/report            生成并落盘体检报告
+  GET    /api/search                        全文检索（本地索引，不调模型）
+  GET    /api/search/status                 索引状态
+  GET    /api/search/doc                    命中页读取单条文档
+  POST   /api/search/sync                   手动同步索引
   POST   /api/import/upload              上传文件并返回切分预览（不落盘）
   POST   /api/import/commit              确认导入（落盘）
   DELETE /api/import/{token}             丢弃这次上传
@@ -1503,6 +1507,52 @@ def index() -> HTMLResponse:
         version = str(asset.stat().st_mtime_ns) if asset.exists() else "0"
         html = html.replace(placeholder, version)
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+
+# ── 全文检索 ────────────────────────────────────────────────
+#
+# 检索只读本地索引，**不调用模型**。每次查询前先做一轮增量同步，
+# 所以改完章节/设定不用重启服务，下一次搜索就能命中。
+
+
+@app.get("/api/search")
+def api_search(
+    q: str = Query("", description="关键词，支持中文/英文/编号混排"),
+    source_type: str = Query("", alias="type", description="来源类型，逗号分隔"),
+    work: str | None = Query(None, description="只查某部作品"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    work_name = safe_name(work) if work else None
+    return services.search_query(
+        PATHS,
+        q,
+        source_types=source_type,
+        work=work_name,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/search/status")
+def api_search_status(refresh: bool = Query(False)) -> dict:
+    """索引状态。`refresh=true` 会先同步再返回（页面上的「重建索引」）。"""
+    return services.search_status(PATHS, sync_first=refresh)
+
+
+@app.get("/api/search/doc")
+def api_search_doc(id: str = Query(..., min_length=1, description="文档 id")) -> dict:
+    """命中页读取单条文档的原始文本与定位信息。"""
+    doc = services.search_load_doc(PATHS, id)
+    if doc is None:
+        raise HTTPException(404, "索引里找不到这条文档，可能文件已被删除")
+    return doc
+
+
+@app.post("/api/search/sync")
+def api_search_sync(force: bool = Query(False)) -> dict:
+    """手动同步索引。`force=true` 无视指纹，全部重新抽取。"""
+    return services.search_sync(PATHS, force=force)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

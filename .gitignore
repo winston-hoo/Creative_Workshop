@@ -18,6 +18,9 @@ config/annotations/
 # 上传暂存与临时工作区：里面是整本原文
 .tmp/
 
+# 全文检索索引：派生缓存，删掉后下次检索自动重建，不进版本管理
+.index/
+
 # 自检产生的模拟报告（跑一次生成一批，没有留存价值）
 config/probe-reports/_selftest/
 
