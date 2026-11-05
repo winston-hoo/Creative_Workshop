@@ -3854,7 +3854,7 @@ def run_draft(
     setup_logging(store.known_values)
     client = _build_client(cfg, provider, store)
     plan_client = client if plan_provider.id == provider.id else _build_client(
-        paths, cfg, plan_provider, store
+        cfg, plan_provider, store
     )
     block, _missing = _setting_refs_block(paths, refs or [], level)
     _ctx, _report = _draft_context_bundle(ctx, budget_chars=budget_chars)
@@ -3949,6 +3949,14 @@ def run_draft(
         return payload
 
     def on_round(row: dict[str, Any]) -> None:
+        # E2：每次调用都带上是哪个服务商、哪个模型。只写阶段名不够——
+        # 一旦阶段与默认绑定不同，账本上就对不上「这行到底是谁花的钱」。
+        if row.get("stage") == "beats":
+            row.setdefault("provider", plan_provider.id)
+            row.setdefault("model", plan_model)
+        else:
+            row.setdefault("provider", provider.id)
+            row.setdefault("model", model)
         calls.append(row)
         if task is not None:
             label = "细纲" if row.get("stage") == "beats" else (
@@ -4391,8 +4399,11 @@ def review_draft(
     }
     review_mod.append_review(ctx["work_dir"], chapter_id, entry)
 
+    call_meta = dict(result["call"] or {})
+    call_meta["provider"] = provider.id
+    call_meta["model"] = model
     _append_manifest_call(
-        ctx["work_dir"], chapter_id, result["call"],
+        ctx["work_dir"], chapter_id, call_meta,
         review_meta={
             "review_id": entry["review_id"],
             "items": len(entry["items"]),
@@ -4711,7 +4722,10 @@ def extract_notes(
                 "vol": vol_no, "chars": len(prose)},
         replace=True, call=result["call"],
     )
-    _append_manifest_call(ctx["work_dir"], chapter_id, result["call"])
+    call_meta = dict(result["call"] or {})
+    call_meta["provider"] = provider.id
+    call_meta["model"] = model
+    _append_manifest_call(ctx["work_dir"], chapter_id, call_meta)
     state = notes_state(paths, name, chapter_id)
     return {
         "ok": True, "chapter_id": chapter_id,
