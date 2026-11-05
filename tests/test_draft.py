@@ -27,6 +27,7 @@ from workshop.draft import (  # noqa: E402
     save_draft,
     strip_wrapping,
 )
+from workshop.llm import MAX_TOKENS_CAP  # noqa: E402
 
 _failures: list[str] = []
 
@@ -271,10 +272,13 @@ def test_derive_max_tokens() -> None:
 
     cases = [
         ([800, 1000], {"max_output": 384000}, MIN_OUTPUT_TOKENS, "小目标落到下限"),
-        ([2800, 4000], {"max_output": 384000}, 5034, "常规章节"),
+        ([2800, 4000], {"max_output": 384000}, 5034, "常规章节不受全局上限影响"),
         ([2800, 4000], {"max_output": 3000}, 3000, "模型上限更小时听模型的"),
-        ([20000, 30000], {"max_output": 384000}, 37752, "大目标按比例放大"),
-        ([400000, 500000], {"max_output": 384000}, 384000, "超过模型上限就截到上限"),
+        ([20000, 30000], {"max_output": 384000}, MAX_TOKENS_CAP, "声明值大于 32000 时截到全局上限"),
+        ([20000, 30000], {"max_output": 30000}, 30000, "声明值小于 32000 时取模型值"),
+        ([20000, 30000], {"max_output": 40000}, MAX_TOKENS_CAP, "声明值略大于 32000 也截到 32000"),
+        ([400000, 500000], {"max_output": 384000}, MAX_TOKENS_CAP, "极端目标受全局上限约束"),
+        ([20000, 25429], {"max_output": 384000}, 32000, "正好卡在 32000 边界"),
         ([2800, 4000], None, 5034, "没声明上限时按常规算"),
         ([50000, 80000], None, 32000, "没声明上限时受全局上限约束"),
     ]
@@ -286,6 +290,7 @@ def test_derive_max_tokens() -> None:
     check(derive_max_tokens([1000, 2000], {"max_output": 384000}) == 2517, "取整四舍五入")
     check(derive_max_tokens(None, {"max_output": 384000}) == 5034, "没给区间按 2800–4000")
     check(MIN_OUTPUT_TOKENS >= 2048, "下限足够一次写完一章（不会回到 1200）")
+    check(MAX_TOKENS_CAP == 32000, "全局上限是配置里的 32000，不另写常数")
 
 
 def test_check_draft_deviation_fields() -> None:

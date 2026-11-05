@@ -276,7 +276,8 @@ CONTINUE_INSTRUCTION = (
 # 实测教训：首轮只给 1200 输出 token，写到一半就被截断，续写一轮等于把整段上下文
 # 再发一次（两轮 prompt token 合计 22,934，输入侧几乎翻倍），比一次给足更贵。
 # 系数 0.968 来自探测报告的中文 token/字实测值；1.3 是标点与轻度扩写的余量；
-# 下限 2048 兜住小目标，上限不超过模型声明的 max_output。
+# 下限 2048 兜住小目标。上限取「模型声明的 max_output」与全局 MAX_TOKENS_CAP 的较小值：
+# 本机配置里声明的 384000 明显大于上游实际可用输出，直接当真没有意义。
 CJK_TOKENS_PER_CHAR = 0.968
 OUTPUT_TOKEN_MARGIN = 1.3
 MIN_OUTPUT_TOKENS = 2048
@@ -300,7 +301,8 @@ def derive_max_tokens(
         declared = int((model_cfg or {}).get("max_output") or 0)
     except (TypeError, ValueError):
         declared = 0
-    cap = declared if declared > 0 else MAX_TOKENS_CAP
+    # 声明值只作为「更小的上限」来用，不把它直接当真；全局上限始终生效。
+    cap = min(declared, MAX_TOKENS_CAP) if declared > 0 else MAX_TOKENS_CAP
     # 模型声明的上限必须遵守；只有它低于下限时才让步，否则请求本身会被上游拒绝。
     if cap >= MIN_OUTPUT_TOKENS:
         return int(min(size, cap))
