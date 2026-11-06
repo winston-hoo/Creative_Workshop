@@ -2342,6 +2342,11 @@ const creationState = {
   refs: [],
   refsLevel: 'k3',          // none / k3 / full —— 默认中间档
   refsInitialized: false,   // 默认勾选只做一次，之后尊重作者的取消
+  // P0/P1：生成任务、审稿/要点/定稿/版本面板的状态（面板与工作区一起搬过来的）
+  proseTask: null, proseTaskLoaded: false, proseTaskTimer: null,
+  wsLoadedFor: '',
+  proseReview: null, proseNotes: null, proseFinalize: null, proseVersions: null,
+  wbLastApply: null, notesBusyAt: 0,
 };
 
 /* 视角只有这三种，后端 validate_setting 也按这三个词卡（creation._PERSPECTIVES 是同一份）。
@@ -4020,6 +4025,7 @@ function creationRenderDraft() {
       <button class="btn primary" id="draft-go" ${plan.ready ? '' : 'disabled'}>
         ${plan.has_draft && plan.ready ? '重写这一章' : '写这一章'}${plan.ready ? `（${cost}）` : ''}</button>
     </div>
+    <div id="creation-task-host">${creationRenderTask(creationState.proseTask)}</div>
     <div id="draft-note" style="margin-top:8px"></div>
   </div>`;
 }
@@ -4070,6 +4076,7 @@ function creationRenderDraftResult() {
 
 function creationBindDraft() {
   if (creationState.kind !== 'brief' || !creationState.key) return;
+  creationBindWorkspace();
   if (!creationState.prosePlan) {
     getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}/plan`)
@@ -4160,36 +4167,43 @@ async function draftWriteback() {
   }
 }
 
-async function draftGenerate() {
+async function draftGenerate(options = {}) {
   const btn = document.getElementById('draft-go');
   const note = document.getElementById('draft-note');
-  btn.disabled = true;
-  btn.textContent = '写着呢…（长篇会慢，可能要一两分钟）';
+  const forceBeats = !!document.getElementById('draft-force-beats')?.checked;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '正在启动…';
+  }
+  if (note) note.innerHTML = '';
   try {
-    const res = await postJSON(
+    const task = await postJSON(
       `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
       + `${encodeURIComponent(creationState.key)}`,
-      { refs: creationState.refs, level: creationState.refsLevel }
+      {
+        refs: creationState.refs, level: creationState.refsLevel,
+        force_beats: forceBeats,
+        resume_candidate: options.resumeCandidate || '',
+      }
     );
-    if (!res.ok) {
-      note.innerHTML = notice('bad', `没写成：${esc(res.error || '未知原因')}`);
-      return;
-    }
-    creationState.prose = {
-      exists: true, text: res.text, errors: res.errors, warnings: res.warnings,
-      stats: res.stats, meta: { model: creationState.prosePlan.model, usage: res.usage },
-    };
-    note.innerHTML = notice('ok',
-      `写完并已落盘：${num(res.stats.chars)} 字。${(res.errors || []).length
-        ? `有 ${res.errors.length} 项要处理，看下面。` : '自检没发现问题。'}`);
-    creationLoad();
+    creationState.proseTask = task;
+    updateProseTaskPanel();
+    pollProseTask(task.task_id);
   } catch (e) {
-    note.innerHTML = notice('bad', esc(e.message));
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '写这一章';
+    if (note) note.innerHTML = notice('bad', `没能开始：${esc(e.message)}`);
+    if (btn) {
+      btn.disabled = !(creationState.prosePlan || {}).ready;
+      btn.textContent = '写这一章';
+    }
   }
 }
+
+/* 伏笔账：作者最需要的一句话是「现在还有几条挂着没收」。
+   链路校验只管单条对不对，回答不了这个。 */
+/* 人物动向：长篇最隐蔽的失败不是写错，是**写着写着人不见了**。
+   「连续缺席 N 章」就是那个信号，按它排序，最上面就该处理。 */
+/* 全书梗概：从三层真源**渲染**，不是单独存的一份。
+   所以它永远跟着真源走——改了大纲或指令，这里立刻跟着变，不会像"另存一份梗概"那样过期。 */
 
 async function draftSave() {
   const ta = document.getElementById('draft-text');
@@ -4349,7 +4363,8 @@ function creationRenderEditor(read) {
     return creationRenderSuggest()
       + creationRenderForm(creationState.draft)
       + creationRenderDraft()
-      + creationRenderDraftResult();
+      + creationRenderDraftResult()
+      + creationRenderWorkspace();
   }
   return `<section class="sec">
     <div class="sec-head">
@@ -4364,6 +4379,1426 @@ function creationRenderEditor(read) {
       <div id="creation-check" style="margin-top:10px">${creationRenderCheck(read.errors, read.warnings)}</div>
     </div>
   </section>`;
+}
+
+function creationRenderBudget(report) {
+  if (!report || !Array.isArray(report.blocks) || !report.blocks.length) return '';
+  const budget = Math.max(1, Number(report.budget_chars) || 0);
+  const used = Number(report.used_chars) || 0;
+  const pct = (n) => `${Math.max(0, Math.min(100, (Number(n) || 0) / budget * 100)).toFixed(3)}%`;
+  const cls = (b) => (b.status === 'trimmed' ? 'bud-trim'
+    : b.status === 'omitted' ? 'bud-off'
+      : b.kind === 'required' ? 'bud-req' : 'bud-opt');
+  const label = (s) => ({ included: '已注入', trimmed: '按预算截断', omitted: '未注入' }[s] || s || '—');
+  const segs = (report.blocks || []).filter((b) => (b.chars || 0) > 0).map((b) =>
+    `<span class="bud-seg ${cls(b)}" style="width:${pct(b.chars)}"`
+    + ` title="${esc(b.label)}：${num(b.chars)} 字"></span>`).join('');
+  const rest = Math.max(0, budget - used);
+  const restSeg = rest > 0
+    ? `<span class="bud-seg bud-rest" style="width:${pct(rest)}"`
+      + ` title="预算未用完：${num(rest)} 字"></span>` : '';
+  const rows = (report.blocks || []).map((b) => `
+    <details class="bud-row ${esc(b.status || '')}">
+      <summary>
+        <span class="bud-dot ${cls(b)}"></span>
+        <span class="bud-name">${esc(b.label || b.id)}</span>
+        <span class="bud-kind">${b.kind === 'required' ? '必需' : '可选'}</span>
+        <span class="bud-nums">${num(b.chars || 0)} / ${num(b.original_chars || 0)} 字</span>
+        <span class="bud-status">${esc(label(b.status))}</span>
+      </summary>
+      <div class="bud-detail">
+        <p style="margin:0">${esc(b.reason || '没有记录原因')}</p>
+        ${b.source ? `<p class="muted" style="margin:4px 0 0">来源：<code>${esc(b.source)}</code></p>` : ''}
+        ${b.sha256 ? `<p class="muted" style="margin:4px 0 0">原文指纹：<code>${esc(String(b.sha256).slice(0, 12))}</code></p>` : ''}
+      </div>
+    </details>`).join('');
+  const exact = report.exact === false
+    ? notice('warn', '这份预算账对不上：块字数与总注入字数不一致，先别信它。') : '';
+  return `<div class="bud-box">
+    <div class="spread" style="align-items:baseline">
+      <b>写前必读预算</b>
+      <span class="muted" style="font-size:12px">
+        用了 ${num(used)} / ${num(budget)} 字${rest > 0 ? `，还剩 ${num(rest)} 字` : '，预算已用满'}
+      </span>
+    </div>
+    <div class="bud-bar" role="img"
+      aria-label="上下文预算占用 ${num(used)} / ${num(budget)} 字">${segs}${restSeg}</div>
+    <div class="bud-legend">
+      <span><i class="bud-dot bud-req"></i>必需</span>
+      <span><i class="bud-dot bud-opt"></i>可选</span>
+      <span><i class="bud-dot bud-trim"></i>被截断</span>
+      <span><i class="bud-dot bud-rest"></i>未用完</span>
+      <span class="muted">点任一块看原因与来源</span>
+      <span class="muted">只算这 8 块；设定集/卷表/本章指令/参照素材不在这 8000 字里，见上方 token 估算</span>
+    </div>
+    ${exact}
+    <div class="bud-list">${rows}</div>
+  </div>`;
+}
+
+/* U5：调用账。细纲、正文首轮、每一轮续写各花多少，必须分开列——
+   合起来只给一个总数的话，作者看到费用翻倍，却不知道钱花在「多写了一次细纲」
+   还是「模型复读了三轮」。数据和 manifest 的 calls 是同一份。 */
+function creationRenderCallLedger(calls, stats) {
+  if (!Array.isArray(calls) || !calls.length) return '';
+  const wr = (stats && Array.isArray(stats.word_range)) ? stats.word_range : null;
+  const wordText = wr
+    ? ` · 字数 ${num(stats.chars)} / 目标 ${num(wr[0])}–${num(wr[1])}`
+      + (stats.in_range === false
+        ? `（${stats.deviation_kind === 'short' ? '短' : '长'} ${num(Math.abs(Number(stats.deviation) || 0))} 字）`
+        : '')
+    : '';
+  const label = (r) => (r.stage === 'beats' ? '写前细纲'
+    : r.stage === 'continue' ? `续写第 ${Number(r.round) || 1} 轮`
+      : '正文首轮');
+  const finish = (f) => ({ length: '截断 length', max_tokens: '截断 max_tokens', stop: '写完 stop' }[f]
+    || f || '—');
+  const rows = calls.filter(Boolean).map((r) => `
+    <tr class="${r.error_code ? 'ledger-bad' : ''}">
+      <td>${esc(label(r))}</td>
+      <td>${num(r.new_chars || r.chars || 0)} 字${r.total_chars ? `<span class="muted"> / 累计 ${num(r.total_chars)}</span>` : ''}</td>
+      <td>${num(r.prompt_tokens || 0)} + ${num(r.completion_tokens || 0)}</td>
+      <td>${esc(finish(r.finish_reason))}</td>
+      <td>${r.elapsed_ms ? `${(Number(r.elapsed_ms) / 1000).toFixed(1)}s` : '—'}</td>
+      <td class="muted">${r.dedupe && r.dedupe.overlap_removed
+        ? `去重 ${num(r.dedupe.overlap_removed)} 字` : ''}${r.error_code ? ` ${esc(r.error_code)}` : ''}</td>
+    </tr>`).join('');
+  return `<div class="ledger">
+    <div class="spread" style="align-items:baseline">
+      <b>调用账本</b>
+      <span class="muted" style="font-size:12px">共 ${calls.length} 次调用；续写与细纲各占一行${wordText}</span>
+    </div>
+    <table class="ledger-table">
+      <thead><tr><th>用途</th><th>本轮新增</th><th>token 入+出</th><th>结束原因</th><th>耗时</th><th>去重/错误</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+function creationRenderBeats(info) {
+  if (!info) return '';
+  const beats = Array.isArray(info.beats) ? info.beats : [];
+  const status = info.stale
+    ? notice('warn', '指令改过了，这份细纲已过期；下次生成会重新拆，不会拿旧计划写新章。')
+    : '';
+  const body = beats.length ? beats.map((b) => `
+    <div class="beat-row">
+      <span class="beat-no">${Number(b.no) || 0}</span>
+      <div><b>${esc(b.title || '（无标题）')}</b>
+        <p style="margin:2px 0 0">${esc(b.goal || '')}</p>
+        ${(b.must || []).length ? `<p class="muted" style="margin:2px 0 0">必须写到：${esc(b.must.join('、'))}</p>` : ''}
+      </div>
+    </div>`).join('') : `<p class="muted" style="margin:6px 0 0">
+      还没有细纲。第一次生成时会先花一次短调用拆 5–8 个节拍，再写正文。</p>`;
+  return `<div class="beats-box">
+    <div class="spread" style="align-items:baseline">
+      <b>写前细纲</b>
+      <span class="muted" style="font-size:12px">
+        ${info.count ? `${info.count} 个节拍` : '未生成'}
+        ${info.source ? ` · ${({ model: '本次生成', reused: '复用已落盘', failed: '生成失败已回退' }[info.source] || info.source)}` : ''}
+        ${info.saved_at ? ` · ${esc(info.saved_at)}` : ''}
+      </span>
+    </div>
+    ${status}
+    ${info.source === 'failed' ? notice('warn', `细纲失败已回退：${esc(info.error || '未知原因')}`) : ''}
+    <div class="beat-list">${body}</div>
+    ${beats.length ? `<label class="muted" style="display:block;margin-top:8px;font-size:12px">
+      <input type="checkbox" id="draft-force-beats"> 重写时重新拆细纲（指令没改也能强制重做）</label>` : ''}
+  </div>`;
+}
+
+const PROSE_STAGES = ['装配材料', '写前细纲', '正文生成', '自检与落盘'];
+
+function creationRenderTask(task) {
+  if (!task || !task.status || task.status === 'idle') return '';
+  const running = task.status === 'running' || task.status === 'cancelling';
+  const failed = task.status === 'failed' || task.status === 'interrupted';
+  const stopped = failed || task.status === 'cancelled';
+  const idx = Number(task.stage_index) || 0;
+  const steps = PROSE_STAGES.map((name, i) => {
+    const done = task.status === 'done' || (task.status !== 'failed' && task.status !== 'cancelled'
+      && task.status !== 'interrupted' && i < idx);
+    const now = running && i === idx;
+    return `<li class="${done ? 'task-done' : now ? 'task-now' : (stopped && i === idx ? 'task-stop' : '')}">
+      <i></i><span>${esc(name)}</span></li>`;
+  }).join('');
+  const round = Number(task.round) || 0;
+  const maxRounds = Number(task.max_rounds) || 0;
+  const roundText = (idx >= 2 && (round > 0 || running))
+    ? `正文第 ${round + 1} 次调用${maxRounds ? `（续写上限 ${maxRounds} 轮）` : ''}`
+    : '';
+  const eta = task.elapsed_ms ? `${(Number(task.elapsed_ms) / 1000).toFixed(1)}s` : '';
+  const statusText = ({
+    running: '正在跑', cancelling: '正在停…', done: '完成',
+    failed: `失败${task.error_code ? ` · ${task.error_code}` : ''}`,
+    cancelled: '已取消', interrupted: '中断',
+  }[task.status] || task.status);
+  return `<div class="task-box ${failed ? 'task-box-bad' : task.status === 'done' ? 'task-box-ok' : ''}">
+    <div class="spread" style="align-items:baseline">
+      <b>生成进度：${esc(statusText)}</b>
+      <span class="muted" style="font-size:12px">${eta}${roundText ? ` · ${esc(roundText)}` : ''}</span>
+    </div>
+    <ul class="task-steps">${steps}</ul>
+    <p class="muted" style="margin:4px 0 0;font-size:12px">${esc(task.message || '')}</p>
+    ${task.chars ? `<p class="muted" style="margin:4px 0 0;font-size:12px">已写 ${num(task.chars)} 字</p>` : ''}
+    ${failed ? notice('bad',
+      `<b>${esc(task.error_code || 'failed')}</b>：${esc(task.error || task.message || '未知原因')}`
+      + (task.action ? `<br><span class="muted">建议：${esc(task.action)}</span>` : '')) : ''}
+    ${task.status === 'cancelled'
+      ? notice('warn', '已取消。服务端已停止模型调用，正式稿没有被覆盖。') : ''}
+    ${task.status === 'interrupted'
+      ? notice('warn', '服务重启导致中断。已写内容在候选里；可以「从断点继续」或重新生成。') : ''}
+    ${task.candidate_id ? `<p class="muted" style="margin:4px 0 0;font-size:12px">
+      候选已保留：<code>${esc(task.candidate_id)}</code>（见下方恢复候选）</p>` : ''}
+    ${running && task.cancellable ? '<div class="row" style="justify-content:flex-end;margin-top:6px"><button class="btn" id="draft-cancel">停止生成</button></div>' : ''}
+    ${creationRenderCallLedger(task.calls || [], task.stats || null)}
+  </div>`;
+}
+
+function creationRenderRecovery() {
+  const v = creationState.proseVersions;
+  if (!v) return '';
+  const cands = v.candidates || [];
+  const versions = v.versions || [];
+  if (!cands.length && !versions.length) return '';
+  const candRows = cands.map((c) => `<div class="recover-row">
+    <div>
+      <b>${num(c.chars || 0)} 字</b>
+      <span class="muted"> · ${esc(c.created_at || '')}</span>
+      <p class="muted" style="margin:2px 0 0;font-size:12px">${esc(c.reason || '')}</p>
+    </div>
+    <div class="row">
+      <button class="btn" data-resume-candidate="${esc(c.candidate_id)}">从断点继续</button>
+      <button class="btn" data-promote-candidate="${esc(c.candidate_id)}">转正为正文</button>
+    </div>
+  </div>`).join('');
+  const verRows = versions.map((r) => `<div class="recover-row">
+    <div>
+      <b>${num(r.chars || 0)} 字</b>
+      <span class="muted"> · ${esc(r.created_at || '')} · ${esc(r.reason || '')}</span>
+      <p class="muted" style="margin:2px 0 0;font-size:12px"><code>${esc(r.version_id)}</code></p>
+    </div>
+    <button class="btn" data-restore-version="${esc(r.version_id)}">恢复到此版本</button>
+  </div>`).join('');
+  return `<div class="recover-box">
+    <b>恢复候选与历史版本</b>
+    <p class="muted" style="margin:4px 0 8px;font-size:12px">
+      候选是失败/中断/截断时留下的半截正文，可转正或从断点继续；版本是每次成功覆盖前自动备份的。</p>
+    ${cands.length ? `<div class="recover-title">候选（${cands.length}）</div>${candRows}` : ''}
+    ${versions.length ? `<div class="recover-title">历史版本（${versions.length}）</div>${verRows}` : ''}
+  </div>`;
+}
+
+/* 字数偏离：升级成一张卡片，而不是埋在 warnings 列表里的普通一条。
+   **只提示，不自动补写**：补写要多花一次调用，作者没点头不花钱。 */
+function creationRenderWordDeviation(stats) {
+  if (!stats || !Array.isArray(stats.word_range) || stats.word_range.length !== 2) return '';
+  const chars = Number(stats.chars) || 0;
+  const low = Number(stats.word_range[0]) || 0;
+  const high = Number(stats.word_range[1]) || 0;
+  const short = chars < low;
+  const long = chars > high;
+  if (!short && !long) return '';
+  const delta = short ? low - chars : chars - high;
+  const pct = Number(stats.deviation_pct);
+  return notice('warn',
+    `<b>字数偏离目标：${short ? '短了' : '长了'} ${num(delta)} 字</b>`
+    + (Number.isFinite(pct) && pct > 0 ? `（${num(pct)}%）` : '')
+    + `<br>目标 ${num(low)}–${num(high)} 字，实际 ${num(chars)} 字。`
+    + (short ? '多半是没写完或提前收尾，读的时候留意结尾有没有断。'
+      : '超出上限不一定是错，但多半夹了可以删的铺陈。')
+    + '<span class="muted">　只提示，不会自动补写（自动补写会再花一次调用）。</span>');
+}
+
+function clearProseTaskTimer() {
+  if (creationState.proseTaskTimer) {
+    clearTimeout(creationState.proseTaskTimer);
+    creationState.proseTaskTimer = null;
+  }
+}
+
+function bindProseTaskActions() {
+  const btn = document.getElementById('draft-cancel');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const task = creationState.proseTask;
+    if (!task || !task.task_id) return;
+    btn.disabled = true;
+    btn.textContent = '正在停…';
+    try {
+      // 这里必须调服务端接口：只断前端轮询等于没停，上游还在烧 token。
+      creationState.proseTask = await postJSON(`/api/tasks/${encodeURIComponent(task.task_id)}/cancel`, {});
+      updateProseTaskPanel();
+      pollProseTask(task.task_id);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '停止生成';
+      await tellUser('取消失败', `<p style="margin:0">${esc(e.message)}</p>`);
+    }
+  };
+}
+
+function updateProseTaskPanel() {
+  const host = document.getElementById('creation-task-host');
+  if (host) host.innerHTML = creationRenderTask(creationState.proseTask);
+  bindProseTaskActions();
+  const go = document.getElementById('draft-go');
+  const running = creationState.proseTask
+    && ['running', 'cancelling'].includes(creationState.proseTask.status);
+  if (go) {
+    go.disabled = running || !(creationState.prosePlan || {}).ready;
+    if (running) go.textContent = '正在生成…';
+  }
+}
+
+function pollProseTask(taskId) {
+  clearProseTaskTimer();
+  const tick = async () => {
+    try {
+      const task = await getJSON(`/api/tasks/${encodeURIComponent(taskId)}`);
+      creationState.proseTask = task;
+      updateProseTaskPanel();
+      const done = ['done', 'failed', 'cancelled', 'interrupted'].includes(task.status);
+      if (done) {
+        // 结束后重新取计划/正文/候选：调用账、细纲、错误码都来自服务端落盘结果。
+        creationState.prosePlan = null;
+        creationState.prosePlanError = null;
+        creationState.prose = null;
+        // 新一轮生成落盘了：审稿/要点/版本都可能跟着变，工作区必须重新取一遍。
+        creationState.wsLoadedFor = '';
+        loadProseVersions();
+        creationLoad();
+        return;
+      }
+    } catch (e) {
+      // 轮询失败不要静默定成完成：可能只是这一秒网络抖了，下一轮继续。
+    }
+    creationState.proseTaskTimer = setTimeout(tick, 1000);
+  };
+  creationState.proseTaskTimer = setTimeout(tick, 1000);
+}
+
+function loadProseVersions() {
+  if (creationState.kind !== 'brief' || !creationState.key) return;
+  const chapter = creationState.key;
+  getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+    + `${encodeURIComponent(chapter)}/versions`)
+    .then((v) => {
+      if (creationState.key !== chapter) return;
+      creationState.proseVersions = v;
+      const host = document.getElementById('creation-recovery-host');
+      if (host) host.innerHTML = creationRenderRecovery();
+      bindRecoveryActions();
+      // 工作台里的版本面板是同一份数据画的，异步回来也要跟着重画一次；
+      // 已经画出来的逐段对比保留下来，不让它闪一下消失。
+      const wbHost = document.getElementById('wb-vers-host');
+      if (wbHost) {
+        const prevDiff = wbHost.querySelector('#wb-diff-out');
+        const keep = prevDiff ? prevDiff.innerHTML : '';
+        wbHost.innerHTML = wbVersionPanel();
+        if (keep) {
+          const out = wbHost.querySelector('#wb-diff-out');
+          if (out) out.innerHTML = keep;
+        }
+        wbBindVersionPanel();
+      }
+    })
+    .catch(() => {});
+}
+
+function bindRecoveryActions() {
+  const box = document.getElementById('creation-recovery-host');
+  if (!box) return;
+  box.querySelectorAll('[data-promote-candidate]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const res = await postJSON(
+          `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+          + `${encodeURIComponent(creationState.key)}/candidates/`
+          + `${encodeURIComponent(btn.dataset.promoteCandidate)}/promote`, {});
+        creationState.prose = null;
+        creationState.prosePlan = null;
+        loadProseVersions();
+        creationLoad();
+        await tellUser('候选已转正', `<p style="margin:0">现在正文 ${num(res.chars || 0)} 字。</p>`);
+      } catch (e) {
+        await tellUser('转正失败', `<p style="margin:0">${esc(e.message)}</p>`);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
+  box.querySelectorAll('[data-restore-version]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const res = await postJSON(
+          `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+          + `${encodeURIComponent(creationState.key)}/versions/`
+          + `${encodeURIComponent(btn.dataset.restoreVersion)}/restore`, {});
+        creationState.prose = null;
+        creationState.prosePlan = null;
+        loadProseVersions();
+        creationLoad();
+        await tellUser('已恢复', `<p style="margin:0">现在正文 ${num(res.chars || 0)} 字。</p>`);
+      } catch (e) {
+        await tellUser('恢复失败', `<p style="margin:0">${esc(e.message)}</p>`);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
+  box.querySelectorAll('[data-resume-candidate]').forEach((btn) => {
+    btn.onclick = () => draftGenerate({ resumeCandidate: btn.dataset.resumeCandidate });
+  });
+}
+
+/* ── 正文审稿（P0 批次 3：D1/D2/D3/D5/U4）────────────────────
+   意见不是一段散文点评：每条都有「正文原句 + 偏移 + 问题 + 改写」。
+   界面要做的是让作者**看得到它指哪一句**、能逐条勾选/拒绝，
+   勾完写回正文时真的只动那几处（服务端按偏移替换，写前存版本）。
+
+   长正文（三五千字）下不能卡：这里只渲染每条的引文片段（前后各 40 字），
+   不把整章塞进每条卡片；定位用的是偏移，不是全页搜索。 */
+
+const REVIEW_STATUS_LABEL = {
+  open: '未处理', adopted: '已采纳', rejected: '已拒绝',
+  stale: '已过期', duplicate: '已处理过',
+};
+const REVIEW_SEV_LABEL = { blocker: '阻断', major: '主要', minor: '次要' };
+const DRAFT_STATUS_LABEL = { draft: '草稿', reviewed: '已审', final: '已定稿' };
+
+function creationRenderDraftStatus(status) {
+  const s = (status && status.status) || 'draft';
+  const label = DRAFT_STATUS_LABEL[s] || s;
+  return `<span class="draft-status ds-${esc(s)}">${esc(label)}</span>`;
+}
+
+function reviewChapterUrl(suffix) {
+  return `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+    + `${encodeURIComponent(creationState.key)}${suffix || ''}`;
+}
+
+function currentReviewId() {
+  const latest = creationState.proseReview && creationState.proseReview.latest;
+  return latest ? latest.review_id : '';
+}
+
+function reviewNote(text) {
+  const el = document.getElementById('review-note');
+  if (el) el.textContent = text || '';
+}
+
+/* 只显示引文左右各 40 字，并把原句包进 mark。
+   直接渲染整段甚至整章会让 12 张卡片各扛一份长文本，滚动时明显发涩。 */
+function reviewSnippet(text, item) {
+  const evidence = String(item.evidence || '');
+  const source = String(text || '');
+  let start = Number(item.start);
+  if (!(start >= 0) || source.slice(start, start + evidence.length) !== evidence) {
+    start = source.indexOf(evidence);
+  }
+  if (start < 0) return esc(evidence);
+  const from = Math.max(0, start - 40);
+  const to = Math.min(source.length, start + evidence.length + 40);
+  const before = source.slice(from, start).replace(/\s*\n\s*/g, ' ');
+  const after = source.slice(start + evidence.length, to).replace(/\s*\n\s*/g, ' ');
+  return `${from > 0 ? '…' : ''}${esc(before)}<mark>${esc(evidence)}</mark>`
+    + `${esc(after)}${to < source.length ? '…' : ''}`;
+}
+
+function creationRenderReview() {
+  const d = creationState.prose;
+  if (!d || !d.exists) return '';
+  const r = creationState.proseReview;
+  const status = (r && r.status && r.status.status)
+    || (d.status && d.status.status) || 'draft';
+  const busy = creationState.reviewBusyAt > 0;
+  const head = `<div class="spread" style="margin-bottom:8px">
+    <div>
+      <b>正文审稿</b> ${creationRenderDraftStatus({ status })}
+      <span class="muted" style="font-size:12px;margin-left:6px">
+        意见逐条定位到原句；采纳写回正文前自动存版本</span>
+    </div>
+    <div class="row" style="gap:6px">
+      ${busy
+        ? '<span class="muted" id="review-busy" style="font-size:12px">正在审…</span>'
+        : (status === 'final' ? ''
+          : `<button class="btn" id="review-run">${r && r.latest ? '再审一次…' : '审这一章正文…'}</button>`)}
+      ${status === 'reviewed' ? '<button class="btn primary" id="review-final">标为定稿</button>' : ''}
+      ${status === 'final' ? '<button class="btn" id="review-reopen">重新打开</button>' : ''}
+      ${status === 'draft'
+        ? '<button class="btn" id="review-final" disabled title="先审稿，才能定稿">标为定稿</button>' : ''}
+    </div>
+  </div>`;
+
+  if (!r) {
+    return `<div class="review-box" id="creation-review-inner">${head}
+      <p class="muted" style="margin:4px 0 0">正在读审稿记录…</p></div>`;
+  }
+  const latest = r.latest;
+  if (!latest) {
+    return `<div class="review-box" id="creation-review-inner">${head}
+      <p class="muted" style="margin:4px 0 0">
+        还没有审过这一章。点「审这一章正文…」让模型逐句找问题——会读完整章与技法维度，
+        通常几十秒；正文不会被改动，意见只列在下面，由你逐条选择。</p></div>`;
+  }
+
+  const text = d.text || '';
+  const stale = String(latest.prose_sha || '') !== String(r.prose_sha || '');
+  const items = latest.items || [];
+  const count = (s) => items.filter((i) => i.status === s).length;
+  const adoptable = items.filter((i) => i.adoptable);
+
+  const rows = items.map((item) => {
+    const stLabel = REVIEW_STATUS_LABEL[item.status] || item.status;
+    const sevLabel = REVIEW_SEV_LABEL[item.severity] || item.severity;
+    const pick = item.adoptable
+      ? `<label class="rv-pick"><input type="checkbox" data-pick="${esc(item.id)}"> 采纳</label>`
+      : `<span class="muted" style="font-size:12px">${esc(REVIEW_STATUS_LABEL[item.status] || '')}</span>`;
+    return `<div class="rv-item${item.adoptable ? '' : ' rv-dim'}" data-finding="${esc(item.id)}">
+      <div class="rv-head">
+        <span class="sev sev-${esc(item.severity)}">${esc(sevLabel)}</span>
+        <span class="rv-type">${esc(item.type_label || '')}</span>
+        <span class="rv-st st-${esc(item.status)}">${esc(stLabel)}</span>
+        <span class="grow"></span>
+        <span class="muted" style="font-size:12px">第 ${num(item.paragraph || 0)} 段</span>
+        ${pick}
+      </div>
+      <blockquote class="rv-quote">${reviewSnippet(text, item)}</blockquote>
+      <p class="rv-problem">${esc(item.problem || '')}</p>
+      ${item.status === 'duplicate' && item.repeat_reason
+        ? `<p class="muted" style="font-size:12px;margin:4px 0">不再重复提出：${esc(item.repeat_reason)}</p>` : ''}
+      ${item.adoptable ? `<textarea class="rv-edit" data-replacement="${esc(item.id)}"
+        rows="2" spellcheck="false">${esc(item.suggestion || '')}</textarea>` : ''}
+      <div class="row" style="justify-content:flex-end;gap:6px;margin-top:4px">
+        <button class="btn sm" data-locate="${esc(item.id)}">定位到正文</button>
+        ${['open', 'stale', 'duplicate'].includes(item.status)
+          ? `<button class="btn sm" data-reject="${esc(item.id)}">拒绝</button>` : ''}
+        ${item.status === 'rejected'
+          ? `<button class="btn sm" data-reopen="${esc(item.id)}"
+              title="解除抑制：下一次审稿会重新考虑这条">重新考虑</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const histRows = (r.reviews || []).slice(0, 8).map((x) => `<div class="rv-hist-row">
+    <code>${esc(x.review_id)}</code>
+    <span class="muted">${esc(when(x.created_at))} · ${num(x.count)} 条
+      · 采纳 ${num(x.counts.adopted || 0)} · 拒绝 ${num(x.counts.rejected || 0)}
+      · 未处理 ${num(x.counts.open || 0)}${x.stale ? ' · 正文已改，意见过期' : ''}</span>
+  </div>`).join('');
+
+  return `<div class="review-box" id="creation-review-inner">
+    ${head}
+    ${stale ? notice('warn', '正文在这次审稿之后改过，下面的条目已过期：'
+      + '定位和采纳都已关闭。要处理请先「再审一次」。') : ''}
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      ${esc(when(latest.created_at))} · ${num(latest.chars || 0)} 字 · ${num(items.length)} 条意见
+      ${(latest.invalid || []).length
+        ? ` · ${num(latest.invalid.length)} 条定位不到已丢弃` : ''}
+      · 未处理 ${num(count('open'))} · 已采纳 ${num(count('adopted'))}
+      · 已拒绝 ${num(count('rejected'))}
+      ${latest.summary ? `<br><b>总评：</b>${esc(latest.summary)}` : ''}
+    </div>
+    <div class="rv-list">${rows || '<p class="muted" style="margin:0">这次没提得出可执行的意见。</p>'}</div>
+    <div class="row" style="justify-content:flex-end;gap:8px;margin-top:8px">
+      <button class="btn" id="review-check-all" ${adoptable.length ? '' : 'disabled'}>
+        全选可采纳（${num(adoptable.length)}）</button>
+      <button class="btn primary" id="review-apply" ${adoptable.length ? '' : 'disabled'}>
+        采纳选中并写回</button>
+    </div>
+    <div id="review-note" class="muted" style="font-size:12px;margin-top:6px"></div>
+    ${histRows ? `<details class="rv-history"><summary>审稿历史（${(r.reviews || []).length} 次）</summary>
+      ${histRows}</details>` : ''}
+  </div>`;
+}
+
+function loadProseReview() {
+  if (creationState.kind !== 'brief' || !creationState.key) return Promise.resolve();
+  const chapter = creationState.key;
+  const render = () => {
+    const host = document.getElementById('creation-review-host');
+    if (!host) return;
+    host.innerHTML = creationRenderReview();
+    bindReviewActions();
+  };
+  if (creationState.proseReview) return Promise.resolve(render());
+  return getJSON(reviewChapterUrl('/reviews'))
+    .then((data) => {
+      if (creationState.key !== chapter) return undefined;
+      creationState.proseReview = data;
+      return render();
+    })
+    .catch(() => undefined);
+}
+
+function bindReviewActions() {
+  const root = document.getElementById('creation-review-inner');
+  if (!root) return;
+  const run = document.getElementById('review-run');
+  if (run) run.onclick = () => runProseReview();
+  const finalBtn = document.getElementById('review-final');
+  if (finalBtn && !finalBtn.disabled) finalBtn.onclick = () => setProseStatus('final');
+  const reopen = document.getElementById('review-reopen');
+  if (reopen) reopen.onclick = () => setProseStatus('draft');
+  const checkAll = document.getElementById('review-check-all');
+  if (checkAll) checkAll.onclick = () => {
+    root.querySelectorAll('[data-pick]').forEach((box) => { box.checked = true; });
+    reviewNote('已全选可采纳项，点「采纳选中并写回」才会动正文。');
+  };
+  const apply = document.getElementById('review-apply');
+  if (apply) apply.onclick = () => applyReviewFindings();
+  root.querySelectorAll('[data-locate]').forEach((btn) => {
+    btn.onclick = () => locateFinding(btn.dataset.locate);
+  });
+  root.querySelectorAll('[data-reject]').forEach((btn) => {
+    btn.onclick = () => rejectFinding(btn.dataset.reject);
+  });
+  root.querySelectorAll('[data-reopen]').forEach((btn) => {
+    btn.onclick = () => reopenFinding(btn.dataset.reopen);
+  });
+}
+
+/* ── 章节要点 / 定稿后处理（P0 批次 4：A1/A5/B5/U8）──────────
+   抽取出来的只是**提案**：面板里逐条接受/编辑/丢弃，确认过的才进下一章。
+   这里要让人一眼看清三件事：
+     · 本章抽了什么（类型 + 关联角色/伏笔 + 原文依据 + 来自哪次生成）
+     · 哪些会进下一章（只有 accepted/edited，discarded 不会）
+     · 新旧状态冲突在哪（标出来由作者裁决，绝不静默覆盖） */
+
+const NOTE_TYPE_LABEL = { fact: '事实', state: '状态', foreshadow: '伏笔' };
+const NOTE_STATUS_LABEL = {
+  pending: '待确认', accepted: '已接受', edited: '已编辑', discarded: '已丢弃',
+};
+const FINALIZE_STEP_LABEL = {
+  snapshot: '版本快照', notes: '抽章节要点', summary: '摘要快照', state: '角色状态索引',
+};
+
+function notesChapterUrl(suffix) {
+  return `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+    + `${encodeURIComponent(creationState.key)}${suffix || ''}`;
+}
+
+function creationRenderNotes() {
+  const d = creationState.prose;
+  if (!d || !d.exists) return '';
+  const n = creationState.proseNotes;
+  const f = creationState.proseFinalize;
+  const busy = creationState.notesBusyAt > 0;
+  /* notes_state 的 status 是 {status: 稿子状态, review_summary}，
+     比 read_draft 多包了一层；不拆开这里就会渲染成 [object Object]。 */
+  const inner = n && n.status && n.status.status;
+  const status = (typeof inner === 'string' ? inner : (inner && inner.status))
+    || (d.status && d.status.status) || 'draft';
+  const head = `<div class="spread" style="margin-bottom:8px">
+    <div>
+      <b>章节要点回流</b> ${creationRenderDraftStatus({ status })}
+      <span class="muted" style="font-size:12px;margin-left:6px">
+        抽取只提案；只有你接受/编辑的条目会进下一章，丢弃的绝不</span>
+    </div>
+    <div class="row" style="gap:6px">
+      ${busy
+        ? '<span class="muted" id="notes-busy" style="font-size:12px">处理中…</span>'
+        : `<button class="btn" id="notes-extract">${n && n.exists ? '重新抽取…' : '抽取要点…'}</button>`}
+    </div>
+  </div>`;
+
+  if (!n) {
+    return `<div class="notes-box" id="creation-notes-inner">${head}
+      <p class="muted" style="margin:4px 0 0">正在读要点记录…</p></div>`;
+  }
+
+  const sum = n.summary || {};
+  const counts = sum.counts || {};
+  const snap = n.summary_snapshot;
+  const rows = (n.notes || []).map((note) => {
+    const conflict = note.conflict;
+    const locked = note.status === 'discarded';
+    return `<div class="nt-item nt-${esc(note.status)}" data-note="${esc(note.id)}">
+      <div class="nt-head">
+        <span class="nt-type nt-t-${esc(note.type)}">${esc(NOTE_TYPE_LABEL[note.type] || note.type)}</span>
+        <span class="nt-ref">${esc(note.ref || '')}</span>
+        <span class="nt-st nt-s-${esc(note.status)}">${esc(NOTE_STATUS_LABEL[note.status] || note.status)}</span>
+        ${note.in_context ? '<span class="nt-in">会进下一章</span>' : ''}
+        ${conflict ? '<span class="nt-conflict">与既有状态冲突，待裁决</span>' : ''}
+        <span class="grow"></span>
+        <span class="muted" style="font-size:12px">第 ${num(note.chapter_no || 0)} 章 · ${esc(note.type_label || '')}</span>
+      </div>
+      <textarea class="nt-text" data-note-text="${esc(note.id)}" rows="2" spellcheck="false"
+        ${locked ? 'disabled' : ''}>${esc(note.text || '')}</textarea>
+      ${note.evidence ? `<blockquote class="nt-evidence">${esc(note.evidence)}</blockquote>` : ''}
+      ${conflict ? `<div class="nt-conflict-box">
+        旧状态（第 ${num(conflict.chapter_no || 0)} 章）：${esc(conflict.text || '')}
+        <br><span class="muted">接受新状态会把旧条目标为「已被取代」，原文与历史都保留。</span>
+      </div>` : ''}
+      <div class="nt-meta muted">
+        来自 ${esc((note.source_generation && note.source_generation.model) || '—')}
+        · 生成 ${esc(when((note.source_generation || {}).at || n.generated_at))}
+        ${note.confirmed_by ? ` · ${esc(note.confirmed_by)}于 ${esc(when(note.confirmed_at))}确认` : ''}
+        ${note.superseded_by ? ` · 已被 ${esc(note.superseded_by)} 取代` : ''}
+      </div>
+      <div class="row" style="justify-content:flex-end;gap:6px;margin-top:4px">
+        ${note.status !== 'accepted' && !locked
+          ? `<button class="btn sm primary" data-note-accept="${esc(note.id)}">接受</button>` : ''}
+        ${!locked && note.status !== 'edited'
+          ? `<button class="btn sm" data-note-edit="${esc(note.id)}">保存编辑</button>` : ''}
+        ${locked
+          ? `<button class="btn sm" data-note-reset="${esc(note.id)}">退回待确认</button>`
+          : `<button class="btn sm" data-note-discard="${esc(note.id)}">丢弃</button>`}
+        ${note.status !== 'pending'
+          ? `<button class="btn sm" data-note-reset="${esc(note.id)}">退回</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const finalizeBox = status === 'final' ? `<div class="nt-finalize">
+      <div class="spread" style="margin-bottom:6px">
+        <div><b>定稿后处理</b>
+          <span class="muted" style="font-size:12px">幂等：同一份正文重复跑不会重复写、不重复花钱</span></div>
+        <div class="row" style="gap:6px">
+          <button class="btn" id="finalize-run" ${busy ? 'disabled' : ''}>
+            ${(f && f.status === 'done') ? '重新检查' : '开始定稿处理…'}</button>
+        </div>
+      </div>
+      <div class="nt-steps">${Object.keys(FINALIZE_STEP_LABEL).map((step) => {
+        const st = (f && f.steps && f.steps[step]) || {};
+        const label = FINALIZE_STEP_LABEL[step];
+        const state = st.status || 'pending';
+        const extra = st.skipped ? '（已做过，跳过）'
+          : (st.count != null ? `（${num(st.count)} 条要点）` : '')
+            + (st.characters != null ? `（${num(st.characters)} 个角色）` : '');
+        return `<div class="nt-step nt-step-${esc(state)}">
+          <span>${esc(label)}</span><span class="muted">${esc(state)}${esc(extra)}</span>
+          ${state === 'failed'
+            ? `<button class="btn sm" data-finalize-step="${esc(step)}">只重试这一步</button>` : ''}
+          ${st.error ? `<div class="muted" style="font-size:12px">${esc(st.error)}</div>` : ''}
+        </div>`;
+      }).join('')}</div>
+      ${f && f.outdated ? notice('warn', '正文在这次定稿处理之后又改过：下面的结论已过期，需要重跑。') : ''}
+    </div>` : '';
+
+  return `<div class="notes-box" id="creation-notes-inner">
+    ${head}
+    ${sum.total
+      ? `<div class="muted" style="font-size:12px;margin-bottom:8px">
+          共 ${num(sum.total)} 条：待确认 ${num(counts.pending || 0)}
+          · 已接受 ${num(counts.accepted || 0)} · 已编辑 ${num(counts.edited || 0)}
+          · 已丢弃 ${num(counts.discarded || 0)}
+          · <b>会进下一章 ${num(sum.in_context || 0)} 条</b>
+          ${sum.conflicts ? ` · <span style="color:#b45309">${num(sum.conflicts)} 条待裁决冲突</span>` : ''}
+          <br>来源：${esc((n.source && n.source.model) || '—')} · ${esc(when(n.generated_at))}
+          · <code>${esc((sum.path) || '')}</code>
+        </div>`
+      : `<p class="muted" style="margin:4px 0 8px">
+          还没有要点提案。点「抽取要点…」让模型读这一章，产出 5–8 条事实/状态/伏笔；
+          这一步会花钱，且结果要你逐条确认后才会被下一章使用。</p>`}
+    <div class="nt-list">${rows}</div>
+    ${(n.invalid || []).length
+      ? `<details class="nt-invalid"><summary>${num(n.invalid.length)} 条未入库（校验不通过）</summary>
+          <ul style="margin:6px 0 0 18px">${n.invalid.map((x) =>
+            `<li>${esc(x.reason || '')}${x.text ? `：${esc(x.text)}` : ''}</li>`).join('')}</ul>
+        </details>` : ''}
+    <div class="nt-snap">
+      <div><b>摘要快照（A5）</b>
+        <span class="muted" style="font-size:12px">前情优先读已确认要点；要点一改，快照即标过期并回退卷摘要</span></div>
+      ${snap
+        ? `<div class="muted" style="font-size:12px;margin-top:4px">
+            ${snap.available ? esc(snap.summary || '') : '没有已确认要点，前情回退卷摘要'}
+            ${snap.stale ? '<span class="nt-conflict"> · 已过期</span>' : ' · 与来源一致'}
+            <br>source ${esc(String(snap.source_sha || '').slice(0, 12))}
+            · 当前 ${esc(String(snap.current_source_sha || '').slice(0, 12))}
+            · ${num(snap.note_count || 0)} 条要点 · ${esc(when(snap.built_at))}
+          </div>`
+        : '<div class="muted" style="font-size:12px;margin-top:4px">还没有快照（定稿处理或下面的按钮可建）</div>'}
+      <div class="row" style="justify-content:flex-end;margin-top:6px">
+        <button class="btn sm" id="notes-rebuild-summary" ${busy ? 'disabled' : ''}>重建摘要快照</button>
+      </div>
+    </div>
+    ${finalizeBox}
+    <div id="notes-note" class="muted" style="font-size:12px;margin-top:6px">${esc(creationState.notesMsg || '')}</div>
+  </div>`;
+}
+
+function loadProseNotes() {
+  if (creationState.kind !== 'brief' || !creationState.key) return Promise.resolve();
+  const chapter = creationState.key;
+  const render = () => {
+    const host = document.getElementById('creation-notes-host');
+    if (!host) return;
+    host.innerHTML = creationRenderNotes();
+    bindNotesActions();
+  };
+  return Promise.all([
+    getJSON(notesChapterUrl('/notes')).catch(() => null),
+    getJSON(notesChapterUrl('/finalize')).catch(() => null),
+  ]).then(([notes, fin]) => {
+    if (creationState.key !== chapter) return undefined;
+    creationState.proseNotes = notes;
+    creationState.proseFinalize = fin;
+    return render();
+  });
+}
+
+function notesSay(text) {
+  creationState.notesMsg = text || '';
+  const el = document.getElementById('notes-note');
+  if (el) el.textContent = creationState.notesMsg;
+}
+
+function notesRerender() {
+  const host = document.getElementById('creation-notes-host');
+  if (!host) return;
+  host.innerHTML = creationRenderNotes();
+  bindNotesActions();
+}
+
+function bindNotesActions() {
+  const root = document.getElementById('creation-notes-inner');
+  if (!root) return;
+  const extract = document.getElementById('notes-extract');
+  if (extract) extract.onclick = () => extractProseNotes();
+  const rebuild = document.getElementById('notes-rebuild-summary');
+  if (rebuild) rebuild.onclick = () => rebuildNotesSummary();
+  const runFin = document.getElementById('finalize-run');
+  if (runFin) runFin.onclick = () => runFinalizeSteps([]);
+  root.querySelectorAll('[data-finalize-step]').forEach((btn) => {
+    btn.onclick = () => runFinalizeSteps([btn.dataset.finalizeStep]);
+  });
+  const noteText = (id) => {
+    const el = root.querySelector(`[data-note-text="${id}"]`);
+    return el ? el.value : '';
+  };
+  root.querySelectorAll('[data-note-accept]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteAccept, 'accept', noteText(btn.dataset.noteAccept));
+  });
+  root.querySelectorAll('[data-note-edit]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteEdit, 'edit', noteText(btn.dataset.noteEdit));
+  });
+  root.querySelectorAll('[data-note-discard]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteDiscard, 'discard', '');
+  });
+  root.querySelectorAll('[data-note-reset]').forEach((btn) => {
+    btn.onclick = () => decideNote(btn.dataset.noteReset, 'reset', '');
+  });
+}
+
+async function extractProseNotes() {
+  if (creationState.notesBusyAt) return;
+  const ok = await askConfirm({
+    title: '从这一章正文抽要点？',
+    html: `<p style="margin:0">模型会读完整章，抽 5–8 条 <b>事实 / 状态 / 伏笔</b>。
+      这是另一笔调用；抽出来的只是提案，要你在下面逐条接受后才会进下一章。</p>
+      <p class="muted" style="margin:8px 0 0">不会改动正文，也不会写进你的设定集。</p>`,
+    confirmLabel: '开始抽取',
+  });
+  if (!ok) return;
+  creationState.notesBusyAt = Date.now();
+  notesRerender();
+  try {
+    const res = await postJSON(notesChapterUrl('/notes/extract'), {});
+    creationState.proseNotes = res.notes;
+    creationState.proseFinalize = creationState.proseFinalize;
+    notesSay(`抽出 ${num(res.added || 0)} 条，${num((res.invalid || []).length)} 条校验未通过。逐条确认才会进下一章。`);
+    notesRerender();
+  } catch (e) {
+    await tellUser('抽取失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function decideNote(noteId, action, text) {
+  if (creationState.notesBusyAt) return;
+  if (action === 'discard') {
+    const ok = await askConfirm({
+      title: '丢弃这条要点？',
+      html: '<p style="margin:0">丢弃后它不会进下一章上下文；以后想反悔可以点「退回待确认」。</p>',
+      confirmLabel: '丢弃',
+    });
+    if (!ok) return;
+  }
+  creationState.notesBusyAt = Date.now();
+  try {
+    const res = await postJSON(notesChapterUrl(`/notes/${encodeURIComponent(noteId)}`), {
+      action, text: text || '', reason: action === 'discard' ? '作者丢弃' : '',
+    });
+    creationState.proseNotes = res.notes;
+    notesSay(action === 'accept' ? '已接受：这条会进下一章装配。'
+      : action === 'edit' ? '已按你的改写保存并接受。'
+        : action === 'discard' ? '已丢弃：不会进下一章。' : '已退回待确认。');
+    notesRerender();
+  } catch (e) {
+    await tellUser('操作失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function rebuildNotesSummary() {
+  if (creationState.notesBusyAt) return;
+  creationState.notesBusyAt = Date.now();
+  try {
+    const res = await postJSON(notesChapterUrl('/summary/rebuild'), {});
+    creationState.proseNotes = null;
+    await loadProseNotes();
+    notesSay(`快照已重建：source ${String((res.snapshot || {}).source_sha || '').slice(0, 12)}。`);
+  } catch (e) {
+    await tellUser('重建失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function runFinalizeSteps(steps) {
+  if (creationState.notesBusyAt) return;
+  const only = (steps || []).length ? `只重试「${FINALIZE_STEP_LABEL[steps[0]] || steps[0]}」这一步。` : '';
+  const ok = await askConfirm({
+    title: '跑定稿后处理？',
+    html: `<p style="margin:0">会依次做：${Object.values(FINALIZE_STEP_LABEL).join(' → ')}。
+      ${only}</p>
+      <p class="muted" style="margin:8px 0 0">如果还没抽过要点，这一步会调模型（会花钱）；
+      已做过的步骤会跳过，不会重复写。</p>`,
+    confirmLabel: '开始',
+  });
+  if (!ok) return;
+  creationState.notesBusyAt = Date.now();
+  notesRerender();
+  try {
+    const res = await postJSON(notesChapterUrl('/finalize'), {
+      steps: steps || [], force: false,
+    });
+    creationState.proseFinalize = res;
+    creationState.proseNotes = null;
+    await loadProseNotes();
+    notesSay(`定稿处理：${res.status}。`);
+  } catch (e) {
+    await tellUser('定稿处理失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  } finally {
+    creationState.notesBusyAt = 0;
+    notesRerender();
+  }
+}
+
+async function reopenFinding(findingId) {
+  const reviewId = currentReviewId();
+  if (!reviewId) return;
+  const ok = await askConfirm({
+    title: '重新考虑这条已拒绝的意见？',
+    html: '<p style="margin:0">解除抑制后，<b>下一次审稿</b>会重新判断这条；'
+      + '本次不会立刻改正文。</p>',
+    confirmLabel: '重新考虑',
+  });
+  if (!ok) return;
+  try {
+    await postJSON(reviewChapterUrl(
+      `/reviews/${encodeURIComponent(reviewId)}/reopen/${encodeURIComponent(findingId)}`), {});
+    creationState.proseReview = null;
+    await loadProseReview();
+    reviewNote('已解除抑制：下次审稿会重新考虑这一条。');
+  } catch (e) {
+    await tellUser('操作失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+async function runProseReview() {
+  if (creationState.reviewBusyAt) return;
+  const plan = creationState.prosePlan || {};
+  const cost = plan.est_cost_cny == null ? '' : `生成那次的参考价约 ¥${plan.est_cost_cny}；`;
+  const ok = await askConfirm({
+    title: '审这一章的正文？',
+    html: `<p style="margin:0">会读完整章 + 设定摘要 + 技法审查维度，产出逐句可定位的意见。
+      ${esc(cost)}这次审稿是另一笔调用。</p>
+      <p class="muted" style="margin:8px 0 0">正文不会被改动；意见只落盘并在下面列出，由你逐条选择。</p>`,
+    confirmLabel: '开始审稿',
+  });
+  if (!ok) return;
+
+  creationState.reviewBusyAt = Date.now();
+  const inner = document.getElementById('creation-review-inner');
+  if (inner) { inner.innerHTML = creationRenderReview(); bindReviewActions(); }
+  const tick = () => {
+    const el = document.getElementById('review-busy');
+    if (!el) return;
+    const secs = ((Date.now() - creationState.reviewBusyAt) / 1000).toFixed(0);
+    el.textContent = `正在审… ${secs}s（读完整章后逐条核对引文）`;
+  };
+  tick();
+  creationState.reviewTimer = setInterval(tick, 1000);
+  try {
+    const res = await postJSON(reviewChapterUrl('/review'), {});
+    const items = res.items || [];
+    await tellUser('审稿完成', `<p style="margin:0">共 ${num(items.length)} 条意见
+      ${res.invalid && res.invalid.length ? `，另有 ${num(res.invalid.length)} 条引文对不上正文已丢弃` : ''}。</p>
+      <p class="muted" style="margin:8px 0 0">下面每条都能定位到原句；勾选后点「采纳选中并写回」，
+      写回前会自动存一份历史版本。</p>`);
+  } catch (e) {
+    await tellUser('审稿失败', `<p style="margin:0">${esc(e.message)}</p>
+      <p class="muted" style="margin:8px 0 0">正文没有被改动。</p>`);
+  } finally {
+    creationState.reviewBusyAt = 0;
+    if (creationState.reviewTimer) clearInterval(creationState.reviewTimer);
+    creationState.reviewTimer = null;
+    creationState.proseReview = null;
+    creationState.prose = null;
+    creationLoad();
+    loadProseReview();
+  }
+}
+
+function locateFinding(id) {
+  const latest = creationState.proseReview && creationState.proseReview.latest;
+  const item = latest && (latest.items || []).find((x) => x.id === id);
+  const area = document.getElementById('draft-text');
+  if (!item || !area) return;
+  const text = area.value;
+  const evidence = String(item.evidence || '');
+  let start = Number(item.start);
+  if (!(start >= 0) || text.slice(start, start + evidence.length) !== evidence) {
+    start = text.indexOf(evidence);
+  }
+  if (start < 0) {
+    reviewNote('正文里已经找不到这句（可能被改过），这条意见不能定位，建议重新审稿。');
+    return;
+  }
+  const end = start + evidence.length;
+  area.focus();
+  area.setSelectionRange(start, end);
+  const ratio = text.length ? start / text.length : 0;
+  area.scrollTop = Math.max(0, ratio * area.scrollHeight - area.clientHeight / 3);
+  reviewNote(`已定位到第 ${num(item.paragraph || 0)} 段（偏移 ${start}–${end}），`
+    + '正文里已选中这一句。');
+}
+
+async function rejectFinding(id) {
+  const reviewId = currentReviewId();
+  if (!reviewId) return;
+  const ok = await askConfirm({
+    title: '拒绝这条意见？',
+    html: '<p style="margin:0">拒绝会留下记录（原因和条目），列表里仍能看到它，下次审稿也查得到。</p>',
+    confirmLabel: '拒绝这条',
+  });
+  if (!ok) return;
+  try {
+    await postJSON(reviewChapterUrl(`/reviews/${encodeURIComponent(reviewId)}/reject`),
+      { finding_ids: [id], reason: '作者拒绝' });
+    creationState.proseReview = null;
+    await loadProseReview();
+    reviewNote('已拒绝，记录已保存。');
+  } catch (e) {
+    await tellUser('拒绝失败', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+
+async function applyReviewFindings() {
+  const reviewId = currentReviewId();
+  const root = document.getElementById('creation-review-inner');
+  if (!reviewId || !root) return;
+  const ids = [...root.querySelectorAll('[data-pick]:checked')].map((box) => box.dataset.pick);
+  if (!ids.length) {
+    reviewNote('先勾选要采纳的意见（每条左上角有复选框）。');
+    return;
+  }
+  const replacements = {};
+  ids.forEach((id) => {
+    const area = root.querySelector(`[data-replacement="${id}"]`);
+    if (area) replacements[id] = area.value;
+  });
+  const ok = await askConfirm({
+    title: `采纳 ${ids.length} 条并写回正文？`,
+    html: `<p style="margin:0">只替换这几条对应的原句，其余文字一个字节都不动。</p>
+      <p class="muted" style="margin:8px 0 0">写回前会自动存一份历史版本；写回后状态退回草稿，需要再审一次才能定稿。</p>`,
+    confirmLabel: '写回正文',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const res = await postJSON(
+      reviewChapterUrl(`/reviews/${encodeURIComponent(reviewId)}/apply`),
+      { finding_ids: ids, replacements },
+    );
+    const skipped = res.skipped || [];
+    creationState.prose = null;
+    creationState.proseReview = null;
+    // D4/U2：记下「这次改写从哪一版变过来的」，工作台据此自动画出逐段对比，
+    // 让作者一眼看出哪几段是刚采纳的。shown 保证每章只自动弹一次。
+    creationState.wbLastApply = {
+      chapter: creationState.key,
+      version_id: res.version_id || '',
+      count: res.regions || ids.length,
+      chars: res.chars || 0,
+      shown: false,
+    };
+    creationLoad();
+    loadProseReview();
+    loadProseVersions();
+    await tellUser('已写回正文', `<p style="margin:0">共改写 ${num(res.regions || 0)} 处，
+      现在 ${num(res.chars || 0)} 字。</p>
+      <p class="muted" style="margin:8px 0 0">旧稿已存为版本 <code>${esc(res.version_id || '')}</code>，
+      可在「恢复候选与历史版本」里找回。</p>
+      ${skipped.length ? `<p class="muted" style="margin:8px 0 0">${num(skipped.length)} 条被跳过：
+        ${esc(skipped.map((s) => s.reason).join('；'))}</p>` : ''}
+      <p class="muted" style="margin:8px 0 0">稿子状态已退回草稿：改过的正文需要再审一次才能定稿。</p>`);
+  } catch (e) {
+    await tellUser('写回失败', `<p style="margin:0">${esc(e.message)}</p>
+      <p class="muted" style="margin:8px 0 0">正文没有被改动。</p>`);
+  }
+}
+
+async function setProseStatus(to) {
+  const label = to === 'final' ? '已定稿' : '已重新打开（草稿）';
+  try {
+    const res = await postJSON(reviewChapterUrl('/status'), {
+      to, reason: to === 'final' ? '作者确认定稿' : '重新打开以便修改',
+    });
+    creationState.prose = null;
+    creationState.proseReview = null;
+    creationLoad();
+    loadProseReview();
+    await tellUser(label, `<p style="margin:0">现在状态：${
+      esc(DRAFT_STATUS_LABEL[res.status] || res.status)}。</p>
+      ${to === 'final' ? '<p class="muted" style="margin:8px 0 0">定稿后再重写，需要先点「重新打开」。</p>' : ''}`);
+  } catch (e) {
+    await tellUser('状态没改成', `<p style="margin:0">${esc(e.message)}</p>`);
+  }
+}
+/* 回填：拿这一章的正文当事实来源，把正文里**实际出现过的**东西提回设定集。
+   和起草走同一套提案表格（逐条留/改/丢），但提示词是另一套——
+   回填提错了会把编出来的东西写进真源，所以铁律是「正文里没有的一个字都不许提」。 */
+
+function wbStorageKey(kind) {
+  return `workshop.wb.${kind}.${creationState.name}.${creationState.key}`;
+}
+
+function wbSplitParas(text) {
+  return String(text || '').replace(/\r\n/g, '\n').split(/\n+/)
+    .map((s) => s.trim()).filter(Boolean);
+}
+
+function wbParagraphHTML(text) {
+  const paras = wbSplitParas(text);
+  if (!paras.length) {
+    return '<p class="muted wb-empty">这一章还没有正文。切到编辑态手写，或在右栏「写这一章」。</p>';
+  }
+  return paras.map((p, i) =>
+    `<p id="wb-p-${i + 1}" data-p="${i + 1}">${esc(p)}</p>`).join('');
+}
+
+function wbVersionPanel() {
+  const versions = (creationState.proseVersions && creationState.proseVersions.versions) || [];
+  const last = creationState.wbLastApply
+    && creationState.wbLastApply.chapter === creationState.key ? creationState.wbLastApply : null;
+  const ids = new Set(versions.map((v) => String(v.version_id)));
+  const aDefault = last && ids.has(String(last.version_id))
+    ? String(last.version_id) : (versions[0] ? String(versions[0].version_id) : '__current__');
+  const option = (v, selected) => `<option value="${esc(v.version_id)}" ${selected ? 'selected' : ''}>
+      ${esc(v.version_id)} · ${esc(v.created_at || '')} · ${v.chars || 0} 字</option>`;
+  return `<details class="wb-vers" ${last ? 'open' : ''}>
+    <summary>版本与改写痕迹 <span class="muted">${versions.length} 个历史版本</span></summary>
+    ${last ? `<div class="wb-applied">刚采纳 ${last.count || 0} 条改写（${last.chars || 0} 字）。
+      <button class="btn ghost sm" type="button" data-wb-open-diff>查看逐段对比</button></div>` : ''}
+    ${versions.length ? `
+      <div class="wb-vers-row">
+        <select id="wb-diff-a" aria-label="对比起点">
+          ${versions.map((v) => option(v, String(v.version_id) === aDefault)).join('')}
+          <option value="__current__" ${aDefault === '__current__' ? 'selected' : ''}>当前正文</option>
+        </select>
+        <span class="muted">→</span>
+        <select id="wb-diff-b" aria-label="对比终点">
+          <option value="__current__" selected>当前正文</option>
+          ${versions.map((v) => option(v, false)).join('')}
+        </select>
+        <button class="btn ghost sm" type="button" id="wb-diff-run">逐段对比</button>
+      </div>
+      <div id="wb-diff-out" class="wb-diff"></div>
+      <ul class="wb-vlist">${versions.map((v) => `<li>
+        <code>${esc(v.version_id)}</code>
+        <span class="muted">${esc(v.created_at || '')} · ${v.chars || 0} 字</span>
+        <button class="btn ghost xs" type="button" data-wb-compare="${esc(v.version_id)}">对比当前</button>
+        <button class="btn ghost xs" type="button" data-wb-restore="${esc(v.version_id)}">回退到此版</button>
+      </li>`).join('')}</ul>`
+      : '<p class="muted" style="margin:8px 0 0">还没有历史版本。每次保存正文都会先把旧稿存成一版。</p>'}
+  </details>`;
+}
+
+function wbCurrentText() {
+  const ta = document.getElementById('draft-text');
+  if (ta) return ta.value;
+  return creationState.wbText || '';
+}
+
+function wbSetReadFromText() {
+  const text = wbCurrentText();
+  creationState.wbText = text;
+  const readBox = document.getElementById('wb-read');
+  if (readBox) readBox.innerHTML = wbParagraphHTML(text);
+  const jump = document.getElementById('wb-para-jump');
+  if (jump) {
+    const paras = wbSplitParas(text);
+    jump.innerHTML = '<option value="0">段落…</option>'
+      + paras.map((_, i) => `<option value="${i + 1}">第 ${i + 1} 段</option>`).join('');
+  }
+  const meta = document.querySelector('.wb-center-head .wb-meta');
+  if (meta) meta.textContent = `${text.replace(/\s/g, '').length} 字 · ${wbSplitParas(text).length} 段`;
+}
+
+function wbScheduleLocalSave() {
+  clearTimeout(creationState.wbLocalTimer);
+  creationState.wbLocalTimer = setTimeout(() => {
+    if (!creationState.wbDirty) return;
+    try {
+      localStorage.setItem(wbStorageKey('buf'), JSON.stringify({
+        text: creationState.wbText, at: Date.now(),
+      }));
+    } catch { /* 写不进去就退回手动保存 */ }
+    const box = document.getElementById('wb-save-state');
+    if (box) box.textContent = '未保存 · 本地已保留';
+  }, 2000);
+}
+
+async function wbSaveProse() {
+  const ta = document.getElementById('draft-text');
+  if (!ta) return;
+  const text = ta.value;
+  const btn = document.getElementById('draft-save');
+  if (!text.trim() && creationState.prose && creationState.prose.exists
+      && (creationState.prose.text || '').trim()) {
+    creationSay('空正文不能覆盖已有内容。要清空请先把旧稿存成版本。');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const res = await api(
+      `/api/works/${encodeURIComponent(creationState.name)}/creation/draft/${encodeURIComponent(creationState.key)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }
+    );
+    creationState.wbDirty = false;
+    creationState.wbText = text;
+    creationState.prose = null;
+    creationState.prosePlan = null;
+    creationState.prosePlanError = null;
+    try { localStorage.removeItem(wbStorageKey('buf')); } catch { /* 忽略 */ }
+    creationSay((res && res.version_id)
+      ? `正文已保存；旧稿存为版本 ${res.version_id}。`
+      : '正文已保存（内容没有变化）。');
+    await creationLoad();
+  } catch (e) {
+    creationSay(`保存失败：${e.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '保存正文'; }
+  }
+}
+
+async function wbLoadVersionText(versionId) {
+  const d = await getJSON(
+    `/api/works/${encodeURIComponent(creationState.name)}/creation/draft`
+    + `/${encodeURIComponent(creationState.key)}/versions/${encodeURIComponent(versionId)}`
+  );
+  return d.text || '';
+}
+
+/* 逐段 LCS。正文按自然段比对；段数 * 段数 超过阈值就退化成
+   「相同前缀 + 相同后缀 + 中间整段标改」，避免长章节把主线程卡住。 */
+function wbLcsOps(a, b) {
+  const n = a.length, m = b.length;
+  const ops = [];
+  if (n * m > 250000) {
+    let p = 0;
+    while (p < n && p < m && a[p] === b[p]) { ops.push({ t: 'eq', a: p, b: p }); p += 1; }
+    let ea = n - 1, eb = m - 1;
+    const tail = [];
+    while (ea >= p && eb >= p && a[ea] === b[eb]) {
+      tail.unshift({ t: 'eq', a: ea, b: eb }); ea -= 1; eb -= 1;
+    }
+    for (let i = p; i <= ea; i += 1) ops.push({ t: 'del', a: i });
+    for (let j = p; j <= eb; j += 1) ops.push({ t: 'add', b: j });
+    return ops.concat(tail);
+  }
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ t: 'eq', a: i, b: j }); i += 1; j += 1; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ t: 'del', a: i }); i += 1; }
+    else { ops.push({ t: 'add', b: j }); j += 1; }
+  }
+  while (i < n) { ops.push({ t: 'del', a: i }); i += 1; }
+  while (j < m) { ops.push({ t: 'add', b: j }); j += 1; }
+  return ops;
+}
+
+function wbDiffHTML(aText, bText, aLabel, bLabel) {
+  const A = wbSplitParas(aText), B = wbSplitParas(bText);
+  const ops = wbLcsOps(A, B);
+  const adds = ops.filter((o) => o.t === 'add').length;
+  const dels = ops.filter((o) => o.t === 'del').length;
+  const rows = ops.map((o) => {
+    if (o.t === 'eq') return `<p class="df-eq">${esc(A[o.a])}</p>`;
+    if (o.t === 'del') return `<p class="df-del"><span class="df-tag">−</span>${esc(A[o.a])}</p>`;
+    return `<p class="df-add"><span class="df-tag">+</span>${esc(B[o.b])}</p>`;
+  }).join('');
+  return `<div class="wb-diff-head">${esc(aLabel)} → ${esc(bLabel)}
+    <span class="df-add-t">+${adds} 段</span> <span class="df-del-t">−${dels} 段</span></div>${rows}`;
+}
+
+async function wbRunDiff(baseId, otherId) {
+  const out = document.getElementById('wb-diff-out');
+  const selA = document.getElementById('wb-diff-a');
+  const selB = document.getElementById('wb-diff-b');
+  const a = baseId || (selA && selA.value) || '__current__';
+  const b = otherId || (selB && selB.value) || '__current__';
+  if (!out) return;
+  // 版本列表异步回来时会把 #wb-vers-host 整块重画，调用时抓到的节点可能已经被换掉。
+  // 每次写入都重新找一次，否则结果写进一个不在文档里的旧节点——界面看起来「没反应」。
+  const paint = (html) => {
+    const el = document.getElementById('wb-diff-out');
+    if (el) el.innerHTML = html;
+  };
+  paint('<p class="muted">正在读版本并比对…</p>');
+  try {
+    const [aText, bText] = await Promise.all([
+      a === '__current__' ? wbCurrentText() : wbLoadVersionText(a),
+      b === '__current__' ? wbCurrentText() : wbLoadVersionText(b),
+    ]);
+    paint(wbDiffHTML(
+      aText, bText,
+      a === '__current__' ? '当前正文' : a,
+      b === '__current__' ? '当前正文' : b,
+    ));
+  } catch (e) {
+    paint(notice('bad', `对比失败：${esc(e.message)}`));
+  }
+}
+
+/* 版本面板会随着版本列表异步返回而重画，所以绑定单独抽出来，
+   重画之后重新绑一次，避免「第一次进来按钮点了没反应」。 */
+
+function wbBindVersionPanel() {
+  const diffBtn = document.getElementById('wb-diff-run');
+  if (diffBtn) diffBtn.addEventListener('click', () => wbRunDiff());
+  document.querySelectorAll('[data-wb-compare]').forEach((btn) => {
+    btn.addEventListener('click', () => wbRunDiff(btn.dataset.wbCompare, '__current__'));
+  });
+  const openDiff = document.querySelector('[data-wb-open-diff]');
+  if (openDiff && creationState.wbLastApply) {
+    openDiff.addEventListener('click',
+      () => wbRunDiff(creationState.wbLastApply.version_id, '__current__'));
+  }
+  document.querySelectorAll('[data-wb-restore]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const vid = btn.dataset.wbRestore;
+      const ok = await askConfirm({
+        title: `回退到版本 ${vid}`,
+        html: '<p style="margin:0">当前正文会先备份成一版，再把这一版恢复回来。</p>',
+        confirmLabel: '回退',
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await api(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft`
+          + `/${encodeURIComponent(creationState.key)}/versions/${encodeURIComponent(vid)}/restore`,
+          { method: 'POST' });
+        creationState.wbDirty = false;
+        creationState.prose = null;
+        try { localStorage.removeItem(wbStorageKey('buf')); } catch { /* 忽略 */ }
+        creationSay(`已回退到 ${vid}；回退前的正文已进历史版本。`);
+        await creationLoad();
+      } catch (e) {
+        creationSay(`回退失败：${e.message}`);
+      }
+    });
+  });
+}
+
+/* ── 本章工作区（P0/P1 功能入口）───────────────────────────
+   新界面把创作台做成了「三层表单 + 正文」，但没有地方放 P0/P1 加的那些
+   章节级能力：生成进度与取消、审稿逐条采纳、要点回流与定稿、历史版本回退。
+   这里在正文卡下面补一条工作区，用原有的 host id 接住那些自检过的面板，
+   不重做一套交互——面板本身是数据驱动的，换壳不用换逻辑。 */
+function creationRenderWorkspace() {
+  if (creationState.kind !== 'brief' || !creationState.key) return '';
+  const plan = creationState.prosePlan || {};
+  const task = creationState.proseTask;
+  const calls = (task && task.calls) || (creationState.prose && creationState.prose.calls) || [];
+  const geninfo = creationRenderWordDeviation((creationState.prose || {}).stats)
+    + (plan.context_report ? creationRenderBudget(plan.context_report) : '')
+    + creationRenderBeats(plan.beats)
+    + creationRenderCallLedger(calls, (task && task.stats) || (creationState.prose || {}).stats || null);
+  return `<section class="sec" id="creation-ws">
+    <div class="sec-head">
+      <h2>本章工作区</h2>
+      <span class="grow"></span>
+      <span class="muted">生成明细 · 审稿 · 要点 · 定稿 · 版本</span>
+    </div>
+    <div class="sec-body">
+      <div id="creation-task-host">${creationRenderTask(task)}</div>
+      ${geninfo ? `<details class="cd-geninfo" style="margin:10px 0 4px">
+        <summary style="cursor:pointer;font-size:13px">生成明细：预算 / 细纲 / 调用账</summary>
+        <div style="margin-top:8px">${geninfo}</div>
+      </details>` : ''}
+      <div id="creation-review-host"></div>
+      <div id="creation-notes-host"></div>
+      <div id="creation-recovery-host"></div>
+      <div id="wb-vers-host"></div>
+    </div>
+  </section>`;
+}
+
+/* 工作区只在本章存在。整页重画会把面板 DOM 换掉：已取到的数据留在 state 上，
+   重画后照着它再画一遍，不重复请求、也不让面板空着等下一次异步回来。
+   任务状态刷新后要能恢复——重新进页面时服务端还在跑，不拉一次就只剩一个停在那儿的「写着呢…」。 */
+function creationPaintWorkspace() {
+  const paint = (hostId, data, render, bind) => {
+    const host = document.getElementById(hostId);
+    if (!host || !data || host.innerHTML.trim()) return;
+    host.innerHTML = render();
+    if (bind) bind();
+  };
+  paint('creation-review-host', creationState.proseReview, creationRenderReview, bindReviewActions);
+  paint('creation-notes-host', creationState.proseNotes, creationRenderNotes, bindNotesActions);
+  paint('creation-recovery-host', creationState.proseVersions, creationRenderRecovery, bindRecoveryActions);
+  paint('wb-vers-host', creationState.proseVersions, wbVersionPanel, wbBindVersionPanel);
+}
+
+function creationBindWorkspace() {
+  if (creationState.kind !== 'brief' || !creationState.key) return;
+  updateProseTaskPanel();
+  creationPaintWorkspace();
+  // 面板按章只加载一轮，否则一次进页面就会打十几条重复请求；
+  // 改完正文/审稿之后各自会重新取。
+  const stamp = `${creationState.name}:${creationState.key}`;
+  if (creationState.wsLoadedFor === stamp) return;
+  creationState.wsLoadedFor = stamp;
+  if (!creationState.proseTaskLoaded) {
+    creationState.proseTaskLoaded = true;
+    getJSON(`/api/works/${encodeURIComponent(creationState.name)}/creation/draft/`
+      + `${encodeURIComponent(creationState.key)}/task`)
+      .then((t) => {
+        if (!t || ['idle', 'done', 'cancelled'].includes(t.status)) return;
+        creationState.proseTask = t;
+        updateProseTaskPanel();
+        if (t.status === 'running' || t.status === 'cancelling') pollProseTask(t.task_id);
+      })
+      .catch(() => {});
+  }
+  updateProseTaskPanel();
+  loadProseVersions();
+  loadProseReview();
+  loadProseNotes();
 }
 
 /* ── 本层工具（素材库 / 助手）──────────────────────────────
@@ -5788,11 +7223,14 @@ async function renderSettings() {
 
 function drawSettings() {
   const d = settingsState.data;
+  const flash = settingsState.flash;
+  settingsState.flash = null;
   view.innerHTML = `
     <h1>设置</h1>
     <p class="lead">模型服务商、密钥与限速。改完即刻生效，不需要重启服务。</p>
 
     ${notice('info', d.notes.map((n) => esc(n)).join('<br>'))}
+    ${flash ? notice('ok', esc(flash)) : ''}
 
     <div class="card">
       <div class="spread" style="margin-bottom:10px">
@@ -5814,6 +7252,20 @@ function drawSettings() {
       </div>
     </div>
 
+    <div class="card" id="stage-card">
+      <div class="spread" style="margin-bottom:10px">
+        <h3 style="margin:0">阶段模型</h3>
+        <span class="muted" style="font-size:12px">写一章会依次走这四步</span>
+      </div>
+      <p class="muted" style="margin:0 0 6px">
+        细纲 → 正文 → 审稿 → 要点抽取。每一步的要求不同：细纲要结构判断，正文要长输出，
+        审稿要稳定 JSON，抽取要便宜。单独给某一阶段配模型；没配的阶段回落到上面的默认模型。
+      </p>
+      <div id="stage-rows">
+        ${(d.stages || []).map((row) => stageRowHtml(row, d)).join('')}
+      </div>
+    </div>
+
     <div class="card">
       <div class="spread" style="margin-bottom:10px">
         <h3 style="margin:0">服务商列表</h3>
@@ -5827,6 +7279,19 @@ function drawSettings() {
       <div id="provider-list">
         ${d.providers.map((p) => providerCard(p, d)).join('')}
       </div>
+    </div>
+
+    <div class="card">
+      <div class="spread" style="margin-bottom:10px">
+        <h3 style="margin:0">提示词</h3>
+        <span class="muted" style="font-size:12px">优先级：项目 &gt; 全局 &gt; 内置</span>
+      </div>
+      <p class="muted" style="margin:0 0 10px">
+        每条提示词都可以不改代码就替换：放在 <code>作品/prompts/&lt;id&gt;.md</code> 覆盖这一部，
+        放在数据根的 <code>prompts/&lt;id&gt;.md</code> 覆盖所有作品。
+        模板里的 <code>{{变量}}</code> 是必填的，缺了会明确报错而不是把字面量交给模型。
+      </p>
+      ${(d.prompts || []).map((p) => promptRowHtml(p)).join('')}
     </div>
 
     <div class="card">
@@ -5846,6 +7311,7 @@ function drawSettings() {
   `;
 
   wireBindingSelects();
+  wireStageMatrix();
   document.getElementById('save-binding').onclick = saveDefaultBinding;
   document.getElementById('add-provider').onclick = () => {
     const box = document.getElementById('provider-form');
@@ -5882,6 +7348,148 @@ function drawSettings() {
   });
   view.querySelectorAll('[data-del-provider]').forEach((btn) => {
     btn.onclick = () => deleteProvider(btn.dataset.delProvider);
+  });
+}
+
+const STAGE_SOURCE_NOTE = {
+  stage: '这一阶段单独指定',
+  default: '回落到默认任务绑定',
+  request: '本次请求显式指定',
+  unset: '还没有配置',
+};
+
+function stageRowHtml(row, d) {
+  const providers = d.providers || [];
+  const p = providers.find((x) => x.id === row.provider) || providers[0];
+  const selectedModel = row.provider ? row.model : null;
+  const caps = row.capabilities || {};
+  const capText = [
+    row.max_context ? `上下文 ${num(row.max_context)}` : '',
+    row.max_output ? `输出 ${num(row.max_output)}` : '',
+    caps.structured_output || caps.json_mode ? '结构化输出' : '',
+  ].filter(Boolean).join(' · ');
+  return `<div class="stage-row" data-stage="${esc(row.stage)}">
+    <div class="stage-line">
+      <div style="min-width:0">
+        <b>${esc(row.label || row.stage)}</b>
+        <span class="chip ${row.available ? 'ok' : 'bad'}">${row.available ? '可用' : '不可用'}</span>
+        <span class="muted" style="font-size:12px">${esc(STAGE_SOURCE_NOTE[row.source] || row.source_label || '')}</span>
+      </div>
+      <div class="row wrap" style="gap:6px">
+        <select data-stage-provider aria-label="${esc(row.label)}服务商">
+          ${providers.map((x) => `<option value="${esc(x.id)}" ${x.id === (p && p.id) ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
+        </select>
+        <select data-stage-model aria-label="${esc(row.label)}模型">
+          ${modelOptions(p, selectedModel)}
+        </select>
+        <button type="button" class="btn sm primary" data-stage-save>保存</button>
+        <button type="button" class="btn sm" data-stage-reset ${row.configured ? '' : 'disabled'}
+          title="移除这一阶段的单独配置，回落到默认任务绑定">恢复默认</button>
+        <button type="button" class="btn sm" data-stage-test ${p ? '' : 'disabled'}
+          title="只发一句合成测试句，不碰作品原文">测试</button>
+      </div>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      推荐：${esc(row.recommendation || '')}
+      ${capText ? `<br>当前模型：${esc(capText)}` : ''}
+      ${row.source !== 'unset' ? `<br>实际生效：${esc(row.provider_name || '')} / ${esc(row.model || '')}` : ''}
+    </div>
+    ${row.unavailable_reason ? notice('warn', `当前不可用：${esc(row.unavailable_reason)}`) : ''}
+    ${(row.risks || []).map((r) => notice('warn', esc(r))).join('')}
+    <div class="muted" data-stage-msg style="font-size:12px;margin-top:4px"></div>
+  </div>`;
+}
+
+function promptRowHtml(p) {
+  const sourceText = { builtin: '内置', global: '全局覆盖', project: '项目覆盖' }[p.source] || p.source;
+  const vars = (p.placeholders || []).map((v) => `{{${v}}}`).join('、');
+  return `<div class="stage-row">
+    <div class="stage-line">
+      <div style="min-width:0">
+        <b>${esc(p.label)}</b>
+        <span class="chip ${p.overridden ? 'warn' : ''}">${esc(sourceText)}</span>
+        <span class="muted" style="font-size:12px">${esc(p.id)} · 用于 ${esc(p.used_by)}</span>
+      </div>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:4px;word-break:break-all">
+      文件：<code>${esc(p.path)}</code>
+      ${vars ? `<br>必填变量：${esc(vars)}` : '<br>无必填变量'}
+    </div>
+  </div>`;
+}
+
+function wireStageMatrix() {
+  const d = settingsState.data;
+  const providers = d.providers || [];
+  view.querySelectorAll('[data-stage]').forEach((rowEl) => {
+    const stage = rowEl.dataset.stage;
+    const pSel = rowEl.querySelector('[data-stage-provider]');
+    const mSel = rowEl.querySelector('[data-stage-model]');
+    if (pSel && mSel) {
+      pSel.onchange = () => {
+        mSel.innerHTML = modelOptions(providers.find((x) => x.id === pSel.value), null);
+      };
+    }
+    const save = rowEl.querySelector('[data-stage-save]');
+    if (save) save.onclick = () => saveStageBinding(stage, rowEl);
+    const reset = rowEl.querySelector('[data-stage-reset]');
+    if (reset) {
+      reset.onclick = () => saveStageBinding(stage, rowEl, { clear: true });
+    }
+    const test = rowEl.querySelector('[data-stage-test]');
+    if (test) {
+      test.onclick = () => testStageModel(stage, rowEl, test);
+    }
+  });
+}
+
+async function saveStageBinding(stage, rowEl, opts) {
+  const clear = !!(opts && opts.clear);
+  const pSel = rowEl.querySelector('[data-stage-provider]');
+  const mSel = rowEl.querySelector('[data-stage-model]');
+  const msg = rowEl.querySelector('[data-stage-msg]');
+  const btn = rowEl.querySelector(clear ? '[data-stage-reset]' : '[data-stage-save]');
+  if (!clear && (!pSel || !mSel || !mSel.value)) {
+    if (msg) msg.innerHTML = `<span style="color:var(--danger)">先在服务商的模型清单里加上模型，再绑定。</span>`;
+    return;
+  }
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const r = await api('/api/settings/stages', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(clear
+        ? { stage, clear: true }
+        : { stage, provider: pSel.value, model: mSel.value }),
+    });
+    settingsState.data = await getJSON('/api/settings');
+    settingsState.flash = r.hint || '已保存。';
+    drawSettings();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+    if (msg) msg.innerHTML = `<span style="color:var(--danger)">保存失败：${esc(e.message)}</span>`;
+  }
+}
+
+async function testStageModel(stage, rowEl, btn) {
+  const pSel = rowEl.querySelector('[data-stage-provider]');
+  const mSel = rowEl.querySelector('[data-stage-model]');
+  const msg = rowEl.querySelector('[data-stage-msg]');
+  if (!pSel || !mSel || !msg) return;
+  await withBusy(btn, '<span class="spinner"></span>测试中…', async () => {
+    try {
+      const r = await api(
+        `/api/settings/providers/${encodeURIComponent(pSel.value)}/test`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: mSel.value || null }) },
+      );
+      msg.innerHTML = r.ok
+        ? notice('ok', `「${esc(r.model || mSel.value)}」连通正常，端点、鉴权、模型名三项都通过。`)
+        : stepList(r);
+    } catch (e) {
+      msg.innerHTML = notice('bad', `测试失败：${esc(e.message)}`);
+    }
   });
 }
 
@@ -8407,6 +10015,356 @@ function renderHelp() {
 
 /* ── 路由 ──────────────────────────────────────────────── */
 
+const SEARCH_TYPE_LABELS = {
+  chapter: '正文',
+  setting: '设定',
+  volume: '卷表',
+  brief: '章指令',
+  foreshadow: '伏笔',
+  notes: '要点',
+  review: '审稿',
+};
+
+const searchState = {
+  q: '',
+  types: new Set(),
+  work: '',
+  seq: 0,
+  timer: null,
+  status: null,
+  works: [],
+};
+
+function searchHashParams() {
+  const raw = (location.hash || '').split('?')[1] || '';
+  return new URLSearchParams(raw);
+}
+
+function searchTypeLabel(type) {
+  return SEARCH_TYPE_LABELS[type] || type || '未知';
+}
+
+function searchChipsHtml() {
+  const all = searchState.types.size === 0 ? ' active' : '';
+  const one = Object.entries(SEARCH_TYPE_LABELS)
+    .map(([key, label]) =>
+      `<button type="button" class="chip${searchState.types.has(key) ? ' active' : ''}" data-type="${key}">${esc(label)}</button>`)
+    .join('');
+  return `<button type="button" class="chip${all}" data-type="">全部</button>${one}`;
+}
+
+function searchStatusHtml(st) {
+  if (!st) return '读取索引状态…';
+  if (!st.ready) {
+    return '索引尚未建立；第一次检索会自动建立（只读本地文件，不花钱）';
+  }
+  const counts = Object.entries(st.by_type || {})
+    .map(([k, n]) => `${searchTypeLabel(k)} ${num(n)}`)
+    .join(' · ');
+  const errs = (st.errors || []).length ? ` · ${st.errors.length} 个文件读取失败` : '';
+  return `索引就绪：${num(st.docs)} 条文档 / ${num(st.works)} 部作品${counts ? `（${counts}）` : ''}${errs}`;
+}
+
+function renderSearchStatus(st) {
+  const el = document.getElementById('search-status');
+  if (el) el.innerHTML = searchStatusHtml(st);
+}
+
+function renderSearchChips() {
+  const box = document.getElementById('search-types');
+  if (box) box.innerHTML = searchChipsHtml();
+}
+
+function renderSearchWorkOptions() {
+  const sel = document.getElementById('search-work');
+  if (!sel) return;
+  const names = searchState.works.map((w) => w.name);
+  if (searchState.work && !names.includes(searchState.work)) searchState.work = '';
+  sel.innerHTML =
+    `<option value="">全部作品</option>` +
+    names
+      .map((n) => `<option value="${esc(n)}"${n === searchState.work ? ' selected' : ''}>${esc(n)}</option>`)
+      .join('');
+}
+
+function searchResultsPrompt(html) {
+  const box = document.getElementById('search-results');
+  if (box) box.innerHTML = html;
+}
+
+function searchSnippetHtml(snippet) {
+  if (!snippet) return '<span class="muted">（无片段）</span>';
+  const before = (snippet.prefix ? '…' : '') + esc(snippet.before || '');
+  const match = snippet.match ? `<mark>${esc(snippet.match)}</mark>` : '';
+  const after = esc(snippet.after || '') + (snippet.suffix ? '…' : '');
+  return before + match + after;
+}
+
+function searchHitCard(item) {
+  const params = new URLSearchParams({
+    id: item.doc_id,
+    q: searchState.q,
+    o: String(item.offset || 0),
+    l: String(item.length || 0),
+  });
+  return `<a class="search-hit" href="#/search/hit?${params.toString().replace(/&/g, '&amp;')}">
+    <div class="hit-head">
+      <span class="badge">${esc(searchTypeLabel(item.source_type))}</span>
+      <strong>${esc(item.title || item.ref || item.doc_id)}</strong>
+      <span class="muted">${esc(item.work)} · ${esc(item.ref || '')}</span>
+    </div>
+    <div class="hit-snippet">${searchSnippetHtml(item.snippet)}</div>
+  </a>`;
+}
+
+function renderSearchResults(data) {
+  const box = document.getElementById('search-results');
+  if (!box) return;
+  const total = data.total || 0;
+  const items = data.items || [];
+  const docs = data.index ? data.index.docs : 0;
+
+  if (!searchState.q) {
+    box.innerHTML = notice('', '输入关键词开始检索。人名、术语、伏笔编号、审稿引文都能查。');
+    return;
+  }
+  if (!docs) {
+    box.innerHTML = notice('', '索引里还没有内容。先写一章、保存设定集或跑一次审稿，再回来检索。');
+    return;
+  }
+  if (!total) {
+    box.innerHTML = notice('', `没有找到「${esc(searchState.q)}」。换个词，或放宽来源类型/作品范围。`);
+    return;
+  }
+  const more = total > items.length
+    ? `<br><span class="muted">共 ${num(total)} 条，当前只显示前 ${num(items.length)} 条。收窄关键词或按来源过滤。</span>`
+    : '';
+  box.innerHTML =
+    `<div class="search-meta muted">共 ${num(total)} 条 · 查询 ${data.took_ms} ms · 同步 ${data.index ? data.index.sync_ms : 0} ms${more}</div>` +
+    items.map(searchHitCard).join('');
+}
+
+async function searchRun() {
+  const input = document.getElementById('search-q');
+  searchState.q = input ? input.value.trim() : searchState.q;
+  if (!searchState.q) {
+    searchResultsPrompt(notice('', '输入关键词开始检索。人名、术语、伏笔编号、审稿引文都能查。'));
+    return;
+  }
+  const seq = ++searchState.seq;
+  searchResultsPrompt(notice('', '正在检索…'));
+  const params = new URLSearchParams({ q: searchState.q, limit: '50' });
+  if (searchState.types.size) params.set('type', [...searchState.types].join(','));
+  if (searchState.work) params.set('work', searchState.work);
+  try {
+    const data = await getJSON('/api/search?' + params.toString());
+    if (seq !== searchState.seq) return; // 只认最后一次输入，旧响应直接丢掉
+    searchState.status = {
+      ready: true,
+      docs: data.index ? data.index.docs : 0,
+      works: data.index ? data.index.works : 0,
+      by_type: data.index ? data.index.by_type : {},
+      errors: [],
+    };
+    renderSearchStatus(searchState.status);
+    renderSearchResults(data);
+  } catch (e) {
+    if (seq !== searchState.seq) return;
+    searchResultsPrompt(notice('bad', `检索失败：${esc(e.message)}`));
+  }
+}
+
+function searchSchedule() {
+  clearTimeout(searchState.timer);
+  searchState.timer = setTimeout(searchRun, 250);
+}
+
+async function renderSearch() {
+  setTab('search');
+  const params = searchHashParams();
+  if (params.get('q') != null) searchState.q = params.get('q');
+  view.innerHTML = `
+    <div class="search-page">
+      <div class="search-head">
+        <h1>全书检索</h1>
+        <p class="muted">人名、术语、伏笔编号、审稿引文都能查。索引建在本地，不调用模型。</p>
+      </div>
+      <form class="search-bar" id="search-form">
+        <input id="search-q" type="search" autocomplete="off" spellcheck="false"
+               value="${esc(searchState.q)}" placeholder="搜人名、术语、伏笔编号…">
+        <button class="primary" type="submit">检索</button>
+      </form>
+      <div class="search-filters">
+        <div class="chips" id="search-types">${searchChipsHtml()}</div>
+        <div class="search-scope">
+          <select id="search-work"><option value="">全部作品</option></select>
+          <span class="muted" id="search-status">读取索引状态…</span>
+          <button type="button" class="ghost" id="search-resync">重建索引</button>
+        </div>
+      </div>
+      <div id="search-results"></div>
+    </div>`;
+
+  const input = document.getElementById('search-q');
+  input.addEventListener('input', () => {
+    searchState.q = input.value.trim();
+    searchSchedule();
+  });
+  document.getElementById('search-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    clearTimeout(searchState.timer);
+    searchRun();
+  });
+  document.getElementById('search-types').addEventListener('click', (e) => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    const type = chip.dataset.type || '';
+    if (!type) searchState.types.clear();
+    else if (searchState.types.has(type)) searchState.types.delete(type);
+    else searchState.types.add(type);
+    renderSearchChips();
+    searchRun();
+  });
+  document.getElementById('search-work').addEventListener('change', (e) => {
+    searchState.work = e.target.value;
+    searchRun();
+  });
+  document.getElementById('search-resync').addEventListener('click', (e) => {
+    withBusy(e.currentTarget, '重建中…', async () => {
+      try {
+        const st = await getJSON('/api/search/status?refresh=true');
+        searchState.status = st;
+        renderSearchStatus(st);
+        searchRun();
+      } catch (err) {
+        renderSearchStatus({ ready: false, errors: [err.message] });
+      }
+    });
+  });
+
+  if (searchState.q) {
+    searchResultsPrompt(notice('', '正在检索…'));
+    searchRun();
+  } else {
+    searchResultsPrompt(notice('', '输入关键词开始检索。人名、术语、伏笔编号、审稿引文都能查。'));
+  }
+
+  try {
+    const [st, works] = await Promise.all([
+      getJSON('/api/search/status'),
+      getJSON('/api/works'),
+    ]);
+    searchState.status = st;
+    searchState.works = (works || []).filter((w) => w.kind === 'original');
+    renderSearchStatus(st);
+    renderSearchWorkOptions();
+  } catch (e) {
+    renderSearchStatus({ ready: false, errors: [e.message] });
+  }
+}
+
+function searchParagraphAt(text, offset) {
+  let index = 0;
+  const re = /\n[ \t]*\n/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    if (match.index >= offset) break;
+    index += 1;
+  }
+  return index;
+}
+
+function searchMarkedHtml(text, start, length) {
+  const has = start >= 0 && length > 0 && start < text.length;
+  const end = has ? Math.min(text.length, start + length) : start;
+  const marked = has
+    ? text.slice(0, start) + '\u0001' + text.slice(start, end) + '\u0002' + text.slice(end)
+    : text;
+  const safe = esc(marked).replace(/\r\n/g, '\n');
+  const blocks = safe
+    .split(/\n[ \t]*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => `<p>${block.replace(/\n/g, '<br>')}</p>`)
+    .join('');
+  return blocks
+    .replace(/\u0001/g, '<mark class="search-hit-mark">')
+    .replace(/\u0002/g, '</mark>');
+}
+
+function searchJumpHref(doc) {
+  const loc = doc.locator || {};
+  const work = encodeURIComponent(doc.work || '');
+  if (doc.source_type === 'setting' || loc.kind === 'setting') {
+    return `#/work/${work}/creation/setting`;
+  }
+  if (loc.kind === 'volume') {
+    return `#/work/${work}/creation/volume/${encodeURIComponent(String(loc.vol || 1))}`;
+  }
+  const chapterId = loc.chapter_id;
+  if (chapterId) {
+    return `#/work/${work}/creation/brief/${encodeURIComponent(String(chapterId))}`;
+  }
+  return '';
+}
+
+async function renderSearchHit() {
+  setTab('search');
+  const params = searchHashParams();
+  const docId = params.get('id') || '';
+  const q = params.get('q') || '';
+  const offset = Number(params.get('o') || 0);
+  const length = Number(params.get('l') || 0);
+  if (!docId) return renderSearch();
+
+  view.innerHTML = `<div class="search-page"><div class="muted">正在读取命中内容…</div></div>`;
+  let doc;
+  try {
+    doc = await getJSON('/api/search/doc?id=' + encodeURIComponent(docId));
+  } catch (e) {
+    view.innerHTML = `<div class="search-page">
+      ${notice('bad', `读取失败：${esc(e.message)}`)}
+      <a class="btn" href="#/search?q=${encodeURIComponent(q)}">返回检索</a>
+    </div>`;
+    return;
+  }
+
+  const full = String(doc.raw || '');
+  let raw = full;
+  let base = 0;
+  let truncated = false;
+  if (full.length > 20000) {
+    base = Math.max(0, Math.min(full.length - 20000, offset - 5000));
+    raw = full.slice(base, base + 20000);
+    truncated = true;
+  }
+  const localOffset = offset - base;
+  const paragraph = searchParagraphAt(raw, localOffset);
+  const jump = searchJumpHref(doc);
+  const jumpLabel = doc.source_type === 'setting' ? '打开设定集' : '打开创作台 · 这一章';
+
+  view.innerHTML = `
+    <div class="search-page">
+      <div class="search-hit-nav">
+        <a href="#/search?q=${encodeURIComponent(q)}">← 返回检索</a>
+        <span class="muted">${esc(doc.work)} · ${esc(searchTypeLabel(doc.source_type))} · ${esc(doc.ref || '')}</span>
+        ${jump ? `<a class="btn sm" href="${jump}">${jumpLabel}</a>` : ''}
+      </div>
+      <div class="search-hit-title">
+        <h1>${esc(doc.title || doc.ref || doc.doc_id)}</h1>
+        <p class="muted">定位：第 ${paragraph + 1} 段 · 偏移 ${localOffset}${truncated ? '（原文较长，只显示命中附近 2 万字）' : ''}</p>
+      </div>
+      <div class="hit-body">${searchMarkedHtml(raw, localOffset, length)}</div>
+    </div>`;
+
+  requestAnimationFrame(() => {
+    const mark = document.querySelector('.hit-body mark');
+    if (mark) mark.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+}
+
+/* ── 路由 ──────────────────────────────────────────────── */
+
 function setTab(name) {
   document.querySelectorAll('.tab').forEach((el) => {
     const on = el.dataset.tab === name;
@@ -8446,6 +10404,10 @@ function route() {
       stopTaskPolling();
       chapterState.data = null;
       return renderImport();
+    }
+    if (parts[0] === 'search') {
+      if ((parts[1] || '').split('?')[0] === 'hit') return renderSearchHit();
+      return renderSearch();
     }
     if (parts[0] === 'genres') return renderGenreLab();
     if (parts[0] === 'help') return renderHelp();
