@@ -399,6 +399,58 @@ def test_creation_overview_matches_live_values(work_root: Path) -> None:
     assert chapter["open_reviews"] == 3
 
 
+def test_parse_failure_keeps_last_good_counts_and_retries(work_root: Path) -> None:
+    """坏 JSON 不能被当成「空文件」：计数不归零、指纹不更新、下一轮必须重试。"""
+    metadata.sync(work_root, force=True)
+    state = metadata.chapter_states(work_root, WORK)["v001-c0001"]
+    assert state["notes_total"] == 3 and state["notes_pending"] == 2
+
+    notes = work_root / "workspaces" / WORK / "90-draft" / "v001-c0001.notes.json"
+    good = notes.read_text(encoding="utf-8")
+    notes.write_text("{ 这不是 JSON", encoding="utf-8")
+
+    sync = metadata.sync(work_root)
+    assert sync["ok"] is True and sync["failed"] == 1
+    state = metadata.chapter_states(work_root, WORK)["v001-c0001"]
+    assert state["notes_total"] == 3 and state["notes_pending"] == 2, "解析失败不该清零上一版计数"
+
+    status = metadata.status(work_root)
+    assert status["failed_count"] == 1
+    assert status["failed_files"][0]["path"].endswith("v001-c0001.notes.json")
+    assert "JSON" in status["failed_files"][0]["error"]
+
+    # 文件坏着不改，每次同步都要重试——而不是盖上新 sha 后永远跳过。
+    assert metadata.sync(work_root)["failed"] == 1
+
+    notes.write_text(good, encoding="utf-8")
+    assert metadata.sync(work_root)["failed"] == 0
+    assert metadata.status(work_root)["failed_count"] == 0
+    assert metadata.chapter_states(work_root, WORK)["v001-c0001"]["notes_pending"] == 2
+
+
+def test_final_chapter_blocks_all_rewrite_paths(work_root: Path) -> None:
+    """定稿章的正文不许被悄悄改写：保存/转正/恢复/采纳都先要「重新打开」。"""
+    from server import services
+    from workshop import draft_store
+
+    ws = work_root / "workspaces" / WORK
+    paths = services.Paths(work_root)
+
+    with pytest.raises(ValueError, match="已定稿"):
+        draft_store.promote_candidate(ws, "v001-c0001", "cand1")
+    with pytest.raises(ValueError, match="已定稿"):
+        draft_store.restore_version(ws, "v001-c0001", "20260102T000000-bbbb")
+    with pytest.raises(ValueError, match="已定稿"):
+        services.write_draft_text(paths, WORK, "v001-c0001", "新的正文")
+    with pytest.raises(ValueError, match="已定稿"):
+        services.apply_review_findings(paths, WORK, "v001-c0001", "r1", ["i1"])
+
+    # 重新打开之后，同样的操作就能走通。
+    draft_store.set_status(ws, "v001-c0001", "draft", reason="审查：重新打开")
+    assert draft_store.restore_version(ws, "v001-c0001", "20260102T000000-bbbb")["saved"] is True
+    assert services.write_draft_text(paths, WORK, "v001-c0001", "重新打开后改的正文")["saved"] is True
+
+
 def test_api_endpoints(work_root: Path, monkeypatch) -> None:
     from fastapi.testclient import TestClient
 

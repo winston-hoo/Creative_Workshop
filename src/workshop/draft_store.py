@@ -220,6 +220,7 @@ def promote_candidate(
     candidate_id: str,
 ) -> dict[str, Any]:
     """候选转正：先备份当前正文，再把候选写成正式稿。"""
+    ensure_editable(work_dir, chapter_id)
     candidate = load_candidate(work_dir, chapter_id, candidate_id)
     if not candidate:
         raise ValueError(f"找不到候选「{candidate_id}」")
@@ -263,6 +264,19 @@ def get_status(work_dir: str | Path, chapter_id: str) -> dict[str, Any]:
     data["status"] = status
     data.setdefault("history", [])
     return data
+
+
+def ensure_editable(work_dir: str | Path, chapter_id: str) -> None:
+    """正文写入前的闸门：已定稿的章不许悄悄改。
+
+    `set_status` 只拦状态跳转，拦不住「直接把正文覆盖掉」——保存、候选转正、
+    恢复版本、采纳意见这四条路都是写文件的。所以闸门必须放在写之前，
+    并且报错要说清下一步该点哪里（「重新打开」）。
+    """
+    if get_status(work_dir, chapter_id).get("status") == "final":
+        raise ValueError(
+            "这一章已定稿。要改写正文（保存/候选转正/恢复版本/采纳意见），先点「重新打开」。"
+        )
 
 
 def set_status(
@@ -310,6 +324,7 @@ def restore_version(
     version_id: str,
 ) -> dict[str, Any]:
     """恢复到某个历史版本。恢复前先把**当前**正文存一份，避免这次恢复又变成不可逆。"""
+    ensure_editable(work_dir, chapter_id)
     version = load_version(work_dir, chapter_id, version_id)
     if not version:
         raise ValueError(f"找不到版本「{version_id}」")

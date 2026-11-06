@@ -108,6 +108,20 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _json_or_fail(path: Path) -> dict[str, Any]:
+    """侧车 JSON 必须真能解析。
+
+    以前这里写的是 `_read_json(path) or {}`：一个被编辑器写坏的 notes.json
+    会解析成空对象，于是「这章 0 条待裁决要点」被当成事实写进库，还盖上
+    新 sha 的戳——文件不改就永远不会重算。这里改成：解析不出来就抛，
+    让 sync 走失败分支（保留上一版数据并标记错误）。
+    """
+    data = _read_json(path)
+    if data is None:
+        raise ValueError(f"JSON 解析失败：{path.name}")
+    return data
+
+
 _SCHEMA_SQL = (
     """
     CREATE TABLE IF NOT EXISTS meta (
@@ -474,7 +488,7 @@ def _apply(
             ),
         )
     elif kind == "status":
-        data = _read_json(path) or {}
+        data = _json_or_fail(path)
         status = str(data.get("status") or "draft")
         if status not in ("draft", "reviewed", "final"):
             status = "draft"
@@ -485,7 +499,7 @@ def _apply(
             (status, str(data.get("updated_at") or ""), _now_iso(), work, cid),
         )
     elif kind == "notes":
-        data = _read_json(path) or {}
+        data = _json_or_fail(path)
         notes = [n for n in (data.get("notes") or []) if isinstance(n, dict)]
         pending = sum(1 for n in notes if str(n.get("status") or "pending") == "pending")
         _ensure_chapter(conn, work, cid)
@@ -495,7 +509,7 @@ def _apply(
             (len(notes), pending, _now_iso(), work, cid),
         )
     elif kind == "review":
-        data = _read_json(path) or {}
+        data = _json_or_fail(path)
         reviews = [r for r in (data.get("reviews") or []) if isinstance(r, dict)]
         _ensure_chapter(conn, work, cid)
         conn.execute("DELETE FROM review_runs WHERE work=? AND chapter_id=?", (work, cid))
@@ -534,7 +548,7 @@ def _apply(
             (total, open_count, len(reviews), last_at, _now_iso(), work, cid),
         )
     elif kind in ("version", "candidate"):
-        data = _read_json(path) or {}
+        data = _json_or_fail(path)
         item_id = str(
             data.get("version_id") if kind == "version" else data.get("candidate_id")
         ) or path.stem
@@ -554,7 +568,7 @@ def _apply(
         )
         _refresh_artifacts(conn, work, cid)
     elif kind == "task":
-        data = _read_json(path) or {}
+        data = _json_or_fail(path)
         task_id = str(data.get("task_id") or path.stem)
         conn.execute(
             "INSERT OR REPLACE INTO tasks("
@@ -591,7 +605,7 @@ def sync(
     kinds = STATE_KINDS if scope == "states" else ALL_KINDS
     result: dict[str, Any] = {
         "ok": False, "error": "", "works": [], "scanned": 0, "changed": 0,
-        "removed": 0, "chapters": 0, "duration_ms": 0.0,
+        "removed": 0, "chapters": 0, "failed": 0, "duration_ms": 0.0,
     }
     try:
         with _lock(root_path):
@@ -602,7 +616,7 @@ def sync(
                 result["works"] = [w.name for w in targets]
                 for work_dir in targets:
                     stats = _sync_work(conn, work_dir, force=force, kinds=kinds)
-                    for key in ("scanned", "changed", "removed", "chapters"):
+                    for key in ("scanned", "changed", "removed", "chapters", "failed"):
                         result[key] += stats[key]
                 conn.commit()
                 result["chapters"] = int(
@@ -623,7 +637,7 @@ def _sync_work(
 ) -> dict[str, int]:
     work = work_dir.name
     seen: set[str] = set()
-    stats = {"scanned": 0, "changed": 0, "removed": 0, "chapters": 0}
+    stats = {"scanned": 0, "changed": 0, "removed": 0, "chapters": 0, "failed": 0}
 
     stored = {
         row["path"]: row
@@ -645,6 +659,7 @@ def _sync_work(
         if (
             not force
             and prev
+            and prev["sha"]
             and int(prev["mtime_ns"]) == stat.st_mtime_ns
             and int(prev["size"]) == stat.st_size
         ):
@@ -656,7 +671,7 @@ def _sync_work(
         sha = _sha_bytes(data)
         if prev and prev["sha"] and prev["sha"] == sha and not force:
             conn.execute(
-                "UPDATE files SET mtime_ns=?, size=? WHERE work=? AND path=?",
+                "UPDATE files SET mtime_ns=?, size=?, error='' WHERE work=? AND path=?",
                 (stat.st_mtime_ns, stat.st_size, work, rel),
             )
             continue
@@ -671,25 +686,25 @@ def _sync_work(
             )
             stats["changed"] += 1
         except (OSError, ValueError, TypeError, KeyError) as exc:
-            # 单个文件解析失败不影响别的章节；把它的贡献清空并记下原因。
-            try:
-                item_id = (
-                    path.name[: -len(".json")]
-                    if kind in ("version", "candidate", "task") and path.name.endswith(".json")
-                    else ""
+            # 单个文件解析失败不影响别的章节，但**不能**当成「已同步」：
+            #  · 不写这次的新 sha —— 写进去等于告诉下一轮「这份内容处理过了」，
+            #    坏文件就永远不会重试，而它上一版的派生数据刚被清成 0。
+            #  · 不清空上一版派生数据 —— 宁可短暂显示旧计数，也不能静默变 0。
+            # 错误写进 files.error，`status()` 会把它暴露出去。
+            msg = f"{type(exc).__name__}: {exc}"
+            stats["failed"] += 1
+            if prev:
+                conn.execute(
+                    "UPDATE files SET error=?, extracted_at=? WHERE work=? AND path=?",
+                    (msg, _now_iso(), work, rel),
                 )
-                _reset(conn, work, kind, cid, item_id)
-            except sqlite3.Error:
-                pass
-            conn.execute(
-                "INSERT OR REPLACE INTO files("
-                "work, path, kind, chapter_id, mtime_ns, size, sha, extracted_at, error) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    work, rel, kind, cid, stat.st_mtime_ns, stat.st_size, sha,
-                    _now_iso(), f"{type(exc).__name__}: {exc}",
-                ),
-            )
+            else:
+                conn.execute(
+                    "INSERT OR REPLACE INTO files("
+                    "work, path, kind, chapter_id, mtime_ns, size, sha, extracted_at, error) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (work, rel, kind, cid, stat.st_mtime_ns, stat.st_size, "", _now_iso(), msg),
+                )
 
     for rel, row in stored.items():
         if rel in seen:
@@ -782,6 +797,8 @@ def status(root: str | Path, *, sync_first: bool = False) -> dict[str, Any]:
         "available": False,
         "works": [],
         "counts": {},
+        "failed_files": [],
+        "failed_count": 0,
         "last_sync": _LAST_SYNC.get(str(root_path)),
         "error": "",
     }
@@ -802,6 +819,11 @@ def status(root: str | Path, *, sync_first: bool = False) -> dict[str, Any]:
             for table in ("files", "chapters", "review_runs", "artifacts", "tasks"):
                 n = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
                 out["counts"][table] = int(n)
+            failed = conn.execute(
+                "SELECT work, path, error FROM files WHERE error<>'' ORDER BY work, path"
+            ).fetchall()
+            out["failed_count"] = len(failed)
+            out["failed_files"] = [dict(r) for r in failed[:20]]
             out["available"] = True
         finally:
             conn.close()

@@ -4508,6 +4508,7 @@ def apply_review_findings(
     from workshop.draft import count_chars, load_draft, save_draft
 
     work_dir = paths.work_dir(name)
+    draft_store.ensure_editable(work_dir, chapter_id)
     payload = review_mod.load_reviews(work_dir, chapter_id)
     review = review_mod.find_review(payload, review_id)
     if not review:
@@ -5168,6 +5169,7 @@ def write_draft_text(paths: Paths, name: str, chapter_id: str, text: str) -> dic
     from workshop import draft_store
 
     ctx = _draft_inputs(paths, name, chapter_id)
+    draft_store.ensure_editable(ctx["work_dir"], chapter_id)
     existing = load_draft(ctx["work_dir"], chapter_id)
     old_text = existing.get("text") or ""
     if existing.get("exists") and not text.strip() and old_text.strip():
